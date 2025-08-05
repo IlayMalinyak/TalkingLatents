@@ -965,7 +965,7 @@ class StarLlamaTrainer:
         try:
             # Get a random sample from validation set
             sample_idx = np.random.randint(0, len(self.val_loader.dataset))
-            sample = self.val_loader.dataset[sample_idx]
+            sample = self.test_loader.dataset[sample_idx]
 
             # Create a question
             question = f"Describe the physical parameters of this star {self.config['special_token']}"
@@ -1347,9 +1347,9 @@ def main(num_samples=5000):
         'max_sequence_length': 256,
         'noise_std': 0.002,
         'train_split': 0.8,
-        'eval_every_n_steps': 100,
+        'eval_every_n_steps': 10,
         'save_every_n_epochs': 2,
-        'loss_focus': 'parameters_only',
+        'loss_focus': 'standard',
 
         # Early stopping configuration
         'early_stopping_patience': 7,  # Stop after 7 epochs without improvement

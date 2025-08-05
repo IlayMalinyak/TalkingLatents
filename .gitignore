@@ -4,6 +4,7 @@ logs/*/
 pretrained_models/
 checkpoints/
 llama_url.txt
+google_api.txt
 
 # Specific files
 data/dataset_noiseless.tar.gz
