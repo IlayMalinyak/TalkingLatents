@@ -359,6 +359,13 @@ def parse_args():
     parser.add_argument('--compute_retrieval_metrics', action='store_true',
                        help='Compute retrieval metrics during training')
 
+    parser.add_argument('--split_cache_root', type=str, default=None,
+                       help='Root directory used to cache persistent dataset splits')
+    parser.add_argument('--allow_new_splits', action='store_true', default=False,
+                       help='Allow generation of new dataset splits when no cache is available')
+    parser.add_argument('--validation_interval', type=int, default=None,
+                       help='Run mid-epoch validation every N training iterations')
+
     # Resume options
     parser.add_argument('--resume_path', type=str, default=None,
                         help='Path to a full training checkpoint (model+optimizer+scheduler+scaler) to resume')

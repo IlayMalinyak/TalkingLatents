@@ -49,8 +49,8 @@ class Trainer(object):
     def __init__(self, model, optimizer, criterion, train_dataloader, device, world_size=1, output_dim=2,
                  scheduler=None, val_dataloader=None,   max_iter=-1, scaler=None, use_amp=False,
                   grad_clip=False, max_grad_norm=1, log_path=None, exp_name=None, plot_every=None,
-                   cos_inc=False, range_update=None, accumulation_step=1, wandb_log=False, num_quantiles=1,
-                   update_func=lambda x: x):
+                  cos_inc=False, range_update=None, accumulation_step=1, wandb_log=False, num_quantiles=1,
+                  update_func=lambda x: x, validation_interval=None):
         self.model = model
         self.optimizer = optimizer
         self.criterion = criterion
@@ -79,6 +79,7 @@ class Trainer(object):
         self.num_quantiles = num_quantiles
         self.update_func = update_func
         self.epoch = 0
+        self.validation_interval = validation_interval
         # if log_path is not None:
         #     self.logger =SummaryWriter(f'{self.log_path}/exp{self.exp_num}')
         #     # print(f"logger path: {self.log_path}/exp{self.exp_num}")
@@ -314,7 +315,10 @@ class Trainer(object):
         train_acc = 0
         total = 0
         all_accs = torch.zeros(self.output_dim, device=device)
-        pbar = tqdm(self.train_dl)
+        total_batches = len(self.train_dl)
+        if self.max_iter is not None and self.max_iter >= 0:
+            total_batches = min(total_batches, self.max_iter + 1)
+        pbar = tqdm(self.train_dl, total=total_batches)
         for i, batch in enumerate(pbar):
             if self.optimizer is not None:
                 self.optimizer.zero_grad()
@@ -323,8 +327,11 @@ class Trainer(object):
             all_accs = all_accs + acc
             total += len(y)
             pbar.set_description(f"train_acc: {acc}, train_loss:  {loss.item():.4f}")      
-            if (self.max_iter is not None) and (self.max_iter >= 0) and (i > self.max_iter):
+            if (self.max_iter is not None) and (self.max_iter >= 0) and (i >= self.max_iter):
                 break
+
+            if self.validation_interval and (i + 1) % self.validation_interval == 0:
+                self._run_mid_epoch_validation(epoch, i + 1, device)
         print("number of train_accs: ", all_accs, "total: ", total)
         return train_loss, all_accs/total
     
@@ -340,16 +347,109 @@ class Trainer(object):
         val_acc = 0
         total = 0
         all_accs = torch.zeros(self.output_dim, device=device)
-        pbar = tqdm(self.val_dl)
+        total_batches = len(self.val_dl)
+        if self.max_iter is not None and self.max_iter >= 0:
+            total_batches = min(total_batches, self.max_iter + 1)
+        pbar = tqdm(self.val_dl, total=total_batches)
         for i,batch in enumerate(pbar):
             loss, acc, y = self.eval_batch(batch, i + epoch * len(self.val_dl), device)
             val_loss.append(loss.item())
             all_accs = all_accs + acc
             total += len(y)
             pbar.set_description(f"val_acc: {acc}, val_loss:  {loss.item():.4f}")
-            if (self.max_iter is not None) and (self.max_iter >= 0) and (i > self.max_iter):
+            if (self.max_iter is not None) and (self.max_iter >= 0) and (i >= self.max_iter):
                 break
-        return val_loss, all_accs/total
+
+        if dist.is_initialized():
+            torch.cuda.synchronize()
+        self.model.train()
+
+        avg_acc = all_accs / total if total > 0 else all_accs
+        return val_loss, avg_acc
+
+    def _run_mid_epoch_validation(self, epoch: int, iteration: int, device):
+        if self.val_dl is None or self.validation_interval is None:
+            return
+        self.model.eval()
+        losses = []
+        sample_examples = []
+        with torch.no_grad():
+            for i, batch in enumerate(self.val_dl):
+                mode = batch.get('mode', self.mode)
+                self._set_active_mode(mode)
+                loss, _, _ = self.eval_batch(batch, i + epoch * len(self.val_dl), device)
+                losses.append(loss.item())
+                if len(losses) <= 3:
+                    sample = self._collect_validation_sample(batch, device)
+                    if sample:
+                        sample_examples.append(sample)
+                if i >= 9:
+                    break
+
+        if not losses:
+            return
+
+        avg_loss = float(np.mean(losses))
+        if self.log_path and self.exp_name:
+            interim_path = os.path.join(
+                self.log_path,
+                f"{self.exp_name}_midval_epoch{epoch}_iter{iteration}.json"
+            )
+            with open(interim_path, 'w') as fh:
+                json.dump({
+                    'epoch': epoch,
+                    'iteration': iteration,
+                    'avg_val_loss': avg_loss,
+                    'num_batches': len(losses),
+                    'samples': sample_examples
+                }, fh, indent=2)
+
+        if dist.is_initialized():
+            torch.cuda.synchronize()
+        self.model.train()
+
+    def _collect_validation_sample(self, batch: Dict[str, Any], device) -> Optional[Dict[str, Any]]:
+        try:
+            tokenizer = getattr(self, 'tokenizer', None)
+            model = self.model.module if hasattr(self.model, 'module') else self.model
+            batch_idx = 0
+            generated_text, input_text, target_text, _ = model.generate_response_from_batch(
+                batch_data=batch,
+                batch_idx=batch_idx,
+                tokenizer=tokenizer,
+                max_new_tokens=50,
+                temperature=0.2,
+                top_p=0.8,
+            )
+
+            if not input_text:
+                input_text = batch.get('input_texts', [''])[batch_idx] if batch.get('input_texts') else ''
+                if not input_text:
+                    input_text = batch.get('question_texts', [''])[batch_idx] if batch.get('question_texts') else ''
+
+            if not target_text:
+                target_text = batch.get('target_texts', [''])[batch_idx] if batch.get('target_texts') else ''
+
+            obsid_key = 'obsids' if 'obsids' in batch else 'obsid'
+            obsid_val = None
+            if obsid_key in batch:
+                obs_entry = batch[obsid_key][batch_idx] if isinstance(batch[obsid_key], (list, tuple)) else batch[obsid_key]
+                if isinstance(obs_entry, torch.Tensor):
+                    obsid_val = obs_entry.item() if obs_entry.numel() == 1 else obs_entry.tolist()
+                else:
+                    obsid_val = obs_entry
+
+            sample = {
+                'mode': batch.get('mode', getattr(model, 'mode', 'single_star')),
+                'obsid': obsid_val,
+                'question': input_text,
+                'true_answer': target_text,
+                'generated_answer': generated_text,
+            }
+            return sample
+        except Exception as err:
+            print(f"Warning: failed to collect validation sample ({err})")
+            return None
 
     def eval_batch(self, batch, batch_idx, device):
         pass
@@ -553,6 +653,13 @@ class LLMTrainer(Trainer):
         self.lora_start_epoch = lora_params['lora_start_epoch']
         self.lora_modules = None
         self._apply_freeze_strategy(self.freeze_strategy)
+        self._set_active_mode(self.mode)
+
+    def _set_active_mode(self, mode: str):
+        self.mode = mode
+        target_model = self.model.module if hasattr(self.model, 'module') else self.model
+        if hasattr(target_model, 'mode'):
+            target_model.mode = mode
 
     def _apply_lora(self):
         """Apply LoRA to the model - fixed version"""
@@ -687,21 +794,16 @@ class LLMTrainer(Trainer):
         print(f"Total trainable parameters: {trainable_count:,}")
     
     def train_epoch(self, device, epoch):
-        # Handle mode switching for combined mode
         if hasattr(self, 'combined_mode') and self.combined_mode:
-            if epoch >= self.switch_epoch and self.mode == "single_star":
-                print(f"\n*** SWITCHING MODE FROM single_star TO two_star AT EPOCH {epoch} ***")
-                # Switch to two_star mode
-                self.mode = "two_star"
-                self.train_dl = self.two_star_loaders['train']
-                self.val_dl = self.two_star_loaders['val']
-                # Update model mode
-                if hasattr(self.model, 'module'):
-                    self.model.module.mode = "two_star"
-                else:
-                    self.model.mode = "two_star"
-                print(f"Switched to two_star mode with {len(self.train_dl)} batches per epoch")
-        
+            if hasattr(self, 'mixed_train_loader'):
+                self.mixed_train_loader.set_epoch(epoch)
+                self.train_dl = self.mixed_train_loader
+            if hasattr(self, 'mixed_val_loader'):
+                self.mixed_val_loader.set_epoch(epoch)
+                self.val_dl = self.mixed_val_loader
+            # Ensure we start each epoch in single-star mode for consistency
+            self._set_active_mode('single_star')
+
         self._apply_freeze_strategy(self.freeze_strategy)
         return super().train_epoch(device, epoch)
 
@@ -810,6 +912,9 @@ class LLMTrainer(Trainer):
 
     def train_batch(self, batch, batch_idx, device):
         """Training step with AMP and detailed memory debugging"""
+
+        batch_mode = batch.get('mode', self.mode)
+        self._set_active_mode(batch_mode)
         
         # Memory before forward pass
         torch.cuda.empty_cache()
@@ -856,6 +961,8 @@ class LLMTrainer(Trainer):
 
     def eval_batch(self, batch, batch_idx, device):
         """Validation step with AMP"""
+        batch_mode = batch.get('mode', self.mode)
+        self._set_active_mode(batch_mode)
         outputs = self.get_logits(batch, device, val=True)
 
         target_ids = batch['target_ids'].to(device)
@@ -912,7 +1019,10 @@ class LLMTrainer(Trainer):
                     batch = next(val_iter)
                 except StopIteration:
                     break
-                
+
+                batch_mode = batch.get('mode', self.mode)
+                self._set_active_mode(batch_mode)
+
                 batch_idx = 0
                 obsid = batch['obsids'][batch_idx] if 'obsids' in batch else "Unknown"
                 
@@ -964,7 +1074,8 @@ class LLMTrainer(Trainer):
                     'generated_answer': generated_text,
                     'teacher_forcing_perplexity': tf_perplexity,
                     'generation_perplexity': gen_perplexity,
-                    'num_generated_tokens': len(generation_log_probs)
+                    'num_generated_tokens': len(generation_log_probs),
+                    'mode': batch_mode
                 }
                 epoch_results['samples'].append(sample_result)
                 

@@ -64,6 +64,12 @@ def parse_args():
     p.add_argument('--temperature', type=float, default=0.2)
     p.add_argument('--top_p', type=float, default=0.8)
     p.add_argument('--random_seed', type=int, default=42)
+    p.add_argument('--split_cache_root', type=str, default=None,
+                   help='Root directory containing cached dataset splits')
+    p.add_argument('--allow_new_splits', action='store_true',
+                   help='Allow generating new splits if cache is missing')
+    p.add_argument('--mode', type=str, default='single_star', choices=['single_star', 'two_star'],
+                   help='Select which mode to evaluate when invoked mid-training')
     return p.parse_args()
 
 
@@ -154,6 +160,16 @@ def main():
     from data.transforms import Compose, GeneralSpectrumPreprocessor, ToTensor
     transf = Compose([GeneralSpectrumPreprocessor(rv_norm=True), ToTensor()])
     # Reuse helper but pass batch_size=1; we will sample directly from val_dataset
+    split_root = args.split_cache_root or os.path.join(ROOT_DIR, 'split_cache')
+    split_dir = os.path.join(split_root, 'single', Path(args.json_file).stem)
+    if not os.path.isdir(split_dir):
+        if args.allow_new_splits:
+            os.makedirs(split_dir, exist_ok=True)
+        else:
+            raise FileNotFoundError(
+                f"Cached splits not found at {split_dir}. Provide --split_cache_root pointing to the "
+                "training split cache or rerun with --allow_new_splits to generate them.")
+
     _, val_loader, _ = create_stellar_dataloaders(
         json_file=args.json_file,
         features_array=spectral_features,
@@ -163,7 +179,8 @@ def main():
         test_ratio=0.1,
         random_state=args.random_seed,
         num_spectral_features=args.num_spectral_features,
-        cache_dir=os.path.join(args.output_dir, 'cache'),
+        cache_dir=split_dir,
+        allow_new_splits=bool(args.allow_new_splits),
         tokenizer_path=tokenizer_path,
         max_length=args.max_seq_length,
         batch_size=1,

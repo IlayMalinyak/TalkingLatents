@@ -55,6 +55,7 @@ class StellarQuestionsDataset(Dataset):
                  spectral_transforms: Optional[Any] = None,
                  filter_valid_descriptions: bool = True,
                  cache_dir: Optional[str] = None,
+                 allow_new_splits: bool = True,
                  tokenizer_path: Optional[str] = None,
                  max_length: int = 512,
                  num_spectral_features: int = 1):
@@ -79,6 +80,7 @@ class StellarQuestionsDataset(Dataset):
         
         # Load and process data
         self._load_data()
+        self.allow_new_splits = allow_new_splits
         self._create_splits(train_ratio, val_ratio, test_ratio, cache_dir)
         
     def _load_tokenizer(self):
@@ -305,11 +307,16 @@ class StellarQuestionsDataset(Dataset):
         # Try to load cached splits
         if cache_file and os.path.exists(cache_file):
             print(f"Loading cached splits from {cache_file}")
-            cached = np.load(cache_file)
+            cached = np.load(cache_file, allow_pickle=True)
             train_indices = cached['train_indices']
             val_indices = cached['val_indices'] 
             test_indices = cached['test_indices']
         else:
+            if cache_file and not self.allow_new_splits:
+                raise FileNotFoundError(
+                    f"Cached split file not found at {cache_file}. "
+                    "Re-run with allow_new_splits=True to generate splits."
+                )
             print("Creating new train/val/test splits...")
             
             # First split: separate test set
@@ -536,6 +543,7 @@ def create_stellar_dataloaders(json_file: str,
                              random_state: int = 42,
                              num_workers: int = 0,
                              cache_dir: Optional[str] = None,
+                             allow_new_splits: bool = True,
                              **dataset_kwargs) -> Tuple[DataLoader, DataLoader, DataLoader]:
     """
     Create train, validation, and test dataloaders
@@ -554,6 +562,7 @@ def create_stellar_dataloaders(json_file: str,
         test_ratio=test_ratio,
         random_state=random_state,
         cache_dir=cache_dir,
+        allow_new_splits=allow_new_splits,
         **dataset_kwargs
     )
     
@@ -566,6 +575,7 @@ def create_stellar_dataloaders(json_file: str,
         test_ratio=test_ratio,
         random_state=random_state,
         cache_dir=cache_dir,
+        allow_new_splits=allow_new_splits,
         **dataset_kwargs
     )
     
@@ -578,6 +588,7 @@ def create_stellar_dataloaders(json_file: str,
         test_ratio=test_ratio,
         random_state=random_state,
         cache_dir=cache_dir,
+        allow_new_splits=allow_new_splits,
         **dataset_kwargs
     )
 
