@@ -3,6 +3,7 @@ import torch.nn.functional as F
 import numpy as np
 import time
 
+import csv
 import os
 import json
 import glob
@@ -537,7 +538,12 @@ class MaskedRegressorTrainer(Trainer):
 
 class LLMTrainer(Trainer):
 
-    def __init__(self, lora_params, alpha=1, beta=1, gamma=1, max_chunk_size=128, tokenizer=None, mode="single_star", **kwargs):
+    def __init__(self, lora_params, alpha=1, beta=1, gamma=1, max_chunk_size=128, tokenizer=None, **kwargs):
+        # Pop custom kwargs before calling base Trainer.__init__
+        self.lambda_feat = kwargs.pop('lambda_feat', 0.0)
+        self.lambda_text = kwargs.pop('lambda_text', 0.0)
+        self.lambda_retrieval = kwargs.pop('lambda_retrieval', 0.0)
+        self.lambda_physics = kwargs.pop('lambda_physics', 0.0)
         super(LLMTrainer, self).__init__(**kwargs)
         self.alpha = alpha
         self.beta = beta
@@ -553,6 +559,20 @@ class LLMTrainer(Trainer):
         self.lora_start_epoch = lora_params['lora_start_epoch']
         self.lora_modules = None
         self._apply_freeze_strategy(self.freeze_strategy)
+        # Prepare loss tracking/logging structures
+        self._loss_term_tracker = {
+            'train': {'total': 0.0, 'lm': 0.0, 'feat': 0.0, 'text': 0.0, 'retr': 0.0, 'phys': 0.0, 'count': 0},
+            'val': {'total': 0.0, 'lm': 0.0, 'feat': 0.0, 'text': 0.0, 'retr': 0.0, 'phys': 0.0, 'count': 0},
+        }
+        self._loss_log_path = None
+        if self.log_path:
+            os.makedirs(self.log_path, exist_ok=True)
+            log_filename = f"{self.exp_name}_loss_terms.csv" if self.exp_name else "loss_terms.csv"
+            self._loss_log_path = os.path.join(self.log_path, log_filename)
+            if self._is_main_process() and not os.path.exists(self._loss_log_path):
+                with open(self._loss_log_path, 'w', newline='') as f:
+                    writer = csv.writer(f)
+                    writer.writerow(['phase', 'epoch', 'batches', 'total_loss', 'lm_loss', 'feat_loss', 'text_loss', 'retr_loss', 'physics_loss'])
 
     def _apply_lora(self):
         """Apply LoRA to the model - fixed version"""
@@ -621,6 +641,70 @@ class LLMTrainer(Trainer):
         )
 
         print(f"Successfully applied LoRA to {len(self.lora_modules)} modules")
+
+    def _is_main_process(self) -> bool:
+        return (not dist.is_initialized()) or dist.get_rank() == 0
+
+    def _reset_loss_tracker(self, phase: str) -> None:
+        tracker = self._loss_term_tracker[phase]
+        tracker['total'] = 0.0
+        tracker['lm'] = 0.0
+        tracker['feat'] = 0.0
+        tracker['text'] = 0.0
+        tracker['retr'] = 0.0
+        tracker['phys'] = 0.0
+        tracker['count'] = 0
+
+    def _update_loss_tracker(self, phase: str, *, total: float, lm: float, feat: float, text: float,
+                              retr: float = 0.0, phys: float = 0.0) -> None:
+        tracker = self._loss_term_tracker[phase]
+        tracker['total'] += float(total)
+        tracker['lm'] += float(lm)
+        tracker['feat'] += float(feat)
+        tracker['text'] += float(text)
+        tracker['retr'] += float(retr)
+        tracker['phys'] += float(phys)
+        tracker['count'] += 1
+
+    def _finalize_loss_tracker(self, phase: str, epoch: int) -> None:
+        tracker = self._loss_term_tracker[phase]
+        if tracker['count'] == 0:
+            return
+
+        count = tracker['count']
+        avg_total = tracker['total'] / count
+        avg_lm = tracker['lm'] / count
+        avg_feat = tracker['feat'] / count
+        avg_text = tracker['text'] / count
+        avg_retr = tracker['retr'] / count
+        avg_phys = tracker['phys'] / count
+
+        if self._is_main_process():
+            print(
+                f"[{phase.upper()}][epoch {epoch}] total={avg_total:.4f} "
+                f"lm={avg_lm:.4f} feat={avg_feat:.4f} text={avg_text:.4f} "
+                f"retr={avg_retr:.4f} phys={avg_phys:.4f} (batches={count})"
+            )
+            self._append_loss_log(
+                phase=phase,
+                epoch=epoch,
+                batches=count,
+                avg_total=avg_total,
+                avg_lm=avg_lm,
+                avg_feat=avg_feat,
+                avg_text=avg_text,
+                avg_retr=avg_retr,
+                avg_phys=avg_phys,
+            )
+
+    def _append_loss_log(self, *, phase: str, epoch: int, batches: int,
+                         avg_total: float, avg_lm: float, avg_feat: float, avg_text: float,
+                         avg_retr: float, avg_phys: float) -> None:
+        if not self._loss_log_path:
+            return
+        with open(self._loss_log_path, 'a', newline='') as f:
+            writer = csv.writer(f)
+            writer.writerow([phase, epoch, batches, avg_total, avg_lm, avg_feat, avg_text, avg_retr, avg_phys])
 
     def _apply_freeze_strategy(self, strategy: str):
         """Apply different freezing strategies to the model"""
@@ -703,7 +787,10 @@ class LLMTrainer(Trainer):
                 print(f"Switched to two_star mode with {len(self.train_dl)} batches per epoch")
         
         self._apply_freeze_strategy(self.freeze_strategy)
-        return super().train_epoch(device, epoch)
+        self._reset_loss_tracker('train')
+        result = super().train_epoch(device, epoch)
+        self._finalize_loss_tracker('train', epoch)
+        return result
 
     def get_loss(self, logits, target_ids, attention_mask=None):
         # Shift for autoregressive prediction
@@ -770,6 +857,31 @@ class LLMTrainer(Trainer):
         input_ids = batch['input_ids'].to(device)
         target_ids = batch['target_ids'].to(device)
 
+        neighbor_latents = batch.get('neighbor_latents')
+        neighbor_mask = batch.get('neighbor_mask')
+        if neighbor_latents is not None and neighbor_latents.numel() > 0:
+            neighbor_latents = neighbor_latents.to(device)
+        else:
+            neighbor_latents = None
+        if neighbor_mask is not None and neighbor_mask.numel() > 0:
+            neighbor_mask = neighbor_mask.to(device)
+        else:
+            neighbor_mask = None
+
+        physics_target = batch.get('physics_target_norm')
+        if physics_target is not None and physics_target.numel() > 0:
+            physics_target = physics_target.to(device)
+        else:
+            physics_target = None
+        physics_mask = batch.get('physics_mask')
+        if physics_mask is not None:
+            physics_mask = physics_mask.to(device)
+
+        neighbor_targets = batch.get('neighbor_target_idx')
+        if neighbor_targets is not None:
+            neighbor_targets = neighbor_targets.to(device)
+
+        tot_length = batch['input_lengths'] + batch['target_lengths']
         
         # Handle different data structures based on mode
         if self.mode == "two_star":
@@ -785,44 +897,87 @@ class LLMTrainer(Trainer):
         # Forward pass with memory tracking and AMP
         mem_before_forward = torch.cuda.memory_allocated(device) / 1024**3
         with autocast(enabled=getattr(self, 'use_amp', False)):
-            # Conditional no_grad
-            cm = torch.no_grad() if val else torch.enable_grad()
-            with cm:
-                if self.mode == "two_star":
-                    outputs = self.model(
-                        input_ids=input_ids,
-                        input_spectra=None,
-                        special_token_positions=None,
-                        star_a_spectra=star_a_spectra,
-                        star_b_spectra=star_b_spectra,
-                        star_a_indices=star_a_indices,
-                        star_b_indices=star_b_indices,
-                    )
-                else:
-                    outputs = self.model(
-                        input_ids=input_ids,
-                        input_spectra=input_spectra,
-                        special_token_positions=special_token_positions,
-                    )
+            outputs = self.model(
+                input_ids=input_ids,
+                input_spectra=input_spectra,
+                special_token_positions=special_token_positions,
+                question_start_indices=batch['question_start_indices'].to(device),
+                answer_start_indices=batch['answer_start_indices'].to(device),
+                neighbor_latents=neighbor_latents,
+                neighbor_mask=neighbor_mask,
+            )
+            
+            logits = outputs['logits']
+            
+            # Compute loss components
+            lm_loss = self.get_loss(logits, target_ids)
+            loss = lm_loss
 
-        return outputs
+            inv_loss = None
+            if self.lambda_feat > 0:
+                lat_rec = outputs.get('latent_recon_from_tokens', None)
+                lat_tgt = outputs.get('latent_target', None)
+                if lat_rec is not None and lat_tgt is not None:
+                    lat_tgt = lat_tgt.to(device=lat_rec.device, dtype=lat_rec.dtype)
+                    inv_loss = F.mse_loss(lat_rec, lat_tgt, reduction='mean')
+                    loss = loss + self.lambda_feat * inv_loss
 
+            text_loss = None
+            if self.lambda_text > 0:
+                pred_latent = outputs.get('pred_latent_from_text', None)
+                lat_tgt2 = outputs.get('latent_target', None)
+                if pred_latent is not None and lat_tgt2 is not None:
+                    lat_tgt2 = lat_tgt2.to(device=pred_latent.device, dtype=pred_latent.dtype)
+                    text_loss = F.mse_loss(pred_latent, lat_tgt2, reduction='mean')
+                    loss = loss + self.lambda_text * text_loss
 
-    def train_batch(self, batch, batch_idx, device):
-        """Training step with AMP and detailed memory debugging"""
-        
-        # Memory before forward pass
-        torch.cuda.empty_cache()
-        gc.collect()
+            retrieval_loss = None
+            if self.lambda_retrieval > 0:
+                neighbor_logits = outputs.get('neighbor_logits', None)
+                neighbor_mask_eff = outputs.get('neighbor_mask', neighbor_mask)
+                if neighbor_logits is not None and neighbor_targets is not None and neighbor_logits.numel() > 0:
+                    if neighbor_mask_eff is not None and neighbor_mask_eff.numel() > 0:
+                        valid_mask = (neighbor_mask_eff.sum(dim=-1) > 0)
+                        if valid_mask.any():
+                            idx = valid_mask.nonzero(as_tuple=True)[0]
+                            if idx.numel() > 0:
+                                retrieval_loss = F.cross_entropy(neighbor_logits[idx], neighbor_targets[idx], reduction='mean')
+                    else:
+                        retrieval_loss = F.cross_entropy(neighbor_logits, neighbor_targets, reduction='mean')
+                    if retrieval_loss is not None:
+                        loss = loss + self.lambda_retrieval * retrieval_loss
 
+            physics_loss = None
+            if self.lambda_physics > 0 and physics_target is not None and physics_target.numel() > 0:
+                physics_pred = outputs.get('physics_pred', None)
+                if physics_pred is not None:
+                    if physics_pred.shape != physics_target.shape:
+                        physics_pred = physics_pred[:, :physics_target.shape[1]]
+                    physics_loss_raw = F.mse_loss(physics_pred, physics_target, reduction='none')
+                    if physics_mask is not None:
+                        mask = physics_mask.view(-1, 1)
+                        denom = mask.sum().clamp_min(1e-6)
+                        physics_loss = (physics_loss_raw * mask).sum() / denom
+                    else:
+                        physics_loss = physics_loss_raw.mean()
+                    loss = loss + self.lambda_physics * physics_loss
 
+        # Record scalar losses for logging/exports
+        lm_loss_val = float(lm_loss.detach().item()) if lm_loss is not None else 0.0
+        inv_loss_val = float(inv_loss.detach().item()) if inv_loss is not None else 0.0
+        text_loss_val = float(text_loss.detach().item()) if text_loss is not None else 0.0
+        total_loss_val = float(loss.detach().item())
+        retrieval_loss_val = float(retrieval_loss.detach().item()) if retrieval_loss is not None else 0.0
+        physics_loss_val = float(physics_loss.detach().item()) if physics_loss is not None else 0.0
 
-        outputs = self.get_logits(batch, device, val=False)
-        
-        target_ids = batch['target_ids'].to(device)
-        # Compute loss
-        loss = self.get_loss(outputs['logits'], target_ids)
-        
+        if hasattr(self, 'train_aux_loss_1'):
+            self.train_aux_loss_1.append(lm_loss_val)
+            self.train_aux_loss_2.append(inv_loss_val)
+            self.train_aux_loss_3.append(text_loss_val)
+
+        self._update_loss_tracker('train', total=total_loss_val, lm=lm_loss_val,
+                                   feat=inv_loss_val, text=text_loss_val,
+                                   retr=retrieval_loss_val, phys=physics_loss_val)
         
         # Backward pass with AMP
         if getattr(self, 'use_amp', False) and hasattr(self, 'scaler'):
@@ -859,9 +1014,114 @@ class LLMTrainer(Trainer):
         outputs = self.get_logits(batch, device, val=True)
 
         target_ids = batch['target_ids'].to(device)
-        
-        loss = self.get_loss(outputs['logits'], target_ids)
-        
+        neighbor_latents = batch.get('neighbor_latents')
+        neighbor_mask = batch.get('neighbor_mask')
+        if neighbor_latents is not None and neighbor_latents.numel() > 0:
+            neighbor_latents = neighbor_latents.to(device)
+        else:
+            neighbor_latents = None
+        if neighbor_mask is not None and neighbor_mask.numel() > 0:
+            neighbor_mask = neighbor_mask.to(device)
+        else:
+            neighbor_mask = None
+        neighbor_targets = batch.get('neighbor_target_idx')
+        if neighbor_targets is not None:
+            neighbor_targets = neighbor_targets.to(device)
+
+        physics_target = batch.get('physics_target_norm')
+        if physics_target is not None and physics_target.numel() > 0:
+            physics_target = physics_target.to(device)
+        else:
+            physics_target = None
+        physics_mask = batch.get('physics_mask')
+        if physics_mask is not None:
+            physics_mask = physics_mask.to(device)
+
+        retrieval_loss = None
+        physics_loss = None
+
+        with torch.no_grad():
+            # WRAP with autocast for validation too
+            with autocast(enabled=getattr(self, 'use_amp', False)):
+                outputs = self.model(
+                    input_ids=input_ids,
+                    input_spectra=input_spectra,
+                    special_token_positions=special_token_positions,
+                    question_start_indices=batch['question_start_indices'].to(device),
+                    answer_start_indices=batch['answer_start_indices'].to(device),
+                    neighbor_latents=neighbor_latents,
+                    neighbor_mask=neighbor_mask,
+                )
+                
+                logits = outputs['logits']
+                lm_loss = self.get_loss(logits, target_ids)
+                loss = lm_loss
+
+                inv_loss = None
+                if self.lambda_feat > 0:
+                    lat_rec = outputs.get('latent_recon_from_tokens', None)
+                    lat_tgt = outputs.get('latent_target', None)
+                    if lat_rec is not None and lat_tgt is not None:
+                        lat_tgt = lat_tgt.to(device=lat_rec.device, dtype=lat_rec.dtype)
+                        inv_loss = F.mse_loss(lat_rec, lat_tgt, reduction='mean')
+                        loss = loss + self.lambda_feat * inv_loss
+
+                text_loss = None
+                if self.lambda_text > 0:
+                    pred_latent = outputs.get('pred_latent_from_text', None)
+                    lat_tgt2 = outputs.get('latent_target', None)
+                    if pred_latent is not None and lat_tgt2 is not None:
+                        lat_tgt2 = lat_tgt2.to(device=pred_latent.device, dtype=pred_latent.dtype)
+                        text_loss = F.mse_loss(pred_latent, lat_tgt2, reduction='mean')
+                        loss = loss + self.lambda_text * text_loss
+
+                retrieval_loss = None
+                if self.lambda_retrieval > 0:
+                    neighbor_logits = outputs.get('neighbor_logits', None)
+                    neighbor_mask_eff = outputs.get('neighbor_mask', neighbor_mask)
+                    if neighbor_logits is not None and neighbor_targets is not None and neighbor_logits.numel() > 0:
+                        if neighbor_mask_eff is not None and neighbor_mask_eff.numel() > 0:
+                            valid_mask = (neighbor_mask_eff.sum(dim=-1) > 0)
+                            if valid_mask.any():
+                                idx = valid_mask.nonzero(as_tuple=True)[0]
+                                if idx.numel() > 0:
+                                    retrieval_loss = F.cross_entropy(neighbor_logits[idx], neighbor_targets[idx], reduction='mean')
+                        else:
+                            retrieval_loss = F.cross_entropy(neighbor_logits, neighbor_targets, reduction='mean')
+                        if retrieval_loss is not None:
+                            loss = loss + self.lambda_retrieval * retrieval_loss
+
+                physics_loss = None
+                if self.lambda_physics > 0 and physics_target is not None and physics_target.numel() > 0:
+                    physics_pred = outputs.get('physics_pred', None)
+                    if physics_pred is not None:
+                        if physics_pred.shape != physics_target.shape:
+                            physics_pred = physics_pred[:, :physics_target.shape[1]]
+                        physics_loss_raw = F.mse_loss(physics_pred, physics_target, reduction='none')
+                        if physics_mask is not None:
+                            mask = physics_mask.view(-1, 1)
+                            denom = mask.sum().clamp_min(1e-6)
+                            physics_loss = (physics_loss_raw * mask).sum() / denom
+                        else:
+                            physics_loss = physics_loss_raw.mean()
+                        loss = loss + self.lambda_physics * physics_loss
+
+        lm_loss_val = float(lm_loss.detach().item()) if lm_loss is not None else 0.0
+        inv_loss_val = float(inv_loss.detach().item()) if inv_loss is not None else 0.0
+        text_loss_val = float(text_loss.detach().item()) if text_loss is not None else 0.0
+        retrieval_loss_val = float(retrieval_loss.detach().item()) if retrieval_loss is not None else 0.0
+        physics_loss_val = float(physics_loss.detach().item()) if physics_loss is not None else 0.0
+        total_loss_val = float(loss.detach().item())
+
+        if hasattr(self, 'val_aux_loss_1'):
+            self.val_aux_loss_1.append(lm_loss_val)
+            self.val_aux_loss_2.append(inv_loss_val)
+            self.val_aux_loss_3.append(text_loss_val)
+
+        self._update_loss_tracker('val', total=total_loss_val, lm=lm_loss_val,
+                                   feat=inv_loss_val, text=text_loss_val,
+                                   retr=retrieval_loss_val, phys=physics_loss_val)
+
         return loss, 0, outputs['h']
     
     def eval_epoch(self, device, epoch):
@@ -874,7 +1134,10 @@ class LLMTrainer(Trainer):
                 self.evaluate_validation_samples(device, epoch)
         
         # Then run regular evaluation
-        return super().eval_epoch(device, epoch)
+        self._reset_loss_tracker('val')
+        result = super().eval_epoch(device, epoch)
+        self._finalize_loss_tracker('val', epoch)
+        return result
         
     def evaluate_validation_samples(self, device, epoch, num_samples=3,
                                     max_new_tokens=50, temperature=0.2, top_p=0.8):
@@ -955,7 +1218,26 @@ class LLMTrainer(Trainer):
                 print(f"Teacher-Forcing Perplexity: {tf_perplexity:.2f}")
                 print(f"Generation Perplexity: {gen_perplexity:.2f}")
                 print(f"Generated {len(generation_log_probs)} tokens")
-                
+
+                # Attempt retrieval parsing/metrics if target has retrieval format
+                retrieval_ok = None
+                try:
+                    from util.retrieval import parse_neighbors_text, parse_order_text
+                    t_neighbors = parse_neighbors_text(target_text)
+                    t_order = parse_order_text(target_text)
+                    if t_neighbors is not None:
+                        p_neighbors = parse_neighbors_text(generated_text)
+                        if p_neighbors is not None:
+                            L = len(t_neighbors)
+                            retrieval_ok = int(p_neighbors[:L] == t_neighbors)
+                    elif t_order is not None:
+                        p_order = parse_order_text(generated_text)
+                        if p_order is not None:
+                            L = len(t_order)
+                            retrieval_ok = int(p_order[:L] == t_order)
+                except Exception:
+                    pass
+
                 # Store results
                 sample_result = {
                     'obsid': obsid,
@@ -964,6 +1246,7 @@ class LLMTrainer(Trainer):
                     'generated_answer': generated_text,
                     'teacher_forcing_perplexity': tf_perplexity,
                     'generation_perplexity': gen_perplexity,
+                    'retrieval_ok': retrieval_ok,
                     'num_generated_tokens': len(generation_log_probs)
                 }
                 epoch_results['samples'].append(sample_result)
@@ -995,6 +1278,12 @@ class LLMTrainer(Trainer):
         print(f"Avg Generation Perplexity: {epoch_results['avg_generation_perplexity']:.2f}")
         print(f"Valid TF Samples: {valid_tf_count}/{sample_count}")
         print(f"Valid Gen Samples: {valid_gen_count}/{sample_count}")
+        # Summarize retrieval exact-match if any
+        if any(s.get('retrieval_ok') is not None for s in epoch_results['samples']):
+            total_ret = sum(1 for s in epoch_results['samples'] if s.get('retrieval_ok') is not None)
+            correct_ret = sum(int(s.get('retrieval_ok') or 0) for s in epoch_results['samples'])
+            rate = correct_ret / max(1, total_ret)
+            print(f"Retrieval exact-match on samples: {correct_ret}/{total_ret} ({100*rate:.1f}%)")
         print(f"{'='*60}")
         
         # Store results
@@ -1034,32 +1323,25 @@ class LLMTrainer(Trainer):
         # Extract batch data
         input_ids = batch['input_ids'][batch_idx:batch_idx+1].to(device)
         target_ids = batch['target_ids'][batch_idx:batch_idx+1].to(device)
-
-        # WRAP with autocast for validation too
-        with autocast(enabled=getattr(self, 'use_amp', False)):
-            if self.mode == "two_star":
-                star_a_spectra = batch['masked_spectra_a'][batch_idx:batch_idx+1].to(device)
-                star_b_spectra = batch['masked_spectra_b'][batch_idx:batch_idx+1].to(device)
-                star_a_indices = batch['star_a_feature_indices'][batch_idx:batch_idx+1].to(device)
-                star_b_indices = batch['star_b_feature_indices'][batch_idx:batch_idx+1].to(device)
-                outputs = self.model(
-                    input_ids=input_ids,
-                    input_spectra=None,
-                    special_token_positions=None,
-                    star_a_spectra=star_a_spectra,
-                    star_b_spectra=star_b_spectra,
-                    star_a_indices=star_a_indices,
-                    star_b_indices=star_b_indices,
-                    )
-            else:
-                special_token_positions = batch['feature_start_indices'].to(device)
-                input_spectra = batch['masked_spectra'].to(device) 
-                outputs = self.model(
-                    input_ids=input_ids,
-                    input_spectra=input_spectra,
-                    special_token_positions=special_token_positions,
-                )
+        input_spectra = batch['masked_spectra'][batch_idx:batch_idx+1].to(device)
+        feature_start_idx = batch['feature_start_indices'][batch_idx].item()
+        neighbor_latents = None
+        neighbor_mask = None
+        if 'neighbor_latents' in batch and batch['neighbor_latents'].numel() > 0:
+            neighbor_latents = batch['neighbor_latents'][batch_idx:batch_idx+1].to(device)
+        if 'neighbor_mask' in batch and batch['neighbor_mask'].numel() > 0:
+            neighbor_mask = batch['neighbor_mask'][batch_idx:batch_idx+1].to(device)
         
+        # Forward pass with full sequence (including target)
+        special_token_positions = torch.tensor([feature_start_idx], device=device)
+        
+        outputs = self.model(
+            input_ids=input_ids,
+            input_spectra=input_spectra,
+            special_token_positions=special_token_positions,
+            neighbor_latents=neighbor_latents,
+            neighbor_mask=neighbor_mask,
+        )
         
         logits = outputs['logits']
         

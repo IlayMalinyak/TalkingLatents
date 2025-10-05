@@ -36,6 +36,26 @@ class SpectralTokensProjector(nn.Module):
         return x
 
 
+class InverseProjector(nn.Module):
+    """
+    Map K token embeddings (d_model each) back to the fm latent space (dim=latent_dim).
+    Minimal version: mean-pool over K, then a small MLP to latent_dim.
+    """
+
+    def __init__(self, d_model: int, latent_dim: int, hidden_dim: int):
+        super().__init__()
+        self.mlp = nn.Sequential(
+            nn.Linear(d_model, hidden_dim),
+            nn.GELU(),
+            nn.Linear(hidden_dim, latent_dim),
+        )
+
+    def forward(self, token_block: torch.Tensor) -> torch.Tensor:
+        # token_block: (B, K, d_model)
+        pooled = token_block.mean(dim=1)  # (B, d_model)
+        return self.mlp(pooled)           # (B, latent_dim)
+
+
 class MultimodalLlamaModelMultiTokens(nn.Module):
     """
     Multimodal wrapper that injects K spectral tokens into the LLaMA token sequence.
@@ -58,83 +78,81 @@ class MultimodalLlamaModelMultiTokens(nn.Module):
     """
 
     def __init__(self, base_model, fm_model, latent_dim, hidden_dim, num_spectral_features: int = 8,
-                 use_checkpoint: bool = True, mode: str = "single_star"):
+                 use_checkpoint: bool = True, physics_dim: int = 3, neighbor_temperature: float = 1.0):
         super().__init__()
         self.base_model = base_model
         self.fm_model = fm_model
         self.embedding_dim = base_model.params.dim
         self.num_spectral_features = int(num_spectral_features)
         self.use_checkpoint = use_checkpoint
-        self.mode = mode  # "single_star" or "two_star"
-        
-        # For two-star mode, create separate projectors for each star
-        # if mode == "two_star":
-        self.projector_a = SpectralTokensProjector(
-            latent_dim=latent_dim,
-            d_model=self.embedding_dim,
-            hidden_dim=hidden_dim,
-            num_tokens=self.num_spectral_features,
-        )
-        self.projector_b = SpectralTokensProjector(
-            latent_dim=latent_dim,
-            d_model=self.embedding_dim,
-            hidden_dim=hidden_dim,
-            num_tokens=self.num_spectral_features,
-        )
-    # else:
+        self.physics_dim = int(max(0, physics_dim))
+        self.neighbor_temperature = float(neighbor_temperature)
         self.projector = SpectralTokensProjector(
             latent_dim=latent_dim,
             d_model=self.embedding_dim,
             hidden_dim=hidden_dim,
             num_tokens=self.num_spectral_features,
+        )
+        # Minimal inverse mapping head (tokens -> latent)
+        self.inverse_projector = InverseProjector(
+            d_model=self.embedding_dim,
+            latent_dim=latent_dim,
+            hidden_dim=hidden_dim,
+        )
+        # Text -> latent head (pool question hidden states, then map to latent_dim)
+        self.text_to_latent = nn.Sequential(
+            nn.Linear(self.embedding_dim, hidden_dim),
+            nn.GELU(),
+            nn.Linear(hidden_dim, latent_dim),
+        )
+        self.latent_to_physics = None
+        if self.physics_dim > 0:
+            self.latent_to_physics = nn.Sequential(
+                nn.Linear(latent_dim, hidden_dim),
+                nn.GELU(),
+                nn.Linear(hidden_dim, self.physics_dim),
             )
 
     def forward(self,
                 input_ids: torch.Tensor,
                 input_spectra: torch.Tensor,
-                special_token_positions: torch.Tensor = None,
-                star_a_spectra: torch.Tensor = None,
-                star_b_spectra: torch.Tensor = None,
-                star_a_indices: torch.Tensor = None,
-                star_b_indices: torch.Tensor = None,
-                start_pos: int = 0) -> Dict[str, torch.Tensor]:
-        # Handle different modes
-        if self.mode == "two_star":
-            # Two-star mode: use separate features for each star
-            if star_a_spectra is None or star_b_spectra is None:
-                raise ValueError("star_a_features and star_b_features must be provided in two_star mode")
-            
-            # # Ensure features match projector dtype/device
-            # proj_param_a = next(self.projector_a.parameters())
-            # proj_param_b = next(self.projector_b.parameters())
-            # star_a_spectra = star_a_spectra.to(device=proj_param_a.device, dtype=proj_param_a.dtype)
-            # star_b_spectra = star_b_spectra.to(device=proj_param_b.device, dtype=proj_param_b.dtype)
-                        
-            return self._forward_no_cache_two_star(input_ids, star_a_spectra, star_b_spectra, 
-                                                   star_a_indices, star_b_indices)
+                special_token_positions: torch.Tensor,
+                start_pos: int = 0,
+                question_start_indices: Optional[torch.Tensor] = None,
+                answer_start_indices: Optional[torch.Tensor] = None,
+                neighbor_latents: Optional[torch.Tensor] = None,
+                neighbor_mask: Optional[torch.Tensor] = None) -> Dict[str, torch.Tensor]:
+        # Derive latent features
+        if self.fm_model is not None:
+            self.fm_model.eval()
+            with torch.no_grad():
+                # Expect fm_model to return (reg_out,ssl_out,features)
+                _, _, latent_features = self.fm_model(input_spectra)
+                # If multi-stage, collapse across stages
+                if latent_features.dim() == 3:  # (B, S, D)
+                    latent_features = latent_features.mean(dim=1)
         else:
-            # Single-star mode: original behavior
-            if special_token_positions is None:
-                raise ValueError("special_token_positions must be provided in single_star mode")
-            
-            # Derive latent features
-            if self.fm_model is not None:
-                self.fm_model.eval()
-                with torch.no_grad():
-                    # Expect fm_model to return (reg_out,ssl_out,features)
-                    _, _, latent_features = self.fm_model(input_spectra)
-                    # If multi-stage, collapse across stages
-                    if latent_features.dim() == 3:  # (B, S, D)
-                        latent_features = latent_features.mean(dim=1)
-            else:
-                latent_features = input_spectra.float()  # (B, D)
-            # Ensure latent features match projector dtype/device
-            proj_param = next(self.projector.parameters())
-            latent_features = latent_features.to(device=proj_param.device, dtype=proj_param.dtype)
-            return self._forward_no_cache(input_ids, latent_features, special_token_positions)
+            latent_features = input_spectra.float()  # (B, D)
+        # Ensure latent features match projector dtype/device
+        proj_param = next(self.projector.parameters())
+        latent_features = latent_features.to(device=proj_param.device, dtype=proj_param.dtype)
+
+        return self._forward_no_cache(
+            input_ids,
+            latent_features,
+            special_token_positions,
+            question_start_indices=question_start_indices,
+            answer_start_indices=answer_start_indices,
+            neighbor_latents=neighbor_latents,
+            neighbor_mask=neighbor_mask,
+        )
 
     def _forward_no_cache(self, input_ids: torch.Tensor, latent_features: torch.Tensor,
-                          feature_start_indices) -> Dict[str, torch.Tensor]:
+                          feature_start_indices, *,
+                          question_start_indices: Optional[torch.Tensor] = None,
+                          answer_start_indices: Optional[torch.Tensor] = None,
+                          neighbor_latents: Optional[torch.Tensor] = None,
+                          neighbor_mask: Optional[torch.Tensor] = None) -> Dict[str, torch.Tensor]:
         bsz, seqlen = input_ids.shape
         device = input_ids.device
 
@@ -143,7 +161,8 @@ class MultimodalLlamaModelMultiTokens(nn.Module):
 
         # Project spectral features to K token embeddings
         spec_tokens = self.projector(latent_features)  # (B, K, d_model)
-        # spec_tokens = spec_tokens.to(dtype=token_embeddings.dtype)
+        # Optional: reconstruct latent from tokens for auxiliary loss
+        latent_recon = self.inverse_projector(spec_tokens)  # (B, latent_dim)
 
         # Normalize feature_start_indices to a 1D tensor of length bsz
         if feature_start_indices is None:
@@ -184,11 +203,8 @@ class MultimodalLlamaModelMultiTokens(nn.Module):
         freqs = torch.outer(t, freqs)
         freqs_cis = torch.polar(torch.ones_like(freqs), freqs)
 
-        # Causal mask
+        # Mask handled inside _attn_no_cache to accommodate dynamic lengths
         mask = None
-        if seqlen > 1:
-            mask = torch.full((seqlen, seqlen), float("-inf"), device=device, dtype=h.dtype)
-            mask = torch.triu(mask, diagonal=1)
 
         def layer_block(h_in, layer):
             # Attention
@@ -207,7 +223,65 @@ class MultimodalLlamaModelMultiTokens(nn.Module):
 
         h = self.base_model.norm(h)
         logits = self.base_model.output(h).float()
-        return {"logits": logits, "h": h}
+
+        # Optional text->latent prediction computed inside forward for DDP correctness
+        pred_latent_from_text = None
+        if question_start_indices is not None and answer_start_indices is not None:
+            try:
+                pooled = self.pool_question_hidden(h, question_start_indices, answer_start_indices)
+                pred_latent_from_text = self.text_to_latent(pooled)
+            except Exception:
+                pred_latent_from_text = None
+
+        physics_pred = None
+        if pred_latent_from_text is not None and self.latent_to_physics is not None:
+            physics_pred = self.latent_to_physics(pred_latent_from_text)
+
+        neighbor_logits = None
+        if pred_latent_from_text is not None and neighbor_latents is not None and neighbor_latents.numel() > 0:
+            neighbor_latents = neighbor_latents.to(device=latent_features.device, dtype=latent_features.dtype)
+            query = F.normalize(pred_latent_from_text, dim=-1)
+            neigh = F.normalize(neighbor_latents, dim=-1)
+            neighbor_logits = torch.matmul(query.unsqueeze(1), neigh.transpose(1, 2)).squeeze(1)
+            if neighbor_mask is not None:
+                neighbor_mask_float = neighbor_mask.to(device=neighbor_logits.device, dtype=neighbor_logits.dtype)
+                neighbor_logits = neighbor_logits.masked_fill(neighbor_mask_float < 0.5, float('-inf'))
+                neighbor_mask = neighbor_mask_float
+            if self.neighbor_temperature > 0:
+                neighbor_logits = neighbor_logits / self.neighbor_temperature
+
+        return {
+            "logits": logits,
+            "h": h,
+            # For auxiliary invertibility loss (used only if trainer enables it)
+            "latent_recon_from_tokens": latent_recon,
+            "latent_target": latent_features,
+            "pred_latent_from_text": pred_latent_from_text,
+            "physics_pred": physics_pred,
+            "neighbor_logits": neighbor_logits,
+            "neighbor_mask": neighbor_mask,
+        }
+
+    def pool_question_hidden(self, h: torch.Tensor, q_start: torch.Tensor, a_start: torch.Tensor) -> torch.Tensor:
+        """Mean-pool hidden states over [q_start, a_start) per sample.
+
+        Args:
+            h: [B, S, D]
+            q_start: [B] long tensor
+            a_start: [B] long tensor
+        Returns:
+            pooled: [B, D]
+        """
+        B, S, D = h.shape
+        pooled = []
+        for b in range(B):
+            qs = int(q_start[b].item())
+            as_ = int(a_start[b].item())
+            qs = max(0, min(qs, S-1))
+            as_ = max(qs+1, min(as_, S))  # ensure at least one token
+            seg = h[b, qs:as_, :]
+            pooled.append(seg.mean(dim=0))
+        return torch.stack(pooled, dim=0)
 
     def _forward_no_cache_two_star(self, input_ids: torch.Tensor, 
                                    star_a_features: torch.Tensor, star_b_features: torch.Tensor,
@@ -302,8 +376,15 @@ class MultimodalLlamaModelMultiTokens(nn.Module):
         keys = keys.transpose(1, 2)
         values = values.transpose(1, 2)
         scores = torch.matmul(xq, keys.transpose(2, 3)) / math.sqrt(attention_layer.head_dim)
-        if mask is not None:
-            scores = scores + mask
+        qlen, klen = scores.size(-2), scores.size(-1)
+        if mask is None:
+            causal = torch.full((qlen, klen), float('-inf'), device=scores.device, dtype=scores.dtype)
+            causal = torch.triu(causal, diagonal=1)
+            scores = scores + causal
+        else:
+            mask_to_add = mask.to(dtype=scores.dtype, device=scores.device)
+            mask_to_add = mask_to_add[..., :qlen, :klen]
+            scores = scores + mask_to_add
         probs = F.softmax(scores.float(), dim=-1).type_as(xq)
         out = torch.matmul(probs, values)
         out = out.transpose(1, 2).contiguous().view(bsz, seqlen, -1)
@@ -365,24 +446,25 @@ class MultimodalLlamaModelMultiTokens(nn.Module):
             else:
                 return torch.multinomial(probs, 1).item()
 
-        # Prepare features based on mode
-        if self.mode == "two_star":
-            # Ensure features match projector dtype/device
-            proj_param_a = next(self.projector_a.parameters())
-            proj_param_b = next(self.projector_b.parameters())
-            star_a_features = star_a_features.to(device=proj_param_a.device, dtype=proj_param_a.dtype)
-            star_b_features = star_b_features.to(device=proj_param_b.device, dtype=proj_param_b.dtype)
-        else:
-            # Ensure features fed to projector match projector dtype/device
-            proj_param = next(self.projector.parameters())
-            features_vec = input_spectra.view(prompt.size(0), -1).to(device=proj_param.device, dtype=proj_param.dtype)
+        # Ensure features fed to projector match projector dtype/device
+        proj_param = next(self.projector.parameters())
+        features_vec = input_spectra.view(prompt.size(0), -1).to(device=proj_param.device, dtype=proj_param.dtype)
+        neighbor_latents = None
+        neighbor_mask = None
+        if 'neighbor_latents' in batch_data and batch_data['neighbor_latents'].numel() > 0:
+            neighbor_latents = batch_data['neighbor_latents'][batch_idx:batch_idx+1].to(device)
+            neighbor_mask = batch_data.get('neighbor_mask')
+            if neighbor_mask is not None and neighbor_mask.numel() > 0:
+                neighbor_mask = neighbor_mask[batch_idx:batch_idx+1].to(device)
 
         for _ in range(max_new_tokens):
-            if self.mode == "two_star":
-                out = self._forward_no_cache_two_star(prompt, star_a_features, star_b_features,
-                                                      star_a_indices, star_b_indices)
-            else:
-                out = self._forward_no_cache(prompt, features_vec, feature_start_idx)
+            out = self._forward_no_cache(
+                prompt,
+                features_vec,
+                feature_start_idx,
+                neighbor_latents=neighbor_latents,
+                neighbor_mask=neighbor_mask,
+            )
             logits = out['logits'][:, -1, :].squeeze(0)
             # Log prob of chosen token
             if temperature > 0:

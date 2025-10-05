@@ -29,3 +29,14 @@ __pycache__/
 .DS_Store
 .vscode/
 .idea/
+data/stellar_descriptions_questions_short.json
+data/stellar_descriptions_combined.json
+data/stellar_descriptions_questions_geometry.json
+data/stellar_descriptions_questions_retrieval.json
+data/stellar_descriptions_questions_properties.json
+data/combined_tmp.json
+data/features.npy
+data/stellar_topology_neighbors.json
+data/stellar_topology_questions.json
+data/stellar_topology_questions_small.json
+data/stellar_topology_neighbors_small.json
