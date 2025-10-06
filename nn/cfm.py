@@ -36,6 +36,15 @@ class SpectralFlowBridge(nn.Module):
             nn.Linear(hidden_dim, hidden_dim),
         )
         
+        # Hidden state condition encoder (for when using hidden states instead of logits)
+        # Assume hidden states are 4096-dimensional (LLaMA dimension)
+        self.hidden_encoder = nn.Sequential(
+            nn.Linear(4096, hidden_dim),
+            nn.LayerNorm(hidden_dim),
+            nn.SiLU(),
+            nn.Linear(hidden_dim, hidden_dim),
+        )
+        
         # Vector field network v_θ(x_t, t, c)
         self.vector_field = nn.Sequential(
             nn.Linear(feature_dim + time_embed_dim + hidden_dim, hidden_dim * 2),
@@ -48,14 +57,21 @@ class SpectralFlowBridge(nn.Module):
             nn.Linear(hidden_dim, feature_dim),
         )
         
-    def encode_condition(self, token_logits):
-        """Encode token distribution as condition"""
-        # Handle different input shapes
-        if token_logits.dim() == 3:  # (B, seq_len, vocab_size)
+    def encode_condition(self, input_repr):
+        """Encode token distribution or hidden states as condition"""
+        # Handle different input shapes and types
+        if input_repr.dim() == 3:  # (B, seq_len, D)
             # Use last position or pool
-            token_logits = token_logits[:, -1, :]  # (B, vocab_size)
-        token_probs = F.softmax(token_logits, dim=-1)
-        return self.token_encoder(token_probs)
+            input_repr = input_repr[:, -1, :]  # (B, D)
+        
+        # Determine if input is logits (vocab_size) or hidden states (hidden_dim)
+        if input_repr.size(-1) == self.vocab_size:
+            # Input is logits, convert to probabilities
+            token_probs = F.softmax(input_repr, dim=-1)
+            return self.token_encoder(token_probs)
+        else:
+            # Input is hidden states, use hidden encoder
+            return self.hidden_encoder(input_repr)
     
     def compute_vector_field(self, x_t, t, condition):
         """Compute the vector field v(x_t, t | c)"""
@@ -84,19 +100,20 @@ class SpectralFlowBridge(nn.Module):
         # Compute vector field
         return self.vector_field(h)
     
-    def training_step(self, token_logits, target_features):
+    def training_step(self, input_repr, target_features):
         """
         Compute CFM loss for training
         
         Args:
-            token_logits: (B, vocab_size) or (B, seq_len, vocab_size)
+            input_repr: (B, vocab_size), (B, seq_len, vocab_size) for logits, or
+                       (B, hidden_dim), (B, seq_len, hidden_dim) for hidden states
             target_features: (B, feature_dim) ground truth features
         """
         batch_size = target_features.size(0)
         device = target_features.device
         
         # Encode condition
-        condition = self.encode_condition(token_logits)
+        condition = self.encode_condition(input_repr)
         
         # Sample noise (source distribution)
         x_0 = torch.randn_like(target_features)

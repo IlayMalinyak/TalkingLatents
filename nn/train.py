@@ -537,11 +537,13 @@ class MaskedRegressorTrainer(Trainer):
 
 class LLMTrainer(Trainer):
 
-    def __init__(self, lora_params, alpha=1, beta=1, gamma=1, max_chunk_size=128, tokenizer=None, mode="single_star", **kwargs):
+    def __init__(self, lora_params, alpha=1, beta=1, gamma=1,
+                 cfm_weight=0.01, max_chunk_size=128, tokenizer=None, mode="single_star", **kwargs):
         super(LLMTrainer, self).__init__(**kwargs)
         self.alpha = alpha
         self.beta = beta
         self.gamma = gamma
+        self.cfm_weight = cfm_weight
         self.max_chunk_size = max_chunk_size
         self.tokenizer = tokenizer
         self.mode = mode  # "single_star" or "two_star"
@@ -689,18 +691,12 @@ class LLMTrainer(Trainer):
     def train_epoch(self, device, epoch):
         # Handle mode switching for combined mode
         if hasattr(self, 'combined_mode') and self.combined_mode:
-            if epoch >= self.switch_epoch and self.mode == "single_star":
-                print(f"\n*** SWITCHING MODE FROM single_star TO two_star AT EPOCH {epoch} ***")
-                # Switch to two_star mode
-                self.mode = "two_star"
-                self.train_dl = self.two_star_loaders['train']
-                self.val_dl = self.two_star_loaders['val']
-                # Update model mode
-                if hasattr(self.model, 'module'):
-                    self.model.module.mode = "two_star"
-                else:
-                    self.model.mode = "two_star"
-                print(f"Switched to two_star mode with {len(self.train_dl)} batches per epoch")
+            # Mixed dataset handles mode switching internally based on probability
+            # Update model mode to "combined" to use forward_mixed method
+            if hasattr(self.model, 'module'):
+                self.model.module.mode = "combined"
+            else:
+                self.model.mode = "combined"
         
         self._apply_freeze_strategy(self.freeze_strategy)
         return super().train_epoch(device, epoch)
@@ -766,29 +762,21 @@ class LLMTrainer(Trainer):
         return loss
     
     def get_logits(self, batch, device, val=False):
-        # DEBUG: Check input tensors
         input_ids = batch['input_ids'].to(device)
         target_ids = batch['target_ids'].to(device)
 
-        
-        # Handle different data structures based on mode
-        if self.mode == "two_star":
-            star_a_spectra = batch['masked_spectra_a'].to(device)
-            star_b_spectra = batch['masked_spectra_b'].to(device)
-            star_a_indices = batch['star_a_feature_indices'].to(device)
-            star_b_indices = batch['star_b_feature_indices'].to(device)
+        mode = getattr(self, 'mode', 'single_star')
 
-        else:
-            special_token_positions = batch['feature_start_indices'].to(device)
-            input_spectra = batch['masked_spectra'].to(device) 
-        
-        # Forward pass with memory tracking and AMP
         mem_before_forward = torch.cuda.memory_allocated(device) / 1024**3
         with autocast(enabled=getattr(self, 'use_amp', False)):
-            # Conditional no_grad
             cm = torch.no_grad() if val else torch.enable_grad()
             with cm:
-                if self.mode == "two_star":
+                if mode == "two_star":
+                    star_a_spectra = batch['masked_spectra_a'].to(device)
+                    star_b_spectra = batch['masked_spectra_b'].to(device)
+                    star_a_indices = batch['star_a_feature_indices'].to(device)
+                    star_b_indices = batch['star_b_feature_indices'].to(device)
+
                     outputs = self.model(
                         input_ids=input_ids,
                         input_spectra=None,
@@ -798,7 +786,20 @@ class LLMTrainer(Trainer):
                         star_a_indices=star_a_indices,
                         star_b_indices=star_b_indices,
                     )
+                elif mode == "combined":
+                    # Use the new forward_mixed method for seamless mixed batch handling
+                    # Move batch data to device
+                    batch_device = {}
+                    for key, value in batch.items():
+                        if isinstance(value, torch.Tensor):
+                            batch_device[key] = value.to(device)
+                        else:
+                            batch_device[key] = value
+                    outputs = self.model.forward_mixed(batch_device)
                 else:
+                    special_token_positions = batch['feature_start_indices'].to(device)
+                    input_spectra = batch['masked_spectra'].to(device)
+
                     outputs = self.model(
                         input_ids=input_ids,
                         input_spectra=input_spectra,
@@ -806,6 +807,107 @@ class LLMTrainer(Trainer):
                     )
 
         return outputs
+
+    def _forward_combined(self, batch, device):
+        input_ids = batch['input_ids'].to(device)
+        batch_size, seq_len = input_ids.shape
+
+        full_logits = None
+        full_hidden = None
+        cfm_losses = []
+
+        def _allocate(outputs):
+            nonlocal full_logits, full_hidden
+            if full_logits is None:
+                full_logits = torch.zeros(
+                    (batch_size,) + outputs['logits'].shape[1:],
+                    dtype=outputs['logits'].dtype,
+                    device=outputs['logits'].device,
+                )
+                full_hidden = torch.zeros(
+                    (batch_size,) + outputs['h'].shape[1:],
+                    dtype=outputs['h'].dtype,
+                    device=outputs['h'].device,
+                )
+
+        single_mask = batch['mode_mask_single']
+        comp_mask = batch['mode_mask_comparative']
+
+        single_indices = torch.nonzero(single_mask, as_tuple=False).squeeze(-1)
+        comp_indices = torch.nonzero(comp_mask, as_tuple=False).squeeze(-1)
+
+        if single_indices.numel() > 0:
+            single_indices_device = single_indices.to(device)
+            single_inputs = input_ids.index_select(0, single_indices_device)
+
+            if batch.get('x_raw') is not None and batch['x_raw'] is not None:
+                single_features = batch['x_raw'].index_select(0, single_indices).to(device)
+            elif batch.get('masked_spectra') is not None and batch['masked_spectra'] is not None:
+                single_features = batch['masked_spectra'].index_select(0, single_indices).to(device)
+            else:
+                raise ValueError("Missing spectral features for single-star samples in mixed batch")
+
+            special_positions = batch['feature_start_indices'].index_select(0, single_indices).to(device)
+
+            outputs_single = self.model(
+                input_ids=single_inputs,
+                input_spectra=single_features,
+                special_token_positions=special_positions,
+            )
+            _allocate(outputs_single)
+            full_logits.index_copy_(0, single_indices_device, outputs_single['logits'])
+            full_hidden.index_copy_(0, single_indices_device, outputs_single['h'])
+            if 'cfm_loss' in outputs_single:
+                cfm_losses.append(outputs_single['cfm_loss'])
+
+        if comp_indices.numel() > 0:
+            comp_indices_device = comp_indices.to(device)
+            comp_inputs = input_ids.index_select(0, comp_indices_device)
+
+            if batch.get('x_raw_a') is not None and batch['x_raw_a'] is not None:
+                star_a = batch['x_raw_a'].index_select(0, comp_indices).to(device)
+            elif batch.get('masked_spectra_a') is not None and batch['masked_spectra_a'] is not None:
+                star_a = batch['masked_spectra_a'].index_select(0, comp_indices).to(device)
+            else:
+                raise ValueError("Missing Star A features for comparative samples in mixed batch")
+
+            if batch.get('x_raw_b') is not None and batch['x_raw_b'] is not None:
+                star_b = batch['x_raw_b'].index_select(0, comp_indices).to(device)
+            elif batch.get('masked_spectra_b') is not None and batch['masked_spectra_b'] is not None:
+                star_b = batch['masked_spectra_b'].index_select(0, comp_indices).to(device)
+            else:
+                raise ValueError("Missing Star B features for comparative samples in mixed batch")
+
+            star_a_indices = batch['star_a_feature_indices'].index_select(0, comp_indices).to(device)
+            star_b_indices = batch['star_b_feature_indices'].index_select(0, comp_indices).to(device)
+            star_a_indices = star_a_indices.clone()
+            star_b_indices = star_b_indices.clone()
+            star_a_indices[star_a_indices < 0] = seq_len
+            star_b_indices[star_b_indices < 0] = seq_len
+
+            outputs_comp = self.model(
+                input_ids=comp_inputs,
+                input_spectra=None,
+                special_token_positions=None,
+                star_a_spectra=star_a,
+                star_b_spectra=star_b,
+                star_a_indices=star_a_indices,
+                star_b_indices=star_b_indices,
+            )
+            _allocate(outputs_comp)
+            full_logits.index_copy_(0, comp_indices_device, outputs_comp['logits'])
+            full_hidden.index_copy_(0, comp_indices_device, outputs_comp['h'])
+            if 'cfm_loss' in outputs_comp:
+                cfm_losses.append(outputs_comp['cfm_loss'])
+
+        if full_logits is None or full_hidden is None:
+            raise ValueError("Mixed batch produced no forward outputs")
+
+        outputs = {"logits": full_logits, "h": full_hidden}
+        if cfm_losses:
+            outputs['cfm_loss'] = torch.stack(cfm_losses).mean()
+        return outputs
+
 
 
     def train_batch(self, batch, batch_idx, device):
@@ -821,7 +923,44 @@ class LLMTrainer(Trainer):
         
         target_ids = batch['target_ids'].to(device)
         # Compute loss
-        loss = self.get_loss(outputs['logits'], target_ids)
+        # Compute language modeling loss
+        lm_loss = self.get_loss(outputs['logits'], target_ids)
+        
+        # Combine losses
+        loss = lm_loss
+        
+        # Add CFM loss if available
+        if 'cfm_loss' in outputs:
+            cfm_loss = outputs['cfm_loss']
+            loss = loss + self.cfm_weight * cfm_loss
+            
+            # Log CFM loss for monitoring
+            if batch_idx % 100 == 0:
+                print(f"  LM Loss: {lm_loss.item():.4f}, CFM Loss: {cfm_loss.item():.4f}")
+        
+        # Add stellar parameter loss if available
+        if 'stellar_predictions' in outputs:
+            stellar_loss = self.compute_stellar_parameter_loss(outputs['stellar_predictions'], batch)
+            if stellar_loss is not None:
+                # Check for NaN in stellar loss
+                if torch.isnan(stellar_loss) or torch.isinf(stellar_loss):
+                    print(f"Warning: NaN/inf detected in stellar parameter loss, skipping")
+                    # Don't add NaN loss to total loss
+                else:
+                    loss = loss + stellar_loss
+                    
+                    # Log stellar parameter loss for monitoring
+                    if batch_idx % 100 == 0:
+                        print(f"  Stellar Param Loss: {stellar_loss.item():.4f}")
+        
+        # Check for NaN in total loss
+        if torch.isnan(loss) or torch.isinf(loss):
+            print(f"Warning: NaN/inf detected in total loss at batch {batch_idx}")
+            print(f"  LM Loss: {lm_loss.item() if not torch.isnan(lm_loss) else 'NaN'}")
+            if 'cfm_loss' in outputs:
+                print(f"  CFM Loss: {outputs['cfm_loss'].item() if not torch.isnan(outputs['cfm_loss']) else 'NaN'}")
+            # Skip this batch by returning a small loss
+            loss = torch.tensor(1e-6, device=device, requires_grad=True)
         
         
         # Backward pass with AMP
@@ -829,24 +968,32 @@ class LLMTrainer(Trainer):
             # Scale loss and backward
             self.scaler.scale(loss).backward()
             
-            # Gradient clipping (optional)
-            if hasattr(self, 'max_grad_norm') and self.max_grad_norm > 0:
-                self.scaler.unscale_(self.optimizer)
-                torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.max_grad_norm)
+            # Gradient clipping (always enabled for stability)
+            self.scaler.unscale_(self.optimizer)
+            grad_norm = torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
             
-            # Optimizer step with scaler
-            self.scaler.step(self.optimizer)
-            self.scaler.update()
+            # Check for NaN gradients
+            if torch.isnan(grad_norm) or torch.isinf(grad_norm):
+                print(f"Warning: NaN/inf gradients detected (norm: {grad_norm}), skipping optimizer step")
+                # Don't step the optimizer
+            else:
+                # Optimizer step with scaler
+                self.scaler.step(self.optimizer)
+                self.scaler.update()
         else:
             # Standard backward pass
             loss.backward()
             
-            # Gradient clipping (optional)
-            if hasattr(self, 'max_grad_norm') and self.max_grad_norm > 0:
-                torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.max_grad_norm)
+            # Gradient clipping (always enabled for stability)
+            grad_norm = torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
             
-            # Standard optimizer step
-            self.optimizer.step()
+            # Check for NaN gradients
+            if torch.isnan(grad_norm) or torch.isinf(grad_norm):
+                print(f"Warning: NaN/inf gradients detected (norm: {grad_norm}), skipping optimizer step")
+                # Don't step the optimizer
+            else:
+                # Standard optimizer step
+                self.optimizer.step()
         
         # Learning rate scheduler
         if self.scheduler is not None:
@@ -860,18 +1007,206 @@ class LLMTrainer(Trainer):
 
         target_ids = batch['target_ids'].to(device)
         
-        loss = self.get_loss(outputs['logits'], target_ids)
+        lm_loss = self.get_loss(outputs['logits'], target_ids)
+        
+        # Combine losses
+        loss = lm_loss
+        
+        # Add CFM loss if available
+        if 'cfm_loss' in outputs:
+            cfm_loss = outputs['cfm_loss']
+            loss = loss + self.cfm_weight * cfm_loss
+            
+            # Log CFM loss for monitoring
+            if batch_idx % 100 == 0:
+                print(f"  LM Loss: {lm_loss.item():.4f}, CFM Loss: {cfm_loss.item():.4f}")
+        
+        # Add stellar parameter loss if available
+        if 'stellar_predictions' in outputs:
+            stellar_loss = self.compute_stellar_parameter_loss(outputs['stellar_predictions'], batch)
+            if stellar_loss is not None:
+                # Check for NaN in stellar loss
+                if torch.isnan(stellar_loss) or torch.isinf(stellar_loss):
+                    print(f"Warning: NaN/inf detected in stellar parameter loss, skipping")
+                    # Don't add NaN loss to total loss
+                else:
+                    loss = loss + stellar_loss
+                    
+                    # Log stellar parameter loss for monitoring
+                    if batch_idx % 100 == 0:
+                        print(f"  Stellar Param Loss: {stellar_loss.item():.4f}")
+        
+        # Check for NaN in total loss
+        if torch.isnan(loss) or torch.isinf(loss):
+            print(f"Warning: NaN/inf detected in total loss at batch {batch_idx}")
+            print(f"  LM Loss: {lm_loss.item() if not torch.isnan(lm_loss) else 'NaN'}")
+            if 'cfm_loss' in outputs:
+                print(f"  CFM Loss: {outputs['cfm_loss'].item() if not torch.isnan(outputs['cfm_loss']) else 'NaN'}")
+            # Skip this batch by returning a small loss
+            loss = torch.tensor(1e-6, device=device, requires_grad=True)
         
         return loss, 0, outputs['h']
+    
+    def compute_stellar_parameter_loss(self, stellar_predictions: Dict[str, torch.Tensor], batch: Dict[str, Any]) -> Optional[torch.Tensor]:
+        """
+        Compute L1/L2 loss for stellar parameter predictions
+        
+        Args:
+            stellar_predictions: Dict of predicted parameters {'Teff': tensor, 'logg': tensor, 'FeH': tensor}
+            batch: Batch containing ground truth stellar parameters
+            
+        Returns:
+            Combined stellar parameter loss or None if no ground truth available
+        """
+        device = next(iter(stellar_predictions.values())).device
+        total_loss = torch.tensor(0.0, device=device)
+        loss_count = 0
+        
+        # Helper function to compute loss for a parameter set
+        def compute_param_loss(gt_params_tensor, gt_mask_tensor, param_names_subset, debug_prefix=""):
+            nonlocal total_loss, loss_count
+            
+            if gt_mask_tensor.any() and gt_params_tensor.size(1) > 0:
+                for i, param_name in enumerate(param_names_subset):
+                    if param_name in stellar_predictions and i < gt_params_tensor.size(1):
+                        pred = stellar_predictions[param_name][gt_mask_tensor]
+                        gt = gt_params_tensor[gt_mask_tensor, i]
+                        
+                        # Check for valid values (non-zero ground truth)
+                        valid_mask = (gt != 0.0)
+                        if valid_mask.any():
+                            pred_valid = pred[valid_mask]
+                            gt_valid = gt[valid_mask]
+                            
+                            if len(pred_valid) > 0 and len(gt_valid) > 0:
+                                param_loss = F.l1_loss(pred_valid, gt_valid)
+                                total_loss += param_loss
+                                loss_count += 1
+        
+        # For single-star mode, use stellar_params_gt
+        if 'stellar_params_gt' in batch and batch['stellar_params_gt'] is not None:
+            gt_params = batch['stellar_params_gt'].to(device)
+            gt_mask = batch['stellar_params_gt_present'].to(device)
+            param_names = ['Teff', 'logg', 'FeH']
+            compute_param_loss(gt_params, gt_mask, param_names, "single")
+        
+        # For comparative mode, use stellar_params_gt_a and stellar_params_gt_b
+        if 'stellar_params_gt_a' in batch and batch['stellar_params_gt_a'] is not None:
+            gt_params_a = batch['stellar_params_gt_a'].to(device)
+            gt_mask_a = batch['stellar_params_gt_a_present'].to(device)
+            # Only use parameters that exist in this tensor
+            available_params = ['Teff', 'logg', 'FeH'][:gt_params_a.size(1)]
+            compute_param_loss(gt_params_a, gt_mask_a, available_params, "star_a")
+        
+        if 'stellar_params_gt_b' in batch and batch['stellar_params_gt_b'] is not None:
+            gt_params_b = batch['stellar_params_gt_b'].to(device)
+            gt_mask_b = batch['stellar_params_gt_b_present'].to(device)
+            # Only use parameters that exist in this tensor
+            available_params = ['Teff', 'logg', 'FeH'][:gt_params_b.size(1)]
+            compute_param_loss(gt_params_b, gt_mask_b, available_params, "star_b")
+        
+        # Return average loss if any parameters were processed
+        if loss_count > 0:
+            return total_loss / loss_count
+        else:
+            return None
+    
+    def _get_stellar_parameter_predictions(self, batch: Dict[str, Any], batch_idx: int, device: torch.device) -> Optional[str]:
+        """Get stellar parameter predictions as JSON string"""
+        try:
+            # Run forward pass to get predictions
+            outputs = self.get_logits(batch, device, val=True)
+            
+            if 'stellar_predictions' in outputs:
+                predictions = outputs['stellar_predictions']
+                
+                # Extract predictions for the specific batch index
+                pred_dict = {}
+                for param_name, pred_tensor in predictions.items():
+                    if batch_idx < len(pred_tensor):
+                        pred_dict[param_name] = round(pred_tensor[batch_idx].item(), 2)
+                
+                if pred_dict:
+                    import json
+                    return json.dumps(pred_dict, separators=(',', ':'))
+            
+            return None
+        except Exception as e:
+            print(f"Error getting stellar predictions: {e}")
+            return None
+    
+    def _get_ground_truth_stellar_parameters(self, batch: Dict[str, Any], batch_idx: int) -> Optional[str]:
+        """Get ground truth stellar parameters as JSON string"""
+        try:
+            import json
+            
+            # Try single-star mode first
+            if 'stellar_params_gt' in batch and batch['stellar_params_gt'] is not None:
+                gt_params = batch['stellar_params_gt']
+                gt_mask = batch['stellar_params_gt_present']
+                
+                if batch_idx < len(gt_mask) and gt_mask[batch_idx] and gt_params.size(1) > 0:
+                    param_names = ['Teff', 'logg', 'FeH']
+                    gt_dict = {}
+                    for i, param_name in enumerate(param_names):
+                        if i < gt_params.shape[1]:
+                            gt_dict[param_name] = round(gt_params[batch_idx, i].item(), 2)
+                    
+                    if gt_dict:
+                        return json.dumps(gt_dict, separators=(',', ':'))
+            
+            # Try comparative mode star A
+            if 'stellar_params_gt_a' in batch and batch['stellar_params_gt_a'] is not None:
+                gt_params_a = batch['stellar_params_gt_a']
+                gt_mask_a = batch['stellar_params_gt_a_present']
+                
+                if batch_idx < len(gt_mask_a) and gt_mask_a[batch_idx] and gt_params_a.size(1) > 0:
+                    param_names = ['Teff', 'logg', 'FeH']
+                    gt_dict_a = {}
+                    for i, param_name in enumerate(param_names):
+                        if i < gt_params_a.shape[1]:
+                            gt_dict_a[f"{param_name}_A"] = round(gt_params_a[batch_idx, i].item(), 2)
+                    
+                    # Also try star B
+                    gt_dict_b = {}
+                    if 'stellar_params_gt_b' in batch and batch['stellar_params_gt_b'] is not None:
+                        gt_params_b = batch['stellar_params_gt_b']
+                        gt_mask_b = batch['stellar_params_gt_b_present']
+                        
+                        if batch_idx < len(gt_mask_b) and gt_mask_b[batch_idx] and gt_params_b.size(1) > 0:
+                            for i, param_name in enumerate(param_names):
+                                if i < gt_params_b.shape[1]:
+                                    gt_dict_b[f"{param_name}_B"] = round(gt_params_b[batch_idx, i].item(), 2)
+                    
+                    combined_dict = {**gt_dict_a, **gt_dict_b}
+                    if combined_dict:
+                        return json.dumps(combined_dict, separators=(',', ':'))
+            
+            return None
+        except Exception as e:
+            print(f"Error getting ground truth stellar parameters: {e}")
+            return None
     
     def eval_epoch(self, device, epoch):
         """
         Enhanced evaluation: first evaluate on sample questions, then run regular eval
         """
-        # Evaluate on validation samples first (rank 0 only)
-        if (not dist.is_initialized()) or dist.get_rank() == 0:
-            if epoch % 1 == 0:  # Every epoch
-                self.evaluate_validation_samples(device, epoch)
+        # Skip detailed evaluation for the first few epochs to let model stabilize
+        current_rank = dist.get_rank() if dist.is_initialized() else 0
+        print(f"DEBUG: eval_epoch called on rank {current_rank}")
+        
+        if epoch >= 3:  # Only run detailed evaluation after epoch 3
+            if (not dist.is_initialized()) or dist.get_rank() == 0:
+                print(f"DEBUG: Running evaluate_validation_samples on rank {current_rank}")
+                try:
+                    self.evaluate_validation_samples(device, epoch)
+                except Exception as e:
+                    print(f"Warning: Evaluation failed with error: {e}")
+                    print("Continuing training without detailed evaluation...")
+            else:
+                print(f"DEBUG: Skipping evaluate_validation_samples on rank {current_rank}")
+        else:
+            print(f"DEBUG: Skipping evaluation for epoch {epoch} (stabilization period)")
         
         # Then run regular evaluation
         return super().eval_epoch(device, epoch)
@@ -881,7 +1216,17 @@ class LLMTrainer(Trainer):
         """
         Evaluate model on actual validation samples with both teacher-forcing and generation perplexity
         """
+        current_rank = dist.get_rank() if dist.is_initialized() else 0
+        print(f"DEBUG: evaluate_validation_samples called on rank {current_rank}")
         self.model.eval()
+        
+        # For combined mode, ensure model is set to combined mode across all ranks
+        if hasattr(self, 'combined_mode') and self.combined_mode:
+            # Ensure model is in combined mode
+            if isinstance(self.model, torch.nn.DataParallel) or isinstance(self.model, torch.nn.parallel.DistributedDataParallel):
+                self.model.module.mode = "combined"
+            else:
+                self.model.mode = "combined"
         
         print(f"\n{'='*80}")
         print(f"VALIDATION SAMPLE EVALUATION - EPOCH {epoch}")
@@ -891,7 +1236,14 @@ class LLMTrainer(Trainer):
         if tokenizer is None:
             print("Warning: No tokenizer available for decoding")
         
-        val_iter = iter(self.val_dl)
+        # Use appropriate validation dataloader based on current mode
+        if hasattr(self, 'combined_mode') and self.combined_mode:
+            # For mixed datasets, always use the mixed validation dataloader
+            val_dl = self.val_dl
+        else:
+            val_dl = self.val_dl
+        
+        val_iter = iter(val_dl)
         
         epoch_results = {
             'epoch': epoch,
@@ -914,7 +1266,19 @@ class LLMTrainer(Trainer):
                     break
                 
                 batch_idx = 0
-                obsid = batch['obsids'][batch_idx] if 'obsids' in batch else "Unknown"
+                # Handle different batch structures for mixed vs single datasets
+                if 'obsids' in batch:
+                    # Single dataset format
+                    obsid = batch['obsids'][batch_idx]
+                elif 'metadata' in batch and batch['metadata']:
+                    # Mixed dataset format
+                    meta = batch['metadata'][batch_idx]
+                    if meta and 'raw' in meta:
+                        obsid = meta['raw'].get('obsid', "Unknown")
+                    else:
+                        obsid = "Unknown"
+                else:
+                    obsid = "Unknown"
                 
                 # 1. Calculate teacher-forcing perplexity (how well it predicts the true answer)
                 tf_perplexity = self._calculate_teacher_forcing_perplexity(batch, batch_idx, device)
@@ -955,6 +1319,16 @@ class LLMTrainer(Trainer):
                 print(f"Teacher-Forcing Perplexity: {tf_perplexity:.2f}")
                 print(f"Generation Perplexity: {gen_perplexity:.2f}")
                 print(f"Generated {len(generation_log_probs)} tokens")
+                
+                # Add stellar parameter predictions if available
+                stellar_pred_json = self._get_stellar_parameter_predictions(batch, batch_idx, device)
+                if stellar_pred_json:
+                    print(f"STELLAR PARAMETERS: {stellar_pred_json}")
+                
+                # Add ground truth stellar parameters if available
+                stellar_gt_json = self._get_ground_truth_stellar_parameters(batch, batch_idx)
+                if stellar_gt_json:
+                    print(f"TRUE STELLAR PARAMS: {stellar_gt_json}")
                 
                 # Store results
                 sample_result = {
@@ -1037,7 +1411,22 @@ class LLMTrainer(Trainer):
 
         # WRAP with autocast for validation too
         with autocast(enabled=getattr(self, 'use_amp', False)):
-            if self.mode == "two_star":
+            print(f"DEBUG TRAINER: batch keys: {list(batch.keys())}")
+            print(f"DEBUG TRAINER: self.mode = {self.mode}")
+            
+            # Handle combined mode - use forward_mixed for mixed batches
+            if hasattr(self, 'combined_mode') and self.combined_mode and 'mode' in batch:
+                # For teacher forcing with single sample, extract just that sample
+                single_batch = {}
+                for key, value in batch.items():
+                    if isinstance(value, torch.Tensor):
+                        single_batch[key] = value[batch_idx:batch_idx+1].to(device)
+                    elif isinstance(value, list):
+                        single_batch[key] = [value[batch_idx]]
+                    else:
+                        single_batch[key] = value
+                outputs = self.model.forward_mixed(single_batch)
+            elif self.mode == "two_star":
                 star_a_spectra = batch['masked_spectra_a'][batch_idx:batch_idx+1].to(device)
                 star_b_spectra = batch['masked_spectra_b'][batch_idx:batch_idx+1].to(device)
                 star_a_indices = batch['star_a_feature_indices'][batch_idx:batch_idx+1].to(device)
@@ -1052,8 +1441,23 @@ class LLMTrainer(Trainer):
                     star_b_indices=star_b_indices,
                     )
             else:
-                special_token_positions = batch['feature_start_indices'].to(device)
-                input_spectra = batch['masked_spectra'].to(device) 
+                special_token_positions = batch['feature_start_indices'][batch_idx:batch_idx+1].to(device)
+                input_spectra = batch['masked_spectra'][batch_idx:batch_idx+1].to(device)
+                print(f"DEBUG TRAINER: input_spectra shape from batch: {input_spectra.shape}")
+                print(f"DEBUG TRAINER: input_spectra dtype: {input_spectra.dtype}")
+                print(f"DEBUG TRAINER: First few values: {input_spectra[0, :5]}")
+                print(f"DEBUG TRAINER: Value range: min={input_spectra.min().item():.4f}, max={input_spectra.max().item():.4f}")
+                
+                # Sanity check: spectral features should typically be in range [-1, 5] or [0, 1]
+                # LLM hidden states are typically in range [-10, 10] or larger
+                if input_spectra.max().item() > 10 or input_spectra.min().item() < -10:
+                    print(f"WARNING: input_spectra values seem to be in LLM hidden state range, not spectral range!")
+                if input_spectra.shape[-1] == 4096:
+                    print(f"CRITICAL: input_spectra has 4096 dims = LLM hidden dim! This should be spectral features!")
+                    print(f"EMERGENCY FIX: Skipping this sample due to corrupted data")
+                    # Return dummy perplexity to avoid crash
+                    return float('inf')
+                
                 outputs = self.model(
                     input_ids=input_ids,
                     input_spectra=input_spectra,

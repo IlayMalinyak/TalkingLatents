@@ -32,10 +32,11 @@ from nn.train import LLMTrainer
 from util.utils import *
 # from nn.multimodal import setup
 
-JSON_PATH = '/lustre/fswork/projects/rech/oxl/utl47bv/data/stellar_descriptions_questions_short.json'
-FEATURES_PATH = '/lustre/fswork/projects/rech/oxl/utl47bv/data/features.npy'  # Optional, can be None to load all features on-the-fly
-MODEL_PATH = "/lustre/fsmisc/dataset/HuggingFace_Models/meta-llama/Meta-Llama-3.1-8B/original"
-TOKENIZER_PATH = "/lustre/fsmisc/dataset/HuggingFace_Models/meta-llama/Meta-Llama-3.1-8B/original"
+JSON_PATH = '/data/TalkingLatents/data/dataset/stellar_descriptions_questions_short.json'
+COMPARATIVE_JSON_FILE='/data/TalkingLatents/data/dataset/comparative_dataset.json'
+FEATURES_PATH = '/data/TalkingLatents/logs/2025-07-29/features.npy'  # Optional, can be None to load all features on-the-fly
+MODEL_PATH = "/data/.llama/Llama3.1-8B"
+TOKENIZER_PATH = "/data/.llama/Llama3.1-8B"
 SPECTRA_CONFIG_PATH = "/data/DESA/logs/spec_decode2_2025-02-16/MultiTaskRegressor_spectra__decode_4_complete_config.yaml"
 SPECTRA_WEIGHTS_PATH = "/data/DESA/logs/spec_decode2_2025-02-16/MultiTaskRegressor_spectra_decode_4.pth"
 
@@ -287,6 +288,10 @@ def parse_args():
                           help='Directory to load model checkpoint from, if any'),
     parser.add_argument('--train', type=bool, default=True,
                           help='Whether to train the model or just evaluate'),
+    parser.add_argument('--use_cfm', action='store_true', default=True, 
+                   help='Use Conditional Flow Matching')
+    parser.add_argument('--cfm_weight', type=float, default=0.1,
+                   help='Weight for CFM loss')
                     
                 
     
@@ -324,6 +329,8 @@ def parse_args():
                        default='/data/TalkingLatents/data/dataset/comparative_dataset.json',
                        help='Path to comparative questions JSON file (used in two_star mode)')
     
+    parser.add_argument('--single_sample_prob', type=float, default=0.5,
+                       help='Probability of drawing a single-star sample when using the mixed dataset')
     
     # Memory optimization
     parser.add_argument('--gradient_checkpointing', action='store_true', default=True,

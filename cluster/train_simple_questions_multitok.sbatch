@@ -1,17 +1,19 @@
 #!/bin/bash
 #SBATCH --job-name=TalkingLatents
 #SBATCH --nodes=1
-#SBATCH --ntasks=4
-#SBATCH --ntasks-per-node=4
+#SBATCH --ntasks=2
+#SBATCH --ntasks-per-node=2
 #SBATCH --cpus-per-task=8
-#SBATCH --gpus-per-node=a100:4
+#SBATCH --gpus-per-node=a100:2
 #SBATCH --qos=basic
 #SBATCH --mem=64G
 #SBATCH --hint=nomultithread
 
-# Allocator setting compatible with this build
-export PYTORCH_CUDA_ALLOC_CONF=${PYTORCH_CUDA_ALLOC_CONF:-"max_split_size_mb:64"}
+# Allocator settings optimized for multi-GPU memory efficiency
+export PYTORCH_CUDA_ALLOC_CONF=${PYTORCH_CUDA_ALLOC_CONF:-"max_split_size_mb:32,expandable_segments:True"}
 export NCCL_DEBUG=${NCCL_DEBUG:-WARN}
+export OMP_NUM_THREADS=2
+export CUDA_LAUNCH_BLOCKING=0
 
 # Data/model paths (edit to your filesystem)
 JSON_FILE=/data/TalkingLatents/data/dataset/stellar_descriptions_questions_short.json
@@ -24,18 +26,18 @@ LLM_PATH=/data/.llama/Llama3.1-8B
 OUTDIR=${OUTDIR:-logs/train_ddp}
 EXP=${EXP:-llm_multitok}
 EPOCHS=${EPOCHS:-20}
-BATCH=${BATCH:-8}              # per-GPU
+BATCH=${BATCH:-4}              # per-GPU
 MAXLEN=${MAXLEN:-128}
-WORKERS=${WORKERS:-8}
+WORKERS=${WORKERS:-4}
 LR=${LR:-1e-4}
 WD=${WD:-1e-3}
 TOKS=${TOKS:-4}                # number of spectral tokens (K)
-SWITCH=${SWITCH:-10}
+SWITCH=${SWITCH:-3}
 
 mkdir -p "${OUTDIR}"
 
 srun --kill-on-bad-exit=1 \
- --container-image="/rg/perets_prj/ilay.kamai/containers/lightPred3_C.sqsh" \
+ --container-image="/rg/perets_prj/ilay.kamai/containers/astro.sqsh" \
      --mem=64G \
      --output=/home/ilay.kamai/athena/logs/TalkingLatents_%j_%s_%t.out \
      --error=/home/ilay.kamai/athena/logs/TalkingLatents_%j_%s_%t.err \

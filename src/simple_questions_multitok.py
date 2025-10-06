@@ -7,7 +7,7 @@ from torch.nn.parallel import DistributedDataParallel as DDP
 
 ROOT_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.append(ROOT_DIR)
-os.system('pip install tiktoken fairscale fire blobfile')
+os.system('pip install tiktoken fairscale fire blobfile torchdiffeq torchcfm')
 
 from src.simple_questions import (
     setup,
@@ -23,65 +23,58 @@ from nn.llm_multi import MultimodalLlamaModelMultiTokens
 from nn.train import LLMTrainer
 from data.dataset_interpert import create_stellar_dataloaders
 from data.dataset_comparative import create_comparative_dataloaders
+from data.dataset_mixed import create_mixed_dataloaders
 from data.transforms import GeneralSpectrumPreprocessor, ToTensor, Compose
 import numpy as np
 import torch.distributed as dist
+import gc
 
 
 def parse_args():
     """Parse command line arguments with mode support"""
-    parser = argparse.ArgumentParser(description='Train Multimodal Stellar Model (Multi Tokens)')
-    
-    # Add mode argument
-    parser.add_argument('--mode', type=str, choices=['single_star', 'two_star', 'combined'], 
-                       default='combined', help='Training mode: single_star, two_star, or combined')
-    
-    # Add switch epoch argument for combined mode
-    parser.add_argument('--switch_epoch', type=int, default=7,
-                       help='Epoch to switch from single_star to two_star in combined mode')
-    
-    # Add comparative dataset path for two-star mode
-    parser.add_argument('--comparative_json_file', type=str, 
-                       default='/data/TalkingLatents/data/dataset/comparative_dataset.json',
-                       help='Path to comparative questions JSON file (used in two_star mode)')
-    
-    # Get base arguments
+    # Base parser now includes all needed arguments
     args = base_parse_args()
     
-    # Parse mode-specific arguments
-    remaining_args = sys.argv[1:]
-    mode_args = parser.parse_known_args(remaining_args)[0]
-    
-    # Add mode-specific arguments to base args
-    args.mode = mode_args.mode
-    args.comparative_json_file = mode_args.comparative_json_file
-    args.switch_epoch = mode_args.switch_epoch
+    # Override default mode for this script to 'combined'
+    if args.mode == 'single_star':  # Only change if it's the default
+        import sys
+        if '--mode' not in sys.argv:  # User didn't specify mode explicitly
+            args.mode = 'combined'
     
     return args
 
 
 def create_datasets_and_loaders(args, device):
-    """Create datasets and dataloaders with mode support"""
+    """Create datasets and dataloaders with mode support - only on rank 0 for memory efficiency"""
     
+    rank = dist.get_rank() if dist.is_initialized() else 0
+    world_size = dist.get_world_size() if dist.is_initialized() else 1
+    
+    # Only rank 0 loads spectral features to avoid OOM
     spectral_features = None
-    if args.features_file and os.path.exists(args.features_file):
-        print(f"Loading spectral features from {args.features_file}")
-        spectral_features = np.load(args.features_file)
-        print(f"Spectral features shape: {spectral_features.shape}")
-    else:
-        print("No spectral features file provided or file not found. Will use raw spectra on-the-fly.")
+    if rank == 0:
+        if args.features_file and os.path.exists(args.features_file):
+            print(f"Loading spectral features from {args.features_file}")
+            spectral_features = np.load(args.features_file)
+            print(f"Spectral features shape: {spectral_features.shape}")
+        else:
+            print("No spectral features file provided or file not found. Will use raw spectra on-the-fly.")
+    
+    # Synchronize before proceeding
+    if dist.is_initialized():
+        dist.barrier()
     
     model_path, tokenizer_path = get_model_path(args)
     transf = Compose([GeneralSpectrumPreprocessor(rv_norm=True), ToTensor()])
     
     # Create cache directory for split consistency
     cache_dir_base = os.path.join(args.output_dir, 'cache')
-    rank = dist.get_rank() if dist.is_initialized() else 0
     cache_dir = cache_dir_base if rank == 0 else f"{cache_dir_base}_r{rank}"
     os.makedirs(cache_dir, exist_ok=True)
     
     if args.mode == "two_star":
-        print(f"Creating two-star comparative datasets from {args.comparative_json_file}...")
+        if rank == 0:
+            print(f"Creating two-star comparative datasets from {args.comparative_json_file}...")
         
         train_loader, val_loader, test_loader = create_comparative_dataloaders(
             json_file=args.comparative_json_file,
@@ -91,7 +84,7 @@ def create_datasets_and_loaders(args, device):
             val_ratio=args.val_ratio,
             test_ratio=args.test_ratio,
             random_state=args.random_seed,
-            num_workers=args.num_workers,
+            num_workers=args.num_workers // world_size if world_size > 1 else args.num_workers,
             cache_dir=cache_dir,
             tokenizer_path=tokenizer_path,
             max_length=args.max_seq_length,
@@ -99,12 +92,11 @@ def create_datasets_and_loaders(args, device):
         )
         
     elif args.mode == "combined":
-        print(f"Creating combined datasets - single_star from {args.json_file} and two_star from {args.comparative_json_file}...")
-        print(f"Will switch from single_star to two_star at epoch {args.switch_epoch}")
-        
-        # Create both single-star and two-star dataloaders
-        print("Creating single-star dataloaders...")
-        single_train_loader, single_val_loader, single_test_loader = create_stellar_dataloaders(
+        if rank == 0:
+            print(f"Creating mixed dataset from {args.json_file} and {args.comparative_json_file}...")
+            print(f"Single-sample probability: {args.single_sample_prob}")
+
+        single_kwargs = dict(
             json_file=args.json_file,
             features_array=spectral_features,
             spectral_transforms=transf,
@@ -114,35 +106,43 @@ def create_datasets_and_loaders(args, device):
             random_state=args.random_seed,
             num_spectral_features=args.num_spectral_features,
             cache_dir=cache_dir + "_single",
-            tokenizer_path=tokenizer_path,  
-            max_length=args.max_seq_length,
-            batch_size=args.batch_size,
-            num_workers=args.num_workers,
-        )
-        
-        print("Creating two-star dataloaders...")
-        two_train_loader, two_val_loader, two_test_loader = create_comparative_dataloaders(
-            json_file=args.comparative_json_file,
-            features_array=spectral_features,
-            batch_size=args.batch_size,
-            train_ratio=args.train_ratio,
-            val_ratio=args.val_ratio,
-            test_ratio=args.test_ratio,
-            random_state=args.random_seed,
-            num_workers=args.num_workers,
-            cache_dir=cache_dir + "_two",
             tokenizer_path=tokenizer_path,
             max_length=args.max_seq_length,
-            num_stellar_features=args.num_spectral_features,
+        )
+
+        comparative_kwargs = None
+        if args.comparative_json_file:
+            comparative_kwargs = dict(
+                json_file=args.comparative_json_file,
+                features_array=spectral_features,
+                train_ratio=args.train_ratio,
+                val_ratio=args.val_ratio,
+                test_ratio=args.test_ratio,
+                random_state=args.random_seed,
+                cache_dir=cache_dir + "_two",
+                tokenizer_path=tokenizer_path,
+                max_length=args.max_seq_length,
+                num_stellar_features=args.num_spectral_features,
+                spectral_transforms=transf,
+            )
+
+        num_workers_per_rank = args.num_workers // world_size if world_size > 1 else args.num_workers
+        train_loader, val_loader, test_loader = create_mixed_dataloaders(
+            single_kwargs=single_kwargs,
+            comparative_kwargs=comparative_kwargs,
+            batch_size=args.batch_size,
+            single_sample_prob=args.single_sample_prob,
+            seed=args.random_seed,
+            length_strategy='max',
+            num_workers=num_workers_per_rank,
+            persistent_workers=num_workers_per_rank > 0,
+            pin_memory=torch.cuda.is_available(),
+            numeric_keys=('Teff', 'logg', 'FeH'),
         )
         
-        # Return combined dataloaders - start with single_star
-        train_loader = {'single_star': single_train_loader, 'two_star': two_train_loader}
-        val_loader = {'single_star': single_val_loader, 'two_star': two_val_loader}
-        test_loader = {'single_star': single_test_loader, 'two_star': two_test_loader}
-        
     else:
-        print(f"Creating single-star datasets from {args.json_file}...")
+        if rank == 0:
+            print(f"Creating single-star datasets from {args.json_file}...")
 
         train_loader, val_loader, test_loader = create_stellar_dataloaders(
             json_file=args.json_file,
@@ -157,8 +157,12 @@ def create_datasets_and_loaders(args, device):
             tokenizer_path=tokenizer_path,  
             max_length=args.max_seq_length,
             batch_size=args.batch_size,
-            num_workers=args.num_workers,
+            num_workers=args.num_workers // world_size if world_size > 1 else args.num_workers,
         )
+
+    # Synchronize all processes after dataset creation
+    if dist.is_initialized():
+        dist.barrier()
 
     return train_loader, val_loader, test_loader
 
@@ -183,7 +187,18 @@ def build_model_multitok(args, device):
         hidden_dim=args.hidden_dim,
         num_spectral_features=args.num_spectral_features,
         mode=args.mode,
+        use_cfm=args.use_cfm,  # Add CFM flag
+        cfm_weight=args.cfm_weight,  # CFM loss weight
+        predict_stellar_params=True,  # Enable stellar parameter prediction
+        stellar_params=['Teff', 'logg', 'FeH']  # Predict these parameters
     ).to(device)
+    
+    # Ensure stellar predictor matches base model precision
+    if hasattr(model, 'stellar_predictor'):
+        if args.llm_precision == 'fp16':
+            model.stellar_predictor.half()
+        elif args.llm_precision == 'bf16' and torch.cuda.is_bf16_supported():
+            model.stellar_predictor.to(dtype=torch.bfloat16)
     # Keep projector in float32 for numeric stability with GradScaler
     # (base model runs in fp16/bf16; features are cast to projector dtype inside model)
     return model
@@ -201,17 +216,33 @@ def main():
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(args.random_seed)
 
+    # Clear GPU memory and force garbage collection before starting
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+    gc.collect()
+
     print("Creating datasets and dataloaders...")
     train_loader, val_loader, test_loader = create_datasets_and_loaders(args, local_rank)
     
+    # Clear memory after dataset creation
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+    
     # Handle tokenizer extraction for combined mode
     if args.mode == "combined":
-        tokenizer = train_loader['single_star'].dataset.tokenizer
+        # For mixed datasets, get tokenizer from the single dataset inside the mixed dataset
+        tokenizer = train_loader.dataset.single_dataset.tokenizer
     else:
         tokenizer = train_loader.dataset.tokenizer
 
     print("Creating multitoken multimodal model...")
     model = build_model_multitok(args, local_rank)
+
+    # Clear memory after model creation
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
 
     print(f"Model mode after creation: {model.mode}")
     if hasattr(model, 'module'):
@@ -230,6 +261,12 @@ def main():
         for p in base.fm_model.parameters():
             p.requires_grad = False
         print("✓ Frozen spectral FM parameters")
+    
+    # Clear memory after freezing parameters
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+        
     print_detailed_memory()
 
     if world_size > 1:
@@ -266,15 +303,9 @@ def main():
         lora_params = base_cfg.get('lora_params', {})
 
     # Handle dataloader for trainer initialization
-    if args.mode == "combined":
-        # Start with single_star mode
-        initial_train_loader = train_loader['single_star']
-        initial_val_loader = val_loader['single_star']
-        initial_mode = "single_star"
-    else:
-        initial_train_loader = train_loader
-        initial_val_loader = val_loader
-        initial_mode = args.mode
+    initial_train_loader = train_loader
+    initial_val_loader = val_loader
+    initial_mode = args.mode
 
     trainer = LLMTrainer(
         model=model,
@@ -286,7 +317,7 @@ def main():
         world_size=world_size,
         output_dim=1,
         scheduler=None,
-        max_iter=args.max_iter,
+        max_iter=50,
         log_path=args.output_dir,
         exp_name=args.exp_name,
         lora_params=lora_params,
@@ -296,15 +327,7 @@ def main():
         mode=initial_mode,
     )
     
-    # Store combined mode information in trainer for mode switching
-    if args.mode == "combined":
-        trainer.combined_mode = True
-        trainer.switch_epoch = args.switch_epoch
-        trainer.single_star_loaders = {'train': train_loader['single_star'], 'val': val_loader['single_star']}
-        trainer.two_star_loaders = {'train': train_loader['two_star'], 'val': val_loader['two_star']}
-        trainer.original_mode = args.mode
-    else:
-        trainer.combined_mode = False
+    trainer.combined_mode = (args.mode == "combined")
     trainer.scheduler = scheduler
     trainer.tokenizer = tokenizer
 
@@ -312,7 +335,7 @@ def main():
         save_config(args, args.output_dir)
 
     if args.train:
-        trainer.evaluate_validation_samples(local_rank, 0)
+        # trainer.evaluate_validation_samples(local_rank, 0)
         _ = trainer.fit(
             num_epochs=args.num_epochs,
             device=local_rank,

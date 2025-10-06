@@ -73,7 +73,7 @@ class MixedStellarQADataset(Dataset):
         self.single_sample_prob = float(single_sample_prob)
         self.seed = int(seed)
         self.length_strategy = length_strategy
-        self.numeric_keys = tuple(numeric_keys) if numeric_keys is not None else None
+        self.numeric_keys = tuple(numeric_keys) if numeric_keys is not None else ('Teff', 'logg', 'FeH')
 
         single_len = len(self.single_dataset)
         comp_len = len(self.comparative_dataset) if self.comparative_dataset is not None else 0
@@ -129,7 +129,11 @@ class MixedStellarQADataset(Dataset):
         span_end = max(span_start + span_length, span_start)
         span_indices = torch.tensor([span_start, span_end], dtype=torch.long)
 
-        features = self._coerce_tensor(raw.get("features") or raw.get("masked_spectra"))
+        # Use explicit checking to avoid tensor boolean evaluation issues
+        features_raw = raw.get("features")
+        if features_raw is None:
+            features_raw = raw.get("masked_spectra")
+        features = self._coerce_tensor(features_raw)
         numeric = self._extract_numeric(raw.get("stellar_data"))
 
         metadata = {
@@ -162,19 +166,28 @@ class MixedStellarQADataset(Dataset):
         span_end = max(span_start + span_length, span_start)
         span_indices = torch.tensor([span_start, span_end], dtype=torch.long)
 
-        features_a = self._coerce_tensor(
-            raw.get("features_a")
-            or raw.get("star_a_features")
-            or raw.get("masked_spectra_a")
-        )
-        features_b = self._coerce_tensor(
-            raw.get("features_b")
-            or raw.get("star_b_features")
-            or raw.get("masked_spectra_b")
-        )
+        # Use helper function to avoid tensor boolean evaluation issues
+        features_a_raw = None
+        for key in ["features_a", "star_a_features", "masked_spectra_a"]:
+            val = raw.get(key)
+            if val is not None:
+                features_a_raw = val
+                break
+        features_a = self._coerce_tensor(features_a_raw)
+        
+        features_b_raw = None
+        for key in ["features_b", "star_b_features", "masked_spectra_b"]:
+            val = raw.get(key)
+            if val is not None:
+                features_b_raw = val
+                break
+        features_b = self._coerce_tensor(features_b_raw)
         numeric_a = self._extract_numeric(raw.get("star_a_params"))
         numeric_b = self._extract_numeric(raw.get("star_b_params"))
-        pair_label = raw.get("pair_label") or raw.get("target_index")
+        # Use explicit checking to avoid tensor boolean evaluation issues
+        pair_label = raw.get("pair_label")
+        if pair_label is None:
+            pair_label = raw.get("target_index")
         if isinstance(pair_label, int):
             pair_label = torch.tensor(pair_label, dtype=torch.long)
         elif isinstance(pair_label, torch.Tensor):
@@ -212,6 +225,19 @@ class MixedStellarQADataset(Dataset):
         if isinstance(value, torch.Tensor):
             return value.clone()
         return torch.as_tensor(value)
+    
+    def _get_first_available(self, *keys_and_dict):
+        """Get the first non-None value from a dictionary for the given keys"""
+        if len(keys_and_dict) % 2 != 0:
+            raise ValueError("Must provide key-dict pairs")
+        
+        for i in range(0, len(keys_and_dict), 2):
+            key = keys_and_dict[i]
+            data_dict = keys_and_dict[i + 1]
+            value = data_dict.get(key) if data_dict else None
+            if value is not None:
+                return value
+        return None
 
     def _extract_numeric(self, source: Optional[Dict[str, Any]]) -> Optional[torch.Tensor]:
         if not source:
@@ -384,6 +410,13 @@ def collate_mixed_fn(batch: List[Dict[str, Any]]) -> Dict[str, Any]:
         "masked_spectra_b": masked_spectra_b,
         "masked_spectra_b_present": masked_spectra_b_present,
         "metadata": metadata,
+        # Additional stellar parameter ground truth tensors
+        "stellar_params_gt": y_numeric,  # For single-star mode (reuse y_numeric)
+        "stellar_params_gt_present": y_numeric_present,  # Mask for single-star
+        "stellar_params_gt_a": y_numeric_a,  # For comparative mode star A
+        "stellar_params_gt_a_present": y_numeric_a_present,  # Mask for star A
+        "stellar_params_gt_b": y_numeric_b,  # For comparative mode star B
+        "stellar_params_gt_b_present": y_numeric_b_present,  # Mask for star B
     }
 
 
