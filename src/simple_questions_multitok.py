@@ -317,7 +317,7 @@ def main():
         world_size=world_size,
         output_dim=1,
         scheduler=None,
-        max_iter=50,
+        max_iter=args.max_iter,
         log_path=args.output_dir,
         exp_name=args.exp_name,
         lora_params=lora_params,
