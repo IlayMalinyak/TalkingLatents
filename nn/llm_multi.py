@@ -133,7 +133,8 @@ class MultimodalLlamaModelMultiTokens(nn.Module):
 
     def __init__(self, base_model, fm_model, latent_dim, hidden_dim, num_spectral_features: int = 8,
                  use_checkpoint: bool = True, mode: str = "single_star", use_cfm=True, cfm_weight=0.1,
-                 predict_stellar_params: bool = True, stellar_params: List[str] = ['Teff', 'logg', 'FeH']):
+                 predict_stellar_params: bool = True, stellar_params: List[str] = ['Teff', 'logg', 'FeH'],
+                 quantiles: List[float] = [0.159, 0.5, 0.841]):
         super().__init__()
         self.base_model = base_model
         self.fm_model = fm_model
@@ -146,6 +147,8 @@ class MultimodalLlamaModelMultiTokens(nn.Module):
         self.cfm_weight = cfm_weight
         self.predict_stellar_params = predict_stellar_params
         self.stellar_params = stellar_params
+        self.quantiles = quantiles
+        self.num_quantiles = len(quantiles)
         
         # For two-star mode, create separate projectors for each star
         # if mode == "two_star":
@@ -194,7 +197,7 @@ class MultimodalLlamaModelMultiTokens(nn.Module):
                 nn.LayerNorm(self.embedding_dim//2),
                 nn.GELU(),
                 nn.Dropout(0.1),
-                nn.Linear(self.embedding_dim//2, len(stellar_params))
+                nn.Linear(self.embedding_dim//2, len(stellar_params) * self.num_quantiles)
                 )
         else:
             self.stellar_predictor = None
@@ -343,7 +346,7 @@ class MultimodalLlamaModelMultiTokens(nn.Module):
             pooled_h = stellar_h.mean(dim=1)
             
             # Final prediction from pooled representation
-            stellar_preds = self.stellar_predictor(pooled_h)
+            stellar_preds = self.stellar_predictor(pooled_h.float())  # Convert to float32 for stellar predictor
             outputs['stellar_predictions'] = stellar_preds
         
         return outputs
@@ -486,7 +489,7 @@ class MultimodalLlamaModelMultiTokens(nn.Module):
             #     stellar_preds = {param: torch.full((h.size(0),), 0.5, device=h.device, dtype=predictor_dtype) 
             #                    for param in self.stellar_predictor.stellar_params}
             # else:
-            cls_token = h[:, 0, :]
+            cls_token = h[:, 0, :].float()  # Convert to float32 for stellar predictor
             print("cls token single star: ", cls_token.shape)
             stellar_preds = self.stellar_predictor(cls_token)  # Use hidden states
                 
@@ -597,7 +600,7 @@ class MultimodalLlamaModelMultiTokens(nn.Module):
             #     stellar_preds = {param: torch.full((h.size(0),), 0.5, device=h.device, dtype=predictor_dtype) 
             #                    for param in self.stellar_predictor.stellar_params}
             # else:
-            cls_token = h[:, 0, :]
+            cls_token = h[:, 0, :].float()  # Convert to float32 for stellar predictor
             print("cls_token two star: ", cls_token.shape)
             stellar_preds = self.stellar_predictor(cls_token)  # Use hidden states
                 

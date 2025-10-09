@@ -26,12 +26,12 @@ LLM_PATH=/data/.llama/Llama3.1-8B
 OUTDIR=${OUTDIR:-logs/train_ddp}
 EXP=${EXP:-llm_multitok}
 EPOCHS=${EPOCHS:-20}
-BATCH=${BATCH:-4}              # per-GPU
+BATCH=${BATCH:-16}              # per-GPU
 MAXLEN=${MAXLEN:-128}
 WORKERS=${WORKERS:-4}
 LR=${LR:-1e-4}
 WD=${WD:-1e-3}
-TOKS=${TOKS:-4}                # number of spectral tokens (K)
+TOKS=${TOKS:-8}                # number of spectral tokens (K)
 SWITCH=${SWITCH:-3}
 
 mkdir -p "${OUTDIR}"
@@ -48,7 +48,6 @@ srun --kill-on-bad-exit=1 \
     --json_file "${JSON_FILE}" \
     --comparative_json_file "${COMPARATIVE_JSON_FILE}" \
     --mode "${MODE}" \
-    --switch_epoch "${SWITCH}" \
     --features_file "${FEATURES_FILE}" \
     --output_dir "${OUTDIR}" \
     --exp_name "${EXP}" \

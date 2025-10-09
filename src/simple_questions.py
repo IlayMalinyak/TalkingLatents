@@ -296,7 +296,7 @@ def parse_args():
                 
     
     # Training parameters
-    parser.add_argument('--batch_size', type=int, default=8,
+    parser.add_argument('--batch_size', type=int, default=16,
                        help='Batch size per GPU')
     parser.add_argument('--num_epochs', type=int, default=1000,
                        help='Number of training epochs')
@@ -329,8 +329,14 @@ def parse_args():
                        default='/data/TalkingLatents/data/dataset/comparative_dataset.json',
                        help='Path to comparative questions JSON file (used in two_star mode)')
     
-    parser.add_argument('--single_sample_prob', type=float, default=0,
+    parser.add_argument('--single_sample_prob', type=float, default=1,
                        help='Probability of drawing a single-star sample when using the mixed dataset')
+    
+    parser.add_argument('--curriculum_decay_steps', type=int, default=1000,
+                       help='Number of iterations between single_sample_prob decreases (0 = no curriculum)')
+    
+    parser.add_argument('--quantiles', type=float, nargs='+', default=[0.159, 0.5, 0.841],
+                       help='Quantiles for CQR stellar parameter prediction (default: ~1-sigma + median)')
     
     # Memory optimization
     parser.add_argument('--gradient_checkpointing', action='store_true', default=True,

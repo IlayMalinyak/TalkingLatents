@@ -190,7 +190,8 @@ def build_model_multitok(args, device):
         use_cfm=args.use_cfm,  # Add CFM flag
         cfm_weight=args.cfm_weight,  # CFM loss weight
         predict_stellar_params=True,  # Enable stellar parameter prediction
-        stellar_params=['Teff', 'logg', 'FeH']  # Predict these parameters
+        stellar_params=['Teff', 'logg', 'FeH'],  # Predict these parameters
+        quantiles=args.quantiles  # CQR quantiles
     ).to(device)
     
     # Keep stellar predictor and transformer in FP32 for numerical stability
@@ -325,6 +326,8 @@ def main():
         use_amp=args.use_amp,
         max_grad_norm=args.max_grad_norm,
         mode=initial_mode,
+        curriculum_decay_steps=args.curriculum_decay_steps,
+        quantiles=args.quantiles,
     )
     
     trainer.combined_mode = (args.mode == "combined")
@@ -335,7 +338,7 @@ def main():
         save_config(args, args.output_dir)
 
     if args.train:
-        # trainer.evaluate_validation_samples(local_rank, 0)
+        trainer.evaluate_validation_samples(local_rank, 0)
         _ = trainer.fit(
             num_epochs=args.num_epochs,
             device=local_rank,

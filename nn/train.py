@@ -20,6 +20,7 @@ import inspect
 
 
 from nn.lora import apply_lora_to_model
+from nn.optim import CQR
 from fairscale.nn.model_parallel.layers import RowParallelLinear, ColumnParallelLinear
 
 
@@ -538,7 +539,10 @@ class MaskedRegressorTrainer(Trainer):
 class LLMTrainer(Trainer):
 
     def __init__(self, lora_params, alpha=1, beta=1, gamma=1,
-                 cfm_weight=0.01, max_chunk_size=128, tokenizer=None, mode="single_star", **kwargs):
+                 cfm_weight=0.01, max_chunk_size=128, tokenizer=None, mode="single_star", 
+                 curriculum_decay_steps=0, quantiles=None, **kwargs):
+        if quantiles is None:
+            quantiles = [0.159, 0.5, 0.841]  # Default: ~1-sigma + median
         super(LLMTrainer, self).__init__(**kwargs)
         self.alpha = alpha
         self.beta = beta
@@ -554,7 +558,67 @@ class LLMTrainer(Trainer):
         self.lora_target_modules = lora_params['lora_target_modules']
         self.lora_start_epoch = lora_params['lora_start_epoch']
         self.lora_modules = None
+        
+        # Curriculum learning parameters
+        self.curriculum_decay_steps = curriculum_decay_steps
+        self.global_step = 0
+        self.initial_single_sample_prob = None  # Will be set from dataloader
+        
+        # Loss tracking arrays
+        self.ce_losses = []
+        self.stellar_losses = []
+        self.cfm_losses = []
+        
+        # CQR loss for stellar parameters
+        self.stellar_cqr_loss = CQR(quantiles=quantiles, reduction='mean')
+        self.quantiles = quantiles
+        self.num_quantiles = len(quantiles)
+        
         self._apply_freeze_strategy(self.freeze_strategy)
+
+    def _update_curriculum(self):
+        """Update single_sample_prob according to curriculum schedule"""
+        if (self.curriculum_decay_steps > 0 and 
+            hasattr(self, 'combined_mode') and self.combined_mode and
+            hasattr(self, 'train_dl')):
+            
+            # Initialize initial probability from dataset on first call
+            if self.initial_single_sample_prob is None:
+                if hasattr(self.train_dl.dataset, 'single_sample_prob'):
+                    self.initial_single_sample_prob = self.train_dl.dataset.single_sample_prob
+                    print(f"Initial single_sample_prob: {self.initial_single_sample_prob}")
+                else:
+                    return  # No mixed dataset to update
+            
+            # Calculate how many decay steps have occurred
+            decay_steps_occurred = self.global_step // self.curriculum_decay_steps
+            
+            # Decrease by 0.1 each time, but stop at 0.5
+            target_prob = max(0.5, self.initial_single_sample_prob - (decay_steps_occurred * 0.1))
+            
+            # Update dataset probability if it changed
+            current_prob = self.train_dl.dataset.single_sample_prob
+            if abs(current_prob - target_prob) > 1e-6:  # Only update if there's a significant change
+                self.train_dl.dataset.update_single_probability(target_prob)
+                print(f"Step {self.global_step}: Updated single_sample_prob from {current_prob:.1f} to {target_prob:.1f}")
+        
+        self.global_step += 1
+
+    def fit(self, num_epochs, device, early_stopping=None, start_epoch=0, best='loss', conf=False,
+            initial_min_loss=None, initial_best_acc=None):
+        """Override fit to include loss arrays in results"""
+        # Call parent fit method
+        results = super().fit(num_epochs, device, early_stopping, start_epoch, best, conf,
+                             initial_min_loss, initial_best_acc)
+        
+        # Add loss tracking arrays to results
+        results.update({
+            'ce_losses': self.ce_losses,
+            'stellar_losses': self.stellar_losses,
+            'cfm_losses': self.cfm_losses
+        })
+        
+        return results
 
     def _apply_lora(self):
         """Apply LoRA to the model - fixed version"""
@@ -692,7 +756,6 @@ class LLMTrainer(Trainer):
         # Handle mode switching for combined mode
         if hasattr(self, 'combined_mode') and self.combined_mode:
             # Mixed dataset handles mode switching internally based on probability
-            # Update model mode to "combined" to use forward_mixed method
             if hasattr(self.model, 'module'):
                 self.model.module.mode = "combined"
             else:
@@ -913,6 +976,9 @@ class LLMTrainer(Trainer):
     def train_batch(self, batch, batch_idx, device):
         """Training step with AMP and detailed memory debugging"""
         
+        # Update curriculum learning schedule
+        self._update_curriculum()
+        
         # Memory before forward pass
         torch.cuda.empty_cache()
         gc.collect()
@@ -926,19 +992,28 @@ class LLMTrainer(Trainer):
         # Compute language modeling loss
         lm_loss = self.get_loss(outputs['logits'], target_ids)
         
+        # Store CE loss
+        self.ce_losses.append(lm_loss.item())
+        
         # Combine losses
         loss = lm_loss
         
         # Add CFM loss if available
+        cfm_loss_value = None
         if 'cfm_loss' in outputs:
             cfm_loss = outputs['cfm_loss']
+            cfm_loss_value = cfm_loss.item()
             loss = loss + self.cfm_weight * cfm_loss
             
             # Log CFM loss for monitoring
             if batch_idx % 100 == 0:
                 print(f"  LM Loss: {lm_loss.item():.4f}, CFM Loss: {cfm_loss.item():.4f}")
         
+        # Store CFM loss (None if not available)
+        self.cfm_losses.append(cfm_loss_value)
+        
         # Add stellar parameter loss if available
+        stellar_loss_value = None
         if 'stellar_predictions' in outputs:
             stellar_preds = outputs['stellar_predictions']
             
@@ -949,6 +1024,7 @@ class LLMTrainer(Trainer):
                     print(f"Warning: NaN/inf detected in stellar parameter loss, skipping")
                     # Don't add NaN loss to total loss
                 else:
+                    stellar_loss_value = stellar_loss.item()
                     loss = loss + stellar_loss  # Scale down stellar loss to prevent exploding gradients
                     
                     # Log stellar parameter loss for monitoring
@@ -956,6 +1032,9 @@ class LLMTrainer(Trainer):
                         print(f"  Stellar Param Loss: {stellar_loss.item():.4f}")
             else:
                 print("stellar predictions None!")
+        
+        # Store stellar parameter loss (None if not available)
+        self.stellar_losses.append(stellar_loss_value)
         
         # Check for NaN in total loss
         if torch.isnan(loss) or torch.isinf(loss):
@@ -1029,22 +1108,31 @@ class LLMTrainer(Trainer):
     
     def compute_stellar_parameter_loss(self, stellar_predictions, batch: Dict[str, Any]) -> Optional[torch.Tensor]:
         """
-        Compute L1 loss for stellar parameter predictions
+        Compute CQR loss for stellar parameter predictions
         
         Args:
-            stellar_predictions: torch.Tensor of shape [batch_size, 3] where columns are [Teff, logg, FeH]
+            stellar_predictions: torch.Tensor of shape [batch_size, len(stellar_params) * num_quantiles]
             batch: Batch containing ground truth stellar parameters
             
         Returns:
-            Combined stellar parameter loss or None if no ground truth available
+            CQR loss or None if no ground truth available
         """
-        import torch.nn.functional as F
-        
         if stellar_predictions is None:
             print("none from beginning")
             return None
             
         device = stellar_predictions.device
+        batch_size = stellar_predictions.shape[0]
+        num_params = len(self.model.stellar_params) if hasattr(self.model, 'stellar_params') else 3
+        
+        # Reshape predictions to (batch_size, num_params, num_quantiles)
+        try:
+            preds_reshaped = stellar_predictions.view(batch_size, num_params, self.num_quantiles)
+        except Exception as e:
+            print(f"Error reshaping stellar predictions: {e}")
+            print(f"Predictions shape: {stellar_predictions.shape}, expected: ({batch_size}, {self.num_quantiles * num_params})")
+            return None
+        
         total_loss = torch.tensor(0.0, device=device)
         loss_count = 0
 
@@ -1058,11 +1146,11 @@ class LLMTrainer(Trainer):
                 return None
 
             if gt_mask.any():
-                gt = gt_params[gt_mask]
-                preds = stellar_predictions[gt_mask]
+                gt = gt_params[gt_mask]  # Shape: (valid_samples, num_params)
+                preds = preds_reshaped[gt_mask]  # Shape: (valid_samples, num_params, num_quantiles)
                 
                 if len(gt) > 0 and len(preds) > 0:
-                    param_loss = F.l1_loss(preds, gt)
+                    param_loss = self.stellar_cqr_loss(preds, gt)
                     total_loss += param_loss
                     loss_count += 1
         
@@ -1077,10 +1165,10 @@ class LLMTrainer(Trainer):
                 
             if gt_mask_a.any():
                 gt_a = gt_params_a[gt_mask_a]
-                preds_a = stellar_predictions[gt_mask_a]
+                preds_a = preds_reshaped[gt_mask_a]
                 
                 if len(gt_a) > 0 and len(preds_a) > 0:
-                    param_loss_a = F.l1_loss(preds_a, gt_a)
+                    param_loss_a = self.stellar_cqr_loss(preds_a, gt_a)
                     total_loss += param_loss_a
                     loss_count += 1
         
@@ -1094,20 +1182,18 @@ class LLMTrainer(Trainer):
                 
             if gt_mask_b.any():
                 gt_b = gt_params_b[gt_mask_b]
-                preds_b = stellar_predictions[gt_mask_b]
+                preds_b = preds_reshaped[gt_mask_b]
                 
                 if len(gt_b) > 0 and len(preds_b) > 0:
-                    param_loss_b = F.l1_loss(preds_b, gt_b)
+                    param_loss_b = self.stellar_cqr_loss(preds_b, gt_b)
                     total_loss += param_loss_b
                     loss_count += 1
-            else:
-                print("no y numeric b samples")
+            
         
         # Return average loss if any parameters were processed
         if loss_count > 0:
             return total_loss / loss_count
         else:
-            print("no good nmaes in batch")
             return None
     
     def _get_stellar_parameter_predictions(self, batch: Dict[str, Any], batch_idx: int, device: torch.device) -> Optional[str]:
@@ -1404,11 +1490,60 @@ class LLMTrainer(Trainer):
         """
         Calculate perplexity using teacher forcing (how well model predicts the true answer)
         """
-        # Extract batch data
-        input_ids = batch['input_ids'][batch_idx:batch_idx+1].to(device)
-        target_ids = batch['target_ids'][batch_idx:batch_idx+1].to(device)
-
-        # WRAP with autocast for validation too
+        # Extract single sample from batch for teacher forcing evaluation
+        single_batch = {}
+        for key, value in batch.items():
+            if isinstance(value, torch.Tensor):
+                single_batch[key] = value[batch_idx:batch_idx+1].to(device)
+            elif isinstance(value, list):
+                single_batch[key] = [value[batch_idx]]
+            else:
+                single_batch[key] = value
+        
+        # Use get_logits method which handles all modes correctly
+        outputs = self.get_logits(single_batch, device, val=True)
+        
+        # Extract target for loss calculation
+        target_ids = single_batch['target_ids']
+        
+        # Check if forward pass was successful
+        if outputs is None:
+            print("Warning: Model forward pass returned None")
+            return float('inf')
+            
+        logits = outputs['logits']
+        
+        # Check if logits are valid
+        if torch.isnan(logits).any() or torch.isinf(logits).any():
+            print("Warning: Invalid logits detected in teacher forcing")
+            return float('inf')
+        
+        # Calculate loss only on answer tokens (where target_ids != -100)
+        valid_mask = (target_ids != -100)
+        if not valid_mask.any():
+            print("Warning: No valid target tokens found")
+            return float('inf')
+        
+        # Flatten logits and targets for loss calculation
+        flat_logits = logits.view(-1, logits.size(-1))
+        flat_targets = target_ids.view(-1)
+        
+        # Filter to only answer tokens
+        answer_mask = (flat_targets != -100)
+        if not answer_mask.any():
+            return float('inf')
+        
+        answer_logits = flat_logits[answer_mask]
+        answer_labels = flat_targets[answer_mask]
+        
+        # Calculate cross-entropy loss
+        import torch.nn.functional as F
+        loss = F.cross_entropy(answer_logits, answer_labels, reduction='mean')
+        perplexity = torch.exp(loss).item()
+        
+        return perplexity
+    
+    def plot_perplexity_trends(self, save_path=None):
         with autocast(enabled=getattr(self, 'use_amp', False)):
             print(f"DEBUG TRAINER: batch keys: {list(batch.keys())}")
             print(f"DEBUG TRAINER: self.mode = {self.mode}")
