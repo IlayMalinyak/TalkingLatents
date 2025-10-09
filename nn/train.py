@@ -19,7 +19,7 @@ import gc
 import inspect
 
 
-from nn.state_space_llm import apply_lora_to_model
+from nn.lora import apply_lora_to_model
 from fairscale.nn.model_parallel.layers import RowParallelLinear, ColumnParallelLinear
 
 
@@ -723,37 +723,37 @@ class LLMTrainer(Trainer):
         active_logits = flat_logits[flat_mask]
         active_labels = flat_labels[flat_mask]
         
-        # For two_star mode, weight first 2 tokens more heavily
-        if hasattr(self, 'mode') and self.mode == 'two_star':
-            # Create weights for all active tokens
-            weights = torch.ones_like(active_labels, dtype=torch.float, device=logits.device)
+        # # For two_star mode, weight first 2 tokens more heavily
+        # if hasattr(self, 'mode') and self.mode == 'two_star':
+        #     # Create weights for all active tokens
+        #     weights = torch.ones_like(active_labels, dtype=torch.float, device=logits.device)
             
-            # Find positions of active tokens for each sample in batch
-            batch_size, seq_len = active_mask.shape
-            weight_multiplier = 3.0  # Make first 2 tokens 3x more important
+        #     # Find positions of active tokens for each sample in batch
+        #     batch_size, seq_len = active_mask.shape
+        #     weight_multiplier = 3.0  # Make first 2 tokens 3x more important
             
-            # Count active tokens per sample to identify first 2 tokens
-            for batch_idx in range(batch_size):
-                sample_active_mask = active_mask[batch_idx]
-                if sample_active_mask.any():
-                    # Get indices of active tokens for this sample
-                    active_indices = torch.nonzero(sample_active_mask, as_tuple=False).squeeze(-1)
-                    if len(active_indices) >= 2:
-                        # Weight the first 2 active tokens more heavily
-                        first_two_global_indices = batch_idx * seq_len + active_indices[:2]
-                        # Find these indices in the flattened active_labels
-                        flat_active_indices = torch.nonzero(flat_mask, as_tuple=False).squeeze(-1)
-                        for global_idx in first_two_global_indices:
-                            local_idx = (flat_active_indices == global_idx).nonzero(as_tuple=False)
-                            if len(local_idx) > 0:
-                                weights[local_idx[0]] = weight_multiplier
+        #     # Count active tokens per sample to identify first 2 tokens
+        #     for batch_idx in range(batch_size):
+        #         sample_active_mask = active_mask[batch_idx]
+        #         if sample_active_mask.any():
+        #             # Get indices of active tokens for this sample
+        #             active_indices = torch.nonzero(sample_active_mask, as_tuple=False).squeeze(-1)
+        #             if len(active_indices) >= 2:
+        #                 # Weight the first 2 active tokens more heavily
+        #                 first_two_global_indices = batch_idx * seq_len + active_indices[:2]
+        #                 # Find these indices in the flattened active_labels
+        #                 flat_active_indices = torch.nonzero(flat_mask, as_tuple=False).squeeze(-1)
+        #                 for global_idx in first_two_global_indices:
+        #                     local_idx = (flat_active_indices == global_idx).nonzero(as_tuple=False)
+        #                     if len(local_idx) > 0:
+        #                         weights[local_idx[0]] = weight_multiplier
             
-            # Compute weighted cross entropy loss
-            loss = F.cross_entropy(active_logits, active_labels, reduction='none')
-            loss = (loss * weights).mean()
-        else:
-            # Standard cross entropy loss for non-two_star modes
-            loss = F.cross_entropy(active_logits, active_labels, reduction='mean')
+        #     # Compute weighted cross entropy loss
+        #     loss = F.cross_entropy(active_logits, active_labels, reduction='none')
+        #     loss = (loss * weights).mean()
+        # else:
+        #     # Standard cross entropy loss for non-two_star modes
+        loss = F.cross_entropy(active_logits, active_labels, reduction='mean')
         
         # Print diagnostic info
         # print(f"Active tokens: {active_mask.sum().item()}/{active_mask.numel()} "
@@ -795,7 +795,7 @@ class LLMTrainer(Trainer):
                             batch_device[key] = value.to(device)
                         else:
                             batch_device[key] = value
-                    outputs = self.model.forward_mixed(batch_device)
+                    outputs = self.model(batch_device)
                 else:
                     special_token_positions = batch['feature_start_indices'].to(device)
                     input_spectra = batch['masked_spectra'].to(device)
@@ -940,18 +940,22 @@ class LLMTrainer(Trainer):
         
         # Add stellar parameter loss if available
         if 'stellar_predictions' in outputs:
-            stellar_loss = self.compute_stellar_parameter_loss(outputs['stellar_predictions'], batch)
+            stellar_preds = outputs['stellar_predictions']
+            
+            stellar_loss = self.compute_stellar_parameter_loss(stellar_preds, batch)
             if stellar_loss is not None:
                 # Check for NaN in stellar loss
                 if torch.isnan(stellar_loss) or torch.isinf(stellar_loss):
                     print(f"Warning: NaN/inf detected in stellar parameter loss, skipping")
                     # Don't add NaN loss to total loss
                 else:
-                    loss = loss + stellar_loss
+                    loss = loss + stellar_loss  # Scale down stellar loss to prevent exploding gradients
                     
                     # Log stellar parameter loss for monitoring
-                    if batch_idx % 100 == 0:
+                    if batch_idx % 10 == 0:
                         print(f"  Stellar Param Loss: {stellar_loss.item():.4f}")
+            else:
+                print("stellar predictions None!")
         
         # Check for NaN in total loss
         if torch.isnan(loss) or torch.isinf(loss):
@@ -963,38 +967,12 @@ class LLMTrainer(Trainer):
             loss = torch.tensor(1e-6, device=device, requires_grad=True)
         
         
-        # Backward pass with AMP
-        if getattr(self, 'use_amp', False) and hasattr(self, 'scaler'):
-            # Scale loss and backward
-            self.scaler.scale(loss).backward()
-            
-            # Gradient clipping (always enabled for stability)
-            self.scaler.unscale_(self.optimizer)
-            grad_norm = torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
-            
-            # Check for NaN gradients
-            if torch.isnan(grad_norm) or torch.isinf(grad_norm):
-                print(f"Warning: NaN/inf gradients detected (norm: {grad_norm}), skipping optimizer step")
-                # Don't step the optimizer
-            else:
-                # Optimizer step with scaler
-                self.scaler.step(self.optimizer)
-                self.scaler.update()
-        else:
-            # Standard backward pass
-            loss.backward()
-            
-            # Gradient clipping (always enabled for stability)
-            grad_norm = torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
-            
-            # Check for NaN gradients
-            if torch.isnan(grad_norm) or torch.isinf(grad_norm):
-                print(f"Warning: NaN/inf gradients detected (norm: {grad_norm}), skipping optimizer step")
-                # Don't step the optimizer
-            else:
-                # Standard optimizer step
-                self.optimizer.step()
+        # Backward pass (skip scaler for FP16 compatibility)
+        loss.backward()
         
+        
+        self.optimizer.step()
+       
         # Learning rate scheduler
         if self.scheduler is not None:
             self.scheduler.step()
@@ -1023,17 +1001,19 @@ class LLMTrainer(Trainer):
         
         # Add stellar parameter loss if available
         if 'stellar_predictions' in outputs:
-            stellar_loss = self.compute_stellar_parameter_loss(outputs['stellar_predictions'], batch)
+            stellar_preds = outputs['stellar_predictions']
+            
+            stellar_loss = self.compute_stellar_parameter_loss(stellar_preds, batch)
             if stellar_loss is not None:
                 # Check for NaN in stellar loss
                 if torch.isnan(stellar_loss) or torch.isinf(stellar_loss):
                     print(f"Warning: NaN/inf detected in stellar parameter loss, skipping")
                     # Don't add NaN loss to total loss
                 else:
-                    loss = loss + stellar_loss
+                    loss = loss + stellar_loss  # Scale down stellar loss to prevent exploding gradients
                     
                     # Log stellar parameter loss for monitoring
-                    if batch_idx % 100 == 0:
+                    if batch_idx % 10 == 0:
                         print(f"  Stellar Param Loss: {stellar_loss.item():.4f}")
         
         # Check for NaN in total loss
@@ -1047,68 +1027,87 @@ class LLMTrainer(Trainer):
         
         return loss, 0, outputs['h']
     
-    def compute_stellar_parameter_loss(self, stellar_predictions: Dict[str, torch.Tensor], batch: Dict[str, Any]) -> Optional[torch.Tensor]:
+    def compute_stellar_parameter_loss(self, stellar_predictions, batch: Dict[str, Any]) -> Optional[torch.Tensor]:
         """
-        Compute L1/L2 loss for stellar parameter predictions
+        Compute L1 loss for stellar parameter predictions
         
         Args:
-            stellar_predictions: Dict of predicted parameters {'Teff': tensor, 'logg': tensor, 'FeH': tensor}
+            stellar_predictions: torch.Tensor of shape [batch_size, 3] where columns are [Teff, logg, FeH]
             batch: Batch containing ground truth stellar parameters
             
         Returns:
             Combined stellar parameter loss or None if no ground truth available
         """
-        device = next(iter(stellar_predictions.values())).device
+        import torch.nn.functional as F
+        
+        if stellar_predictions is None:
+            print("none from beginning")
+            return None
+            
+        device = stellar_predictions.device
         total_loss = torch.tensor(0.0, device=device)
         loss_count = 0
+
+        # Single-star mode: use y_numeric
+        if 'y_numeric' in batch:
+            gt_params = batch['y_numeric'].to(device)
+            gt_mask = batch['y_numeric_present'].to(device)
+
+            if torch.isnan(gt_params[gt_mask]).any():
+                print("Warning: NaNs detected in y_numeric ground truth")
+                return None
+
+            if gt_mask.any():
+                gt = gt_params[gt_mask]
+                preds = stellar_predictions[gt_mask]
+                
+                if len(gt) > 0 and len(preds) > 0:
+                    param_loss = F.l1_loss(preds, gt)
+                    total_loss += param_loss
+                    loss_count += 1
         
-        # Helper function to compute loss for a parameter set
-        def compute_param_loss(gt_params_tensor, gt_mask_tensor, param_names_subset, debug_prefix=""):
-            nonlocal total_loss, loss_count
-            
-            if gt_mask_tensor.any() and gt_params_tensor.size(1) > 0:
-                for i, param_name in enumerate(param_names_subset):
-                    if param_name in stellar_predictions and i < gt_params_tensor.size(1):
-                        pred = stellar_predictions[param_name][gt_mask_tensor]
-                        gt = gt_params_tensor[gt_mask_tensor, i]
-                        
-                        # Check for valid values (non-zero ground truth)
-                        valid_mask = (gt != 0.0)
-                        if valid_mask.any():
-                            pred_valid = pred[valid_mask]
-                            gt_valid = gt[valid_mask]
-                            
-                            if len(pred_valid) > 0 and len(gt_valid) > 0:
-                                param_loss = F.l1_loss(pred_valid, gt_valid)
-                                total_loss += param_loss
-                                loss_count += 1
+        # Two-star mode: use y_numeric_a and y_numeric_b
+        if 'y_numeric_a' in batch:
+            gt_params_a = batch['y_numeric_a'].to(device)
+            gt_mask_a = batch['y_numeric_a_present'].to(device)
+
+            if torch.isnan(gt_params_a[gt_mask_a]).any():
+                print("Warning: NaNs detected in y_numeric_a ground truth")
+                return None
+                
+            if gt_mask_a.any():
+                gt_a = gt_params_a[gt_mask_a]
+                preds_a = stellar_predictions[gt_mask_a]
+                
+                if len(gt_a) > 0 and len(preds_a) > 0:
+                    param_loss_a = F.l1_loss(preds_a, gt_a)
+                    total_loss += param_loss_a
+                    loss_count += 1
         
-        # For single-star mode, use stellar_params_gt
-        if 'stellar_params_gt' in batch and batch['stellar_params_gt'] is not None:
-            gt_params = batch['stellar_params_gt'].to(device)
-            gt_mask = batch['stellar_params_gt_present'].to(device)
-            param_names = ['Teff', 'logg', 'FeH']
-            compute_param_loss(gt_params, gt_mask, param_names, "single")
-        
-        # For comparative mode, use stellar_params_gt_a and stellar_params_gt_b
-        if 'stellar_params_gt_a' in batch and batch['stellar_params_gt_a'] is not None:
-            gt_params_a = batch['stellar_params_gt_a'].to(device)
-            gt_mask_a = batch['stellar_params_gt_a_present'].to(device)
-            # Only use parameters that exist in this tensor
-            available_params = ['Teff', 'logg', 'FeH'][:gt_params_a.size(1)]
-            compute_param_loss(gt_params_a, gt_mask_a, available_params, "star_a")
-        
-        if 'stellar_params_gt_b' in batch and batch['stellar_params_gt_b'] is not None:
-            gt_params_b = batch['stellar_params_gt_b'].to(device)
-            gt_mask_b = batch['stellar_params_gt_b_present'].to(device)
-            # Only use parameters that exist in this tensor
-            available_params = ['Teff', 'logg', 'FeH'][:gt_params_b.size(1)]
-            compute_param_loss(gt_params_b, gt_mask_b, available_params, "star_b")
+        if 'y_numeric_b' in batch:
+            gt_params_b = batch['y_numeric_b'].to(device)
+            gt_mask_b = batch['y_numeric_b_present'].to(device)
+
+            if torch.isnan(gt_params_b[gt_mask_b]).any():
+                print("Warning: NaNs detected in y_numeric_b ground truth")
+                return None
+                
+            if gt_mask_b.any():
+                gt_b = gt_params_b[gt_mask_b]
+                preds_b = stellar_predictions[gt_mask_b]
+                
+                if len(gt_b) > 0 and len(preds_b) > 0:
+                    param_loss_b = F.l1_loss(preds_b, gt_b)
+                    total_loss += param_loss_b
+                    loss_count += 1
+            else:
+                print("no y numeric b samples")
         
         # Return average loss if any parameters were processed
         if loss_count > 0:
             return total_loss / loss_count
         else:
+            print("no good nmaes in batch")
             return None
     
     def _get_stellar_parameter_predictions(self, batch: Dict[str, Any], batch_idx: int, device: torch.device) -> Optional[str]:

@@ -9,8 +9,19 @@ from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 import torch
 from torch.utils.data import DataLoader, Dataset
 
-from .dataset_interpert import StellarQuestionsDataset
-from .dataset_comparative import StellarComparativeDataset
+try:
+    from .dataset_interpert import StellarQuestionsDataset
+    from .dataset_comparative import StellarComparativeDataset
+except ImportError:
+    # When running as main script, use absolute imports
+    import os
+    import sys
+    import numpy as np
+    
+    ROOT_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    sys.path.append(ROOT_DIR)
+    from data.dataset_interpert import StellarQuestionsDataset
+    from data.dataset_comparative import StellarComparativeDataset
 
 
 @dataclass
@@ -66,7 +77,9 @@ class MixedStellarQADataset(Dataset):
         if not 0.0 <= single_sample_prob <= 1.0:
             raise ValueError("single_sample_prob must be in [0, 1]")
         if comparative_dataset is None and single_sample_prob < 1.0:
+            print("comparative dataset was not provided. setting single_sample_prob to 1.0")
             single_sample_prob = 1.0
+    
 
         self.single_dataset = single_dataset
         self.comparative_dataset = comparative_dataset
@@ -182,8 +195,8 @@ class MixedStellarQADataset(Dataset):
                 features_b_raw = val
                 break
         features_b = self._coerce_tensor(features_b_raw)
-        numeric_a = self._extract_numeric(raw.get("star_a_params"))
-        numeric_b = self._extract_numeric(raw.get("star_b_params"))
+        numeric_a = self._extract_numeric(raw.get("star_a") or raw.get("star_a_params"))
+        numeric_b = self._extract_numeric(raw.get("star_b") or raw.get("star_b_params"))
         # Use explicit checking to avoid tensor boolean evaluation issues
         pair_label = raw.get("pair_label")
         if pair_label is None:
@@ -242,14 +255,52 @@ class MixedStellarQADataset(Dataset):
     def _extract_numeric(self, source: Optional[Dict[str, Any]]) -> Optional[torch.Tensor]:
         if not source:
             return None
-        keys = self.numeric_keys or tuple(k for k, v in source.items() if isinstance(v, (int, float)))
+            
+        # Stellar parameter bounds for normalization
+        BOUNDS = {
+            'MAX_TEFF': 7500, 'MIN_TEFF': 3000,
+            'MAX_LOGG': 5.0, 'MIN_LOGG': 0,
+            'MAX_FE_H': 0.5, 'MIN_FE_H': -3
+        }
+        
+        # Define alternative key mappings for different data formats
+        key_alternatives = {
+            'Teff': ['Teff', 'teff_k', 'teff'],
+            'logg': ['logg', 'log_g'],
+            'FeH': ['FeH', 'feh', '[Fe/H]']
+        }
+        
+        keys = self.numeric_keys or ('Teff', 'logg', 'FeH')
         values = []
+        
         for key in keys:
-            val = source.get(key)
+            val = None
+            # Try the primary key first, then alternatives
+            if key in key_alternatives:
+                for alt_key in key_alternatives[key]:
+                    val = source.get(alt_key)
+                    if val is not None:
+                        break
+            else:
+                val = source.get(key)
+            
             if val is None:
                 continue
             if isinstance(val, (int, float)):
-                values.append(float(val))
+                # Normalize to 0-1 range based on parameter type
+                if key == 'Teff':
+                    normalized_val = (float(val) - BOUNDS['MIN_TEFF']) / (BOUNDS['MAX_TEFF'] - BOUNDS['MIN_TEFF'])
+                elif key == 'logg':
+                    normalized_val = (float(val) - BOUNDS['MIN_LOGG']) / (BOUNDS['MAX_LOGG'] - BOUNDS['MIN_LOGG'])
+                elif key == 'FeH':
+                    normalized_val = (float(val) - BOUNDS['MIN_FE_H']) / (BOUNDS['MAX_FE_H'] - BOUNDS['MIN_FE_H'])
+                else:
+                    normalized_val = float(val)  # Fallback for other parameters
+                
+                # Clamp to [0, 1] range to handle out-of-bounds values
+                normalized_val = max(0.0, min(1.0, normalized_val))
+                values.append(normalized_val)
+        
         if not values:
             return None
         return torch.tensor(values, dtype=torch.float32)
@@ -258,7 +309,18 @@ class MixedStellarQADataset(Dataset):
 def _pad_stack(values: Sequence[Optional[torch.Tensor]], *, dtype: Optional[torch.dtype] = None) -> Tuple[Optional[torch.Tensor], Optional[torch.Tensor]]:
     present: List[torch.Tensor] = [v for v in values if v is not None]
     if not present:
-        return None, None
+        # If no values are present, create a zero tensor with appropriate shape
+        # For stellar parameters, assume shape is (3,) for [Teff, logg, FeH]
+        if dtype == torch.float32:
+            # This is likely stellar parameters
+            target_shape = (3,)
+        else:
+            # For other data, use a reasonable default
+            target_shape = (1,)
+        batch = torch.zeros((len(values),) + target_shape, dtype=dtype or torch.float32)
+        mask = torch.zeros(len(values), dtype=torch.bool)
+        return batch, mask
+    
     ref = present[0]
     target_shape = ref.shape
     dtype = dtype or ref.dtype
@@ -343,8 +405,11 @@ def collate_mixed_fn(batch: List[Dict[str, Any]]) -> Dict[str, Any]:
 
     for meta, span in zip(metadata, span_indices):
         raw_meta = meta.get("raw", {}) if meta else {}
-        feature_start_indices.append(int(meta.get("feature_start_idx", -1)) if meta else -1)
-        feature_lengths.append(int(meta.get("feature_length", 0) or 0) if meta else 0)
+        feature_start_idx = meta.get("feature_start_idx", -1) if meta else -1
+        feature_start_indices.append(int(feature_start_idx) if feature_start_idx is not None else -1)
+        
+        feature_length = meta.get("feature_length", 0) if meta else 0
+        feature_lengths.append(int(feature_length) if feature_length is not None else 0)
         answer_start_indices.append(int(span[0].item()))
         target_lengths.append(int((span[1] - span[0]).item()))
 
@@ -410,13 +475,13 @@ def collate_mixed_fn(batch: List[Dict[str, Any]]) -> Dict[str, Any]:
         "masked_spectra_b": masked_spectra_b,
         "masked_spectra_b_present": masked_spectra_b_present,
         "metadata": metadata,
-        # Additional stellar parameter ground truth tensors
-        "stellar_params_gt": y_numeric,  # For single-star mode (reuse y_numeric)
-        "stellar_params_gt_present": y_numeric_present,  # Mask for single-star
-        "stellar_params_gt_a": y_numeric_a,  # For comparative mode star A
-        "stellar_params_gt_a_present": y_numeric_a_present,  # Mask for star A
-        "stellar_params_gt_b": y_numeric_b,  # For comparative mode star B
-        "stellar_params_gt_b_present": y_numeric_b_present,  # Mask for star B
+        # # Additional stellar parameter ground truth tensors
+        # "stellar_params_gt": y_numeric,  # For single-star mode (reuse y_numeric)
+        # "stellar_params_gt_present": y_numeric_present,  # Mask for single-star
+        # "stellar_params_gt_a": y_numeric_a,  # For comparative mode star A
+        # "stellar_params_gt_a_present": y_numeric_a_present,  # Mask for star A
+        # "stellar_params_gt_b": y_numeric_b,  # For comparative mode star B
+        # "stellar_params_gt_b_present": y_numeric_b_present,  # Mask for star B
     }
 
 
@@ -484,3 +549,78 @@ def create_mixed_dataloaders(
     test_loader = DataLoader(test_dataset, shuffle=False, **loader_kwargs)
 
     return train_loader, val_loader, test_loader
+
+if __name__ == "__main__":
+    
+    
+    from data.transforms import GeneralSpectrumPreprocessor, ToTensor, Compose
+ 
+    JSON_FILE='/data/TalkingLatents/data/dataset/stellar_descriptions_questions_short.json'
+    COMPARATIVE_JSON_FILE='/data/TalkingLatents/data/dataset/comparative_dataset.json'
+    FEATURES_FILE='/data/TalkingLatents/logs/2025-07-29/features.npy'
+
+    spectral_features = np.load(FEATURES_FILE) 
+    
+    # Simple tokenizer path for testing
+    tokenizer_path = "/data/.llama/Llama3.1-8B/tokenizer.model"
+    
+    cache_dir_base = os.path.join('/data/TalkingLatents/logs/test_dataset', 'cache')
+    cache_dir = cache_dir_base
+    os.makedirs(cache_dir, exist_ok=True)
+
+    transf = Compose([GeneralSpectrumPreprocessor(rv_norm=True), ToTensor()])
+    single_kwargs = dict(
+            json_file=JSON_FILE,
+            features_array=spectral_features,
+            spectral_transforms=transf,
+            train_ratio=0.8,
+            val_ratio=0.1,
+            test_ratio=0.1,
+            random_state=1234,
+            num_spectral_features=4,
+            cache_dir=cache_dir + "_single",
+            tokenizer_path=tokenizer_path,
+            max_length=128,
+        )
+
+        
+    comparative_kwargs = dict(
+        json_file=COMPARATIVE_JSON_FILE,
+        features_array=spectral_features,
+        train_ratio=0.8,
+        val_ratio=0.1,
+        test_ratio=0.1,
+        random_state=1234,
+        cache_dir=cache_dir + "_two",
+        tokenizer_path=tokenizer_path,
+        max_length=128,
+        num_spectral_features=4,
+        spectral_transforms=transf,
+    )
+
+    train_loader, val_loader, test_loader = create_mixed_dataloaders(
+        single_kwargs=single_kwargs,
+        comparative_kwargs=comparative_kwargs,
+        batch_size=2,
+        single_sample_prob=0.5,
+        seed=1234,
+        length_strategy='max',
+        num_workers=0,
+        persistent_workers=False,
+        pin_memory=False,
+        numeric_keys=('Teff', 'logg', 'FeH'),
+    )
+    
+    print("Testing stellar parameter extraction...")
+    for i, batch in enumerate(train_loader):
+        if i >= 2:  # Just test first 2 batches
+            break
+        print(f"Batch {i}:")
+        print(f"  Modes: {batch['mode']}")
+        print(f"  y_numeric shape: {batch['y_numeric'].shape if batch['y_numeric'] is not None else None}")
+        print(f"  y_numeric_present: {batch['y_numeric_present']}")
+        print(f"  y_numeric values: {batch['y_numeric']}")
+        print(f"  y_numeric_a shape: {batch['y_numeric_a'].shape if batch['y_numeric_a'] is not None else None}")
+        print(f"  y_numeric_a_present: {batch['y_numeric_a_present']}")
+        print(f"  y_numeric_a values: {batch['y_numeric_a']}")
+        print()

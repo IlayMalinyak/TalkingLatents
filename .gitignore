@@ -14,6 +14,7 @@ cache/
 figs/
 checkpoints/
 tables/
+depreceated/
 
 # File extensions
 *.pth

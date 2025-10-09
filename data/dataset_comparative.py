@@ -59,7 +59,7 @@ class StellarComparativeDataset(Dataset):
                  cache_dir: Optional[str] = None,
                  tokenizer_path: Optional[str] = None,
                  max_length: int = 512,
-                 num_stellar_features: int = 64,
+                 num_spectral_features: int = 64,
                  include_error_stats: bool = True):
         
         assert split in ['train', 'val', 'test'], f"Split must be 'train', 'val', or 'test', got {split}"
@@ -71,7 +71,7 @@ class StellarComparativeDataset(Dataset):
         self.random_state = random_state
         self.tokenizer_path = tokenizer_path
         self.max_length = max_length
-        self.num_stellar_features = num_stellar_features  # Features for each star (2 stars total)
+        self.num_spectral_features = num_spectral_features  # Features for each star (2 stars total)
         self.transforms = spectral_transforms
         self.mask_transform = RandomMasking()
         self.include_error_stats = include_error_stats
@@ -325,7 +325,7 @@ class StellarComparativeDataset(Dataset):
         star_b_positions = np.where(tokens_array == star_b_token_ids)[0]
         
         # Create feature tokens (-100 values)
-        feature_tokens = np.full(self.num_stellar_features, -100, dtype=tokens_array.dtype)
+        feature_tokens = np.full(self.num_spectral_features, -100, dtype=tokens_array.dtype)
         
         # Determine insertion positions
         star_a_insert_pos = star_a_positions[0] + 1 if len(star_a_positions) > 0 else 0
@@ -337,17 +337,17 @@ class StellarComparativeDataset(Dataset):
         
         if len(star_a_positions) > 0:
             insertion_positions.append((star_a_insert_pos, 'STAR_A'))
-            feature_info['star_a_indices'] = list(range(star_a_insert_pos, star_a_insert_pos + self.num_stellar_features))
+            feature_info['star_a_indices'] = list(range(star_a_insert_pos, star_a_insert_pos + self.num_spectral_features))
         else:
             insertion_positions.append((0, 'STAR_A'))
-            feature_info['star_a_indices'] = list(range(0, self.num_stellar_features))
+            feature_info['star_a_indices'] = list(range(0, self.num_spectral_features))
         
         if len(star_b_positions) > 0:
             insertion_positions.append((star_b_insert_pos, 'STAR_B'))
-            feature_info['star_b_indices'] = list(range(star_b_insert_pos, star_b_insert_pos + self.num_stellar_features))
+            feature_info['star_b_indices'] = list(range(star_b_insert_pos, star_b_insert_pos + self.num_spectral_features))
         else:
             insertion_positions.append((0, 'STAR_B'))
-            feature_info['star_b_indices'] = list(range(0, self.num_stellar_features))
+            feature_info['star_b_indices'] = list(range(0, self.num_spectral_features))
         
         # Sort by position in descending order to insert from right to left
         insertion_positions.sort(key=lambda x: x[0], reverse=True)
@@ -360,8 +360,8 @@ class StellarComparativeDataset(Dataset):
             # Insert both at the beginning: STAR_A first, then STAR_B
             all_feature_tokens = np.concatenate([feature_tokens, feature_tokens])
             extended_tokens = np.insert(extended_tokens, 0, all_feature_tokens)
-            feature_info['star_a_indices'] = list(range(0, self.num_stellar_features))
-            feature_info['star_b_indices'] = list(range(self.num_stellar_features, 2 * self.num_stellar_features))
+            feature_info['star_a_indices'] = list(range(0, self.num_spectral_features))
+            feature_info['star_b_indices'] = list(range(self.num_spectral_features, 2 * self.num_spectral_features))
         else:
             # Insert from right to left to avoid index shifting
             if star_b_insert_pos > star_a_insert_pos:
@@ -369,23 +369,23 @@ class StellarComparativeDataset(Dataset):
                 extended_tokens = np.insert(extended_tokens, star_b_insert_pos, feature_tokens)
                 extended_tokens = np.insert(extended_tokens, star_a_insert_pos, feature_tokens)
                 # Update feature_info accounting for the insertion
-                feature_info['star_a_indices'] = list(range(star_a_insert_pos, star_a_insert_pos + self.num_stellar_features))
-                feature_info['star_b_indices'] = list(range(star_b_insert_pos + self.num_stellar_features, 
-                                                            star_b_insert_pos + 2 * self.num_stellar_features))
+                feature_info['star_a_indices'] = list(range(star_a_insert_pos, star_a_insert_pos + self.num_spectral_features))
+                feature_info['star_b_indices'] = list(range(star_b_insert_pos + self.num_spectral_features, 
+                                                            star_b_insert_pos + 2 * self.num_spectral_features))
             else:
                 # Insert STAR_A first (rightmost), or they're at the same position
                 extended_tokens = np.insert(extended_tokens, star_a_insert_pos, feature_tokens)
                 if star_b_insert_pos != star_a_insert_pos:
                     extended_tokens = np.insert(extended_tokens, star_b_insert_pos, feature_tokens)
-                    feature_info['star_b_indices'] = list(range(star_b_insert_pos, star_b_insert_pos + self.num_stellar_features))
-                    feature_info['star_a_indices'] = list(range(star_a_insert_pos + self.num_stellar_features, 
-                                                            star_a_insert_pos + 2 * self.num_stellar_features))
+                    feature_info['star_b_indices'] = list(range(star_b_insert_pos, star_b_insert_pos + self.num_spectral_features))
+                    feature_info['star_a_indices'] = list(range(star_a_insert_pos + self.num_spectral_features, 
+                                                            star_a_insert_pos + 2 * self.num_spectral_features))
                 else:
                     # Same position - insert STAR_B after STAR_A
-                    extended_tokens = np.insert(extended_tokens, star_a_insert_pos + self.num_stellar_features, feature_tokens)
-                    feature_info['star_a_indices'] = list(range(star_a_insert_pos, star_a_insert_pos + self.num_stellar_features))
-                    feature_info['star_b_indices'] = list(range(star_a_insert_pos + self.num_stellar_features, 
-                                                            star_a_insert_pos + 2 * self.num_stellar_features))
+                    extended_tokens = np.insert(extended_tokens, star_a_insert_pos + self.num_spectral_features, feature_tokens)
+                    feature_info['star_a_indices'] = list(range(star_a_insert_pos, star_a_insert_pos + self.num_spectral_features))
+                    feature_info['star_b_indices'] = list(range(star_a_insert_pos + self.num_spectral_features, 
+                                                            star_a_insert_pos + 2 * self.num_spectral_features))
         
         return extended_tokens.tolist(), feature_info
     
@@ -532,7 +532,7 @@ class StellarComparativeDataset(Dataset):
                     values.append(0.0)  # Default for non-numeric
             
             # Pad or truncate to exact size needed
-            target_size = self.num_stellar_features
+            target_size = self.num_spectral_features
             if len(values) > target_size:
                 values = values[:target_size]
             else:
@@ -567,7 +567,7 @@ class StellarComparativeDataset(Dataset):
             'answer_start_idx': answer_start_in_expanded,     # Where answer begins in the sequence
             'star_a_feature_indices': torch.tensor(feature_indices['star_a_indices'], dtype=torch.long),  # Exact positions for Star A features
             'star_b_feature_indices': torch.tensor(feature_indices['star_b_indices'], dtype=torch.long),  # Exact positions for Star B features
-            'num_stellar_features': self.num_stellar_features,  # K features per star
+            'num_spectral_features': self.num_spectral_features,  # K features per star
             'sequence_length': len(expanded_tokens),          # Length before padding
             'question_text': mcq_data['question'],
             'input_text': mcq_data['full_question'],          # For compatibility with dataset_interpert.py
@@ -730,7 +730,7 @@ def collate_comparative_fn(batch: List[Dict[str, Any]]) -> Dict[str, Any]:
     input_lengths = torch.tensor([item['input_length'] for item in batch], dtype=torch.long)
     target_lengths = torch.tensor([item['target_length'] for item in batch], dtype=torch.long)
     answer_start_indices = torch.tensor([item['answer_start_idx'] for item in batch], dtype=torch.long)
-    num_stellar_features = batch[0]['num_stellar_features']  # Same for all samples
+    num_spectral_features = batch[0]['num_spectral_features']  # Same for all samples
     
     # Stack stellar features
     star_a_features = torch.stack([item['star_a_features'] for item in batch])
@@ -765,7 +765,7 @@ def collate_comparative_fn(batch: List[Dict[str, Any]]) -> Dict[str, Any]:
         'answer_start_indices': answer_start_indices,        # [batch] - where answers start
         'star_a_feature_indices': star_a_feature_indices,    # [batch, K] - exact indices for Star A features
         'star_b_feature_indices': star_b_feature_indices,    # [batch, K] - exact indices for Star B features
-        'num_stellar_features': num_stellar_features,        # K - number of features per star
+        'num_spectral_features': num_spectral_features,        # K - number of features per star
         'sequence_lengths': sequence_lengths,                # [batch] - length before padding
         'question_texts': question_texts,
         'input_texts': input_texts,                          # For compatibility with dataset_interpert.py
@@ -809,7 +809,7 @@ if __name__ == "__main__":
         val_ratio=0.1,
         test_ratio=0.1,
         tokenizer_path=TOKENIZER_PATH,
-        num_stellar_features=4,  # Features per star
+        num_spectral_features=4,  # Features per star
         cache_dir='cache/'  # Cache splits for consistency
     )
     
@@ -826,7 +826,7 @@ if __name__ == "__main__":
         print(f"  Star B feature indices shape: {batch['star_b_feature_indices'].shape}")
         print(f"  Star A features shape: {batch['masked_spectra_a'].shape}")
         print(f"  Star B features shape: {batch['masked_spectra_b'].shape}")
-        print(f"  Num stellar features: {batch['num_stellar_features']}")
+        print(f"  Num spectral features: {batch['num_spectral_features']}")
         print(f"  Comparison types: {batch['comparison_types']}")
         print(f"  Correct labels: {batch['correct_labels']}")
         print(f"  Sample question: {batch['question_texts'][0][:100]}...")

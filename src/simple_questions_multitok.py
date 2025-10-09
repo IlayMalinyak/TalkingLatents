@@ -88,7 +88,7 @@ def create_datasets_and_loaders(args, device):
             cache_dir=cache_dir,
             tokenizer_path=tokenizer_path,
             max_length=args.max_seq_length,
-            num_stellar_features=args.num_spectral_features,
+            num_spectral_features=args.num_spectral_features,
         )
         
     elif args.mode == "combined":
@@ -122,7 +122,7 @@ def create_datasets_and_loaders(args, device):
                 cache_dir=cache_dir + "_two",
                 tokenizer_path=tokenizer_path,
                 max_length=args.max_seq_length,
-                num_stellar_features=args.num_spectral_features,
+                num_spectral_features=args.num_spectral_features,
                 spectral_transforms=transf,
             )
 
@@ -193,12 +193,12 @@ def build_model_multitok(args, device):
         stellar_params=['Teff', 'logg', 'FeH']  # Predict these parameters
     ).to(device)
     
-    # Ensure stellar predictor matches base model precision
-    if hasattr(model, 'stellar_predictor'):
-        if args.llm_precision == 'fp16':
-            model.stellar_predictor.half()
-        elif args.llm_precision == 'bf16' and torch.cuda.is_bf16_supported():
-            model.stellar_predictor.to(dtype=torch.bfloat16)
+    # Keep stellar predictor and transformer in FP32 for numerical stability
+    if hasattr(model, 'stellar_predictor') and model.stellar_predictor is not None:
+        model.stellar_predictor.float()
+    if hasattr(model, 'stellar_transformer') and model.stellar_transformer is not None:
+        for layer in model.stellar_transformer:
+            layer.float()
     # Keep projector in float32 for numeric stability with GradScaler
     # (base model runs in fp16/bf16; features are cast to projector dtype inside model)
     return model

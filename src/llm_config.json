@@ -17,7 +17,7 @@
   "train": 1,
   "lora_params": {
     "freeze_strategy": "encoder_only",
-    "lora_start_epoch": 5,
+    "lora_start_epoch": 0,
     "lora_lr_multiplier": 1.0,
     "lora_rank": 8,
     "lora_alpha": 8.0,

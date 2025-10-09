@@ -48,41 +48,64 @@ class StellarParameterPredictor(nn.Module):
         # Parameter-specific prediction heads
         self.param_heads = nn.ModuleDict()
         for param in stellar_params:
-            self.param_heads[param] = nn.Sequential(
+            layers = nn.Sequential(
                 nn.Linear(hidden_dim, hidden_dim // 2),
                 nn.ReLU(),
                 nn.Dropout(0.1),
                 nn.Linear(hidden_dim // 2, 1)
             )
+            
+            # Initialize weights to prevent initial NaN issues
+            with torch.no_grad():
+                for layer in layers:
+                    if isinstance(layer, nn.Linear):
+                        # Xavier/Glorot initialization
+                        nn.init.xavier_uniform_(layer.weight)
+                        if layer.bias is not None:
+                            nn.init.zeros_(layer.bias)
+            
+            self.param_heads[param] = layers
     
     def forward(self, hidden_states: torch.Tensor) -> Dict[str, torch.Tensor]:
         """
         Args:
             hidden_states: [batch_size, seq_len, hidden_dim] or [batch_size, hidden_dim]
         Returns:
-            Dict of predicted stellar parameters
+            Dict of predicted stellar parameters (normalized to 0-1 range)
         """
+
+        print("hidden_states shape: ", hidden_states.shape)
         if hidden_states.dim() == 3:
             # Pool across sequence dimension (mean pooling)
-            hidden_states = hidden_states.mean(dim=1)  # [batch_size, hidden_dim]
+            # Add small epsilon to avoid division by zero in case of all-zero sequences
+            seq_mask = (hidden_states.abs().sum(dim=-1) > 1e-8).float().unsqueeze(-1)  # [batch_size, seq_len, 1]
+            if seq_mask.sum() > 0:
+                hidden_states = (hidden_states * seq_mask).sum(dim=1) / (seq_mask.sum(dim=1) + 1e-8)  # [batch_size, hidden_dim]
+            else:
+                hidden_states = hidden_states.mean(dim=1)  # Fallback to simple mean
+        
+        # Check for NaN/inf in pooled hidden states
+        if torch.isnan(hidden_states).any() or torch.isinf(hidden_states).any():
+            print("Warning: NaN/inf detected in pooled hidden states, using zeros")
+            hidden_states = torch.zeros_like(hidden_states)
+        
+        # Ensure hidden states match the dtype of the predictor parameters
+        predictor_dtype = next(self.param_heads[self.stellar_params[0]].parameters()).dtype
+        hidden_states = hidden_states.to(dtype=predictor_dtype)
         
         predictions = {}
         for param in self.stellar_params:
             raw_pred = self.param_heads[param](hidden_states).squeeze(-1)  # [batch_size]
             
-            # Apply reasonable bounds to prevent extreme values
-            if param == 'Teff':
-                # Temperature: reasonable range 2000-10000K
-                predictions[param] = torch.clamp(raw_pred, min=2000.0, max=10000.0)
-            elif param == 'logg':
-                # Surface gravity: reasonable range 0.0-6.0
-                predictions[param] = torch.clamp(raw_pred, min=0.0, max=6.0)
-            elif param == 'FeH':
-                # Metallicity: reasonable range -5.0 to +1.0
-                predictions[param] = torch.clamp(raw_pred, min=-5.0, max=1.0)
-            else:
-                # For any other parameters, apply general bounds
-                predictions[param] = torch.clamp(raw_pred, min=-100.0, max=100.0)
+            # Check for NaN in raw predictions
+            if torch.isnan(raw_pred).any() or torch.isinf(raw_pred).any():
+                print(f"Warning: NaN/inf detected in raw {param} prediction, using zeros")
+                raw_pred = torch.zeros_like(raw_pred)
+            
+            # Apply sigmoid to get 0-1 range, then apply small bounds to avoid exact 0/1
+            normalized_pred = torch.sigmoid(raw_pred)
+            # Clamp to [0.001, 0.999] to avoid extreme values in loss computation
+            predictions[param] = torch.clamp(normalized_pred, min=0.001, max=0.999)
         
         return predictions
 
@@ -115,6 +138,7 @@ class MultimodalLlamaModelMultiTokens(nn.Module):
         self.base_model = base_model
         self.fm_model = fm_model
         self.embedding_dim = base_model.params.dim
+        print("self.embedding dim: ", self.embedding_dim)
         self.num_spectral_features = int(num_spectral_features)
         self.use_checkpoint = use_checkpoint
         self.mode = mode  # "single_star" or "two_star"
@@ -154,200 +178,215 @@ class MultimodalLlamaModelMultiTokens(nn.Module):
         
         # Initialize stellar parameter predictor
         if self.predict_stellar_params:
-            self.stellar_predictor = StellarParameterPredictor(
-                hidden_dim=self.embedding_dim,
-                stellar_params=self.stellar_params
-            )
-
-    def forward(self,
-                input_ids: torch.Tensor,
-                input_spectra: torch.Tensor,
-                special_token_positions: torch.Tensor = None,
-                star_a_spectra: torch.Tensor = None,
-                star_b_spectra: torch.Tensor = None,
-                star_a_indices: torch.Tensor = None,
-                star_b_indices: torch.Tensor = None,
-                start_pos: int = 0,
-                ) -> Dict[str, torch.Tensor]:
-        # Handle different modes
-        if self.mode == "combined":
-            # Combined mode should be handled by forward_mixed method
-            raise ValueError("Combined mode should use forward_mixed() method instead of forward()")
-        elif self.mode == "two_star":
-            # Two-star mode: use separate features for each star
-            if star_a_spectra is None or star_b_spectra is None:
-                raise ValueError("star_a_features and star_b_features must be provided in two_star mode")
+            # Small transformer for stellar prediction
+            self.stellar_transformer = nn.ModuleList([
+                nn.TransformerEncoderLayer(
+                    d_model=self.embedding_dim,
+                    nhead=8,
+                    dim_feedforward=self.embedding_dim*2,
+                    dropout=0.1,
+                    batch_first=True
+                ) for _ in range(2)
+            ])
             
-            # # Ensure features match projector dtype/device
-            # proj_param_a = next(self.projector_a.parameters())
-            # proj_param_b = next(self.projector_b.parameters())
-            # star_a_spectra = star_a_spectra.to(device=proj_param_a.device, dtype=proj_param_a.dtype)
-            # star_b_spectra = star_b_spectra.to(device=proj_param_b.device, dtype=proj_param_b.dtype)
-                        
-            return self._forward_no_cache_two_star(input_ids, star_a_spectra, star_b_spectra, 
-                                                   star_a_indices, star_b_indices)
+            self.stellar_predictor = nn.Sequential(
+                nn.Linear(self.embedding_dim, self.embedding_dim//2),
+                nn.LayerNorm(self.embedding_dim//2),
+                nn.GELU(),
+                nn.Dropout(0.1),
+                nn.Linear(self.embedding_dim//2, len(stellar_params))
+                )
         else:
-            # Single-star mode: original behavior
-            if special_token_positions is None:
-                raise ValueError("special_token_positions must be provided in single_star mode")
-            
-            # Derive latent features
-            if self.fm_model is not None:
-                self.fm_model.eval()
-                with torch.no_grad():
-                    # Expect fm_model to return (reg_out,ssl_out,features)
-                    _, _, latent_features = self.fm_model(input_spectra)
-                    # If multi-stage, collapse across stages
-                    if latent_features.dim() == 3:  # (B, S, D)
-                        latent_features = latent_features.mean(dim=1)
-            else:
-                latent_features = input_spectra.float()  # (B, D)
-                
-                # Handle case where input_spectra was concatenated for two-star mode
-                # but we're in single-star mode (e.g., during evaluation)
-                if latent_features.size(-1) == 4096:
-                    # Split concatenated features and use first half
-                    latent_features = latent_features[:, :2048]
-            # Ensure latent features match projector dtype/device
-            proj_param = next(self.projector.parameters())
-            latent_features = latent_features.to(device=proj_param.device, dtype=proj_param.dtype)
-            outputs = self._forward_no_cache(input_ids, latent_features, special_token_positions)
-            # Compute CFM loss if in training mode
-            if self.use_cfm:
-                # Use hidden states for CFM (richer representation than logits)
-                hidden_states = outputs['h']
-                
-                # Ensure hidden states match CFM bridge dtype (fix dtype mismatch)
-                cfm_param_dtype = next(self.flow_bridge.parameters()).dtype
-                hidden_states = hidden_states.to(dtype=cfm_param_dtype)
-                
-                # Get original features for CFM target
-                if self.mode == "two_star":
-                    # Concatenate both star features for two-star mode
-                    cfm_target = torch.cat([star_a_spectra, star_b_spectra], dim=-1)
-                else:
-                    cfm_target = input_spectra
-                
-                # Ensure CFM target also matches dtype
-                cfm_target = cfm_target.to(dtype=cfm_param_dtype)
-                
-                # Compute CFM loss using hidden states
-                cfm_loss = self.flow_bridge.training_step(hidden_states, cfm_target)
-                outputs['cfm_loss'] = cfm_loss
-            return outputs
+            self.stellar_predictor = None
+           
 
-    def forward_mixed(self, batch: Dict[str, Any]) -> Dict[str, torch.Tensor]:
+    def forward(self, batch: Dict[str, Any]) -> Dict[str, torch.Tensor]:
         """
-        Forward pass for mixed batches containing both single-star and two-star samples.
-        
-        Args:
-            batch: Mixed batch from MixedStellarQADataset with mode masks and appropriate data
-            
-        Returns:
-            Dict containing logits, hidden states, and optional CFM loss
+        Unified forward pass that handles both single-star and two-star samples in one pass.
         """
         input_ids = batch['input_ids']
         batch_size, seq_len = input_ids.shape
         device = input_ids.device
         
-        # Initialize output tensors
-        full_logits = None
-        full_hidden = None
-        cfm_losses = []
+        # Token embeddings from base model
+        token_embeddings = self.base_model.tok_embeddings(input_ids)
         
-        def _allocate_outputs(sample_outputs):
-            nonlocal full_logits, full_hidden
-            if full_logits is None:
-                full_logits = torch.zeros(
-                    (batch_size,) + sample_outputs['logits'].shape[1:],
-                    dtype=sample_outputs['logits'].dtype,
-                    device=device,
-                )
-                full_hidden = torch.zeros(
-                    (batch_size,) + sample_outputs['h'].shape[1:],
-                    dtype=sample_outputs['h'].dtype,
-                    device=device,
-                )
+        # Process spectral features for all samples
+        cfm_targets = []
         
-        # Get mode masks
-        single_mask = batch['mode_mask_single']
-        comp_mask = batch['mode_mask_comparative']
-        
-        # Process single-star samples
-        single_indices = torch.nonzero(single_mask, as_tuple=False).squeeze(-1)
-        if single_indices.numel() > 0:
-            single_input_ids = input_ids.index_select(0, single_indices)
-            single_spectra = batch['masked_spectra'].index_select(0, single_indices) if batch['masked_spectra'] is not None else None
-            single_positions = batch['feature_start_indices'].index_select(0, single_indices)
+        # Handle single-star samples
+        if 'masked_spectra' in batch and batch['masked_spectra'] is not None:
+            single_mask = batch.get('mode_mask_single', torch.ones(batch_size, dtype=torch.bool, device=device))
+            single_indices = torch.nonzero(single_mask, as_tuple=False).squeeze(-1)
             
-            if single_spectra is not None:
-                # Temporarily set mode to single_star for processing
-                original_mode = self.mode
-                self.mode = "single_star"
-                single_outputs = self.forward(
-                    input_ids=single_input_ids,
-                    input_spectra=single_spectra,
-                    special_token_positions=single_positions,
-                )
-                self.mode = original_mode
+            if single_indices.numel() > 0:
+                single_spectra = batch['masked_spectra'].index_select(0, single_indices)
+                single_positions = batch['feature_start_indices'].index_select(0, single_indices)
                 
-                _allocate_outputs(single_outputs)
-                full_logits.index_copy_(0, single_indices, single_outputs['logits'])
-                full_hidden.index_copy_(0, single_indices, single_outputs['h'])
+                # Process spectra through FM model if available
+                if self.fm_model is not None:
+                    self.fm_model.eval()
+                    with torch.no_grad():
+                        _, _, latent_features = self.fm_model(single_spectra)
+                        if latent_features.dim() == 3:
+                            latent_features = latent_features.mean(dim=1)
+                else:
+                    latent_features = single_spectra.float()
                 
-                if 'cfm_loss' in single_outputs:
-                    cfm_losses.append(single_outputs['cfm_loss'])
+                # Project to tokens
+                proj_param = next(self.projector.parameters())
+                latent_features = latent_features.to(device=proj_param.device, dtype=proj_param.dtype)
+                spec_tokens = self.projector(latent_features)
+                
+                # Insert tokens at specified positions
+                for i, global_idx in enumerate(single_indices):
+                    start_pos = single_positions[i].item()
+                    end_pos = start_pos + self.num_spectral_features
+                    if 0 <= start_pos and end_pos <= seq_len:
+                        token_embeddings[global_idx, start_pos:end_pos, :] = spec_tokens[i]
+                    else:
+                        # Fallback to prefix insertion
+                        token_embeddings[global_idx, :self.num_spectral_features, :] = spec_tokens[i]
+                
+                # Store CFM targets
+                cfm_targets.extend([single_spectra[i] for i in range(len(single_indices))])
         
-        # Process comparative samples
-        comp_indices = torch.nonzero(comp_mask, as_tuple=False).squeeze(-1)
-        if comp_indices.numel() > 0:
-            comp_input_ids = input_ids.index_select(0, comp_indices)
-            comp_spectra_a = batch['masked_spectra_a'].index_select(0, comp_indices) if batch['masked_spectra_a'] is not None else None
-            comp_spectra_b = batch['masked_spectra_b'].index_select(0, comp_indices) if batch['masked_spectra_b'] is not None else None
-            comp_indices_a = batch['star_a_feature_indices'].index_select(0, comp_indices)
-            comp_indices_b = batch['star_b_feature_indices'].index_select(0, comp_indices)
+        # Handle two-star samples
+        if 'masked_spectra_a' in batch and batch['masked_spectra_a'] is not None:
+            comp_mask = batch.get('mode_mask_comparative', torch.ones(batch_size, dtype=torch.bool, device=device))
+            comp_indices = torch.nonzero(comp_mask, as_tuple=False).squeeze(-1)
             
-            if comp_spectra_a is not None and comp_spectra_b is not None:
-                # Temporarily set mode to two_star for processing
-                original_mode = self.mode
-                self.mode = "two_star"
-                comp_outputs = self.forward(
-                    input_ids=comp_input_ids,
-                    input_spectra=None,  # Not used in two-star mode
-                    star_a_spectra=comp_spectra_a,
-                    star_b_spectra=comp_spectra_b,
-                    star_a_indices=comp_indices_a,
-                    star_b_indices=comp_indices_b,
-                )
-                self.mode = original_mode
+            if comp_indices.numel() > 0:
+                comp_spectra_a = batch['masked_spectra_a'].index_select(0, comp_indices)
+                comp_spectra_b = batch['masked_spectra_b'].index_select(0, comp_indices)
+                comp_indices_a = batch['star_a_feature_indices'].index_select(0, comp_indices)
+                comp_indices_b = batch['star_b_feature_indices'].index_select(0, comp_indices)
                 
-                if full_logits is None:
-                    _allocate_outputs(comp_outputs)
+                # Process both stars' spectra
+                if self.fm_model is not None:
+                    self.fm_model.eval()
+                    with torch.no_grad():
+                        _, _, latent_a = self.fm_model(comp_spectra_a)
+                        _, _, latent_b = self.fm_model(comp_spectra_b)
+                        if latent_a.dim() == 3:
+                            latent_a = latent_a.mean(dim=1)
+                        if latent_b.dim() == 3:
+                            latent_b = latent_b.mean(dim=1)
+                else:
+                    latent_a = comp_spectra_a.float()
+                    latent_b = comp_spectra_b.float()
                 
-                full_logits.index_copy_(0, comp_indices, comp_outputs['logits'])
-                full_hidden.index_copy_(0, comp_indices, comp_outputs['h'])
+                # Project to tokens using same projector
+                proj_param = next(self.projector.parameters())
+                latent_a = latent_a.to(device=proj_param.device, dtype=proj_param.dtype)
+                latent_b = latent_b.to(device=proj_param.device, dtype=proj_param.dtype)
+                spec_tokens_a = self.projector(latent_a)
+                spec_tokens_b = self.projector(latent_b)
                 
-                if 'cfm_loss' in comp_outputs:
-                    cfm_losses.append(comp_outputs['cfm_loss'])
+                # Insert tokens at exact positions
+                for i, global_idx in enumerate(comp_indices):
+                    indices_a = comp_indices_a[i]
+                    indices_b = comp_indices_b[i]
+                    
+                    # Insert star A tokens
+                    valid_indices_a = indices_a[indices_a < seq_len]
+                    if len(valid_indices_a) > 0:
+                        num_tokens_a = min(len(valid_indices_a), spec_tokens_a.shape[1])
+                        token_embeddings[global_idx, valid_indices_a[:num_tokens_a], :] = spec_tokens_a[i, :num_tokens_a, :].to(token_embeddings.dtype)
+                    
+                    # Insert star B tokens
+                    valid_indices_b = indices_b[indices_b < seq_len]
+                    if len(valid_indices_b) > 0:
+                        num_tokens_b = min(len(valid_indices_b), spec_tokens_b.shape[1])
+                        token_embeddings[global_idx, valid_indices_b[:num_tokens_b], :] = spec_tokens_b[i, :num_tokens_b, :].to(token_embeddings.dtype)
+                
+                # Store CFM targets (concatenated for two-star)
+                cfm_targets.extend([torch.cat([comp_spectra_a[i], comp_spectra_b[i]], dim=-1) for i in range(len(comp_indices))])
         
-        # Combine outputs
-        outputs = {
-            'logits': full_logits,
-            'h': full_hidden,
-        }
+        # Single transformer forward pass for all samples
+        h = self._transformer_forward(token_embeddings)
+        logits = self.base_model.output(h).float()
         
-        # Add CFM loss if available
-        if cfm_losses:
-            outputs['cfm_loss'] = torch.stack(cfm_losses).mean()
+        # Check for NaN in logits
+        if torch.isnan(logits).any() or torch.isinf(logits).any():
+            print("Warning: NaN/inf detected in model logits")
+            logits = torch.where(torch.isnan(logits) | torch.isinf(logits), 
+                               torch.zeros_like(logits), logits)
+        
+        outputs = {"logits": logits, "h": h}
+        
+        # Add CFM loss if enabled
+        if self.use_cfm and cfm_targets:
+            cfm_param_dtype = next(self.flow_bridge.parameters()).dtype
+            hidden_states = h.to(dtype=cfm_param_dtype)
+            normalized_hidden = (hidden_states - hidden_states.mean(dim=-1, keepdim=True)) / (hidden_states.std(dim=-1, keepdim=True) + 1e-8)
+            
+            cfm_losses = []
+            for i, target in enumerate(cfm_targets):
+                cfm_target = target.to(dtype=cfm_param_dtype)
+                cfm_loss = self.flow_bridge.training_step(normalized_hidden[i:i+1], cfm_target.unsqueeze(0))
+                cfm_losses.append(cfm_loss)
+            
+            if cfm_losses:
+                outputs['cfm_loss'] = torch.stack(cfm_losses).mean()
         
         # Add stellar parameter predictions if enabled
-        if self.predict_stellar_params and hasattr(self, 'stellar_predictor'):
-            # Ensure hidden states match predictor dtype
-            h_for_predictor = full_hidden.to(dtype=next(self.stellar_predictor.parameters()).dtype)
-            stellar_preds = self.stellar_predictor(h_for_predictor)  # Use combined hidden states
+        if self.stellar_predictor is not None:
+            # Convert to FP32 for stellar components (they are kept in FP32 for stability)
+            stellar_h = h.float()
+            
+            # Pass full sequence through small transformer
+            for layer in self.stellar_transformer:
+                stellar_h = layer(stellar_h)
+            
+            # Pool the sequence dimension (mean pooling)
+            pooled_h = stellar_h.mean(dim=1)
+            
+            # Final prediction from pooled representation
+            stellar_preds = self.stellar_predictor(pooled_h)
             outputs['stellar_predictions'] = stellar_preds
         
         return outputs
+
+    def _transformer_forward(self, token_embeddings: torch.Tensor) -> torch.Tensor:
+        """
+        Unified transformer forward pass for token embeddings.
+        """
+        h = token_embeddings
+        device = token_embeddings.device
+        seqlen = token_embeddings.size(1)
+        
+        # Build RoPE frequencies
+        head_dim = self.base_model.params.dim // self.base_model.params.n_heads
+        freqs = 1.0 / (self.base_model.params.rope_theta ** (
+            torch.arange(0, head_dim, 2, device=device).float() / head_dim))
+        t = torch.arange(seqlen, device=device, dtype=torch.float32)
+        freqs = torch.outer(t, freqs)
+        freqs_cis = torch.polar(torch.ones_like(freqs), freqs)
+
+        # Causal mask
+        mask = None
+        if seqlen > 1:
+            mask = torch.full((seqlen, seqlen), float("-inf"), device=device, dtype=h.dtype)
+            mask = torch.triu(mask, diagonal=1)
+
+        def layer_block(h_in, layer):
+            # Attention
+            h_norm = layer.attention_norm(h_in)
+            attn_out = self._attn_no_cache(h_norm, freqs_cis, mask, layer.attention)
+            h_mid = h_in + attn_out
+            # FFN
+            ff_norm = layer.ffn_norm(h_mid)
+            return h_mid + layer.feed_forward(ff_norm)
+
+        for layer in self.base_model.layers:
+            if self.training and self.use_checkpoint:
+                h = checkpoint(layer_block, h, layer, use_reentrant=False)
+            else:
+                h = layer_block(h, layer)
+
+        h = self.base_model.norm(h)
+        return h
 
     def _forward_no_cache(self, input_ids: torch.Tensor, latent_features: torch.Tensor,
                           feature_start_indices) -> Dict[str, torch.Tensor]:
@@ -436,22 +475,30 @@ class MultimodalLlamaModelMultiTokens(nn.Module):
         # Add stellar parameter predictions if enabled
         if self.predict_stellar_params and hasattr(self, 'stellar_predictor'):
             # Ensure hidden states match predictor dtype
-            h_for_predictor = h.to(dtype=next(self.stellar_predictor.parameters()).dtype)
+            # h_for_predictor = h.to(dtype=next(self.stellar_predictor.parameters()).dtype)
+            print("h shape: ", h.shape)
             
             # Check for NaN in hidden states before prediction
-            if torch.isnan(h_for_predictor).any() or torch.isinf(h_for_predictor).any():
-                print("Warning: NaN/inf detected in hidden states for stellar prediction")
-                # Create dummy predictions to avoid breaking the forward pass
-                stellar_preds = {param: torch.zeros(h.size(0), device=h.device, dtype=h.dtype) 
-                               for param in self.stellar_predictor.stellar_params}
-            else:
-                stellar_preds = self.stellar_predictor(h_for_predictor)  # Use hidden states
+            # if torch.isnan(h_for_predictor).any() or torch.isinf(h_for_predictor).any():
+            #     print("Warning: NaN/inf detected in hidden states for stellar prediction")
+            #     # Create dummy predictions to avoid breaking the forward pass (use 0.5 for normalized range)
+            #     predictor_dtype = next(self.stellar_predictor.parameters()).dtype
+            #     stellar_preds = {param: torch.full((h.size(0),), 0.5, device=h.device, dtype=predictor_dtype) 
+            #                    for param in self.stellar_predictor.stellar_params}
+            # else:
+            cls_token = h[:, 0, :]
+            print("cls token single star: ", cls_token.shape)
+            stellar_preds = self.stellar_predictor(cls_token)  # Use hidden states
                 
-                # Check for NaN in stellar predictions
-                for param, pred in stellar_preds.items():
-                    if torch.isnan(pred).any() or torch.isinf(pred).any():
-                        print(f"Warning: NaN/inf detected in stellar prediction for {param}")
-                        stellar_preds[param] = torch.zeros_like(pred)
+                # # Check for NaN in stellar predictions
+                # for param, pred in stellar_preds.items():
+                #     if torch.isnan(pred).any() or torch.isinf(pred).any():
+                #         print(f"Warning: NaN/inf detected in stellar prediction for {param}")
+                #         # Use small positive values instead of zeros to match normalized range
+                #         stellar_preds[param] = torch.full_like(pred, 0.5, dtype=pred.dtype)
+                #         print("nans in h_for_predictor: ", torch.isnan(h_for_predictor))
+                #         print("nans in h: ", torch.isnan(h))
+                #         exit()
             
             outputs['stellar_predictions'] = stellar_preds
         
@@ -539,24 +586,26 @@ class MultimodalLlamaModelMultiTokens(nn.Module):
         
         # Add stellar parameter predictions if enabled
         if self.predict_stellar_params and hasattr(self, 'stellar_predictor'):
-            # Ensure hidden states match predictor dtype
-            h_for_predictor = h.to(dtype=next(self.stellar_predictor.parameters()).dtype)
+            # # Ensure hidden states match predictor dtype
+            # h_for_predictor = h.to(dtype=next(self.stellar_predictor.parameters()).dtype)
             
-            # Check for NaN in hidden states before prediction
-            if torch.isnan(h_for_predictor).any() or torch.isinf(h_for_predictor).any():
-                print("Warning: NaN/inf detected in hidden states for stellar prediction")
-                # Create dummy predictions to avoid breaking the forward pass
-                stellar_preds = {param: torch.zeros(h.size(0), device=h.device, dtype=h.dtype) 
-                               for param in self.stellar_predictor.stellar_params}
-            else:
-                stellar_preds = self.stellar_predictor(h_for_predictor)  # Use hidden states
+            # # Check for NaN in hidden states before prediction
+            # if torch.isnan(h_for_predictor).any() or torch.isinf(h_for_predictor).any():
+            #     print("Warning: NaN/inf detected in hidden states for stellar prediction")
+            #     # Create dummy predictions to avoid breaking the forward pass (use 0.5 for normalized range)
+            #     predictor_dtype = next(self.stellar_predictor.parameters()).dtype
+            #     stellar_preds = {param: torch.full((h.size(0),), 0.5, device=h.device, dtype=predictor_dtype) 
+            #                    for param in self.stellar_predictor.stellar_params}
+            # else:
+            cls_token = h[:, 0, :]
+            print("cls_token two star: ", cls_token.shape)
+            stellar_preds = self.stellar_predictor(cls_token)  # Use hidden states
                 
-                # Check for NaN in stellar predictions
-                for param, pred in stellar_preds.items():
-                    if torch.isnan(pred).any() or torch.isinf(pred).any():
-                        print(f"Warning: NaN/inf detected in stellar prediction for {param}")
-                        stellar_preds[param] = torch.zeros_like(pred)
-            
+                # # Check for NaN in stellar predictions
+                # for param, pred in stellar_preds.items():
+                #     if torch.isnan(pred).any() or torch.isinf(pred).any():
+                #         print(f"Warning: NaN/inf detected in stellar prediction for {param}")
+                #         stellar_preds[param] = torch.zeros_like(pred)
             outputs['stellar_predictions'] = stellar_preds
         
         return outputs
@@ -606,17 +655,12 @@ class MultimodalLlamaModelMultiTokens(nn.Module):
         device = next(self.parameters()).device
         input_ids = batch_data['input_ids'][batch_idx:batch_idx+1].to(device)
         
-        # Handle different data structures for single vs two-star modes
-        # For mixed datasets, determine the mode for this specific sample
-        if self.mode == "combined":
-            # Check if this sample is single or comparative
-            if 'mode' in batch_data and batch_data['mode']:
-                current_mode = batch_data['mode'][batch_idx]
-            else:
-                # Fallback: check if it has comparative features
-                current_mode = "two_star" if ('masked_spectra_a' in batch_data and batch_data['masked_spectra_a'] is not None) else "single_star"
+        # Determine the mode for this specific sample  
+        if 'mode' in batch_data and batch_data['mode']:
+            current_mode = batch_data['mode'][batch_idx]
         else:
-            current_mode = self.mode
+            # Fallback: check if it has comparative features
+            current_mode = "two_star" if ('masked_spectra_a' in batch_data and batch_data['masked_spectra_a'] is not None) else "single_star"
             
         if current_mode == "two_star":
             star_a_features = batch_data['masked_spectra_a'][batch_idx:batch_idx+1].to(device)
@@ -721,18 +765,10 @@ class MultimodalLlamaModelMultiTokens(nn.Module):
 
         for _ in range(max_new_tokens):
             if current_mode == "two_star":
-                # Temporarily set mode for forward pass
-                original_mode = self.mode
-                self.mode = "two_star"
                 out = self._forward_no_cache_two_star(prompt, star_a_features, star_b_features,
                                                       star_a_indices, star_b_indices)
-                self.mode = original_mode
             else:
-                # Temporarily set mode for forward pass
-                original_mode = self.mode
-                self.mode = "single_star"
                 out = self._forward_no_cache(prompt, features_vec, feature_start_idx)
-                self.mode = original_mode
             logits = out['logits'][:, -1, :].squeeze(0)
             # Log prob of chosen token
             if temperature > 0:

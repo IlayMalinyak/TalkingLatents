@@ -24,7 +24,7 @@ sys.path.append(ROOT_DIR)
 print("running from ", ROOT_DIR) 
 
 from nn.llm import MultimodalLlamaModel
-from nn.models import MultiTaskRegressor
+# from nn.models import MultiTaskRegressor
 from llama3.llama.model import Transformer, ModelArgs
 from data.dataset_interpert import StellarQuestionsDataset, create_stellar_dataloaders, collate_fn
 from data.transforms import *
@@ -278,7 +278,7 @@ def parse_args():
                        help='Spectral model embedding dimension')
     parser.add_argument('--hidden_dim', type=int, default=512,
                        help='Common projection space dimension')
-    parser.add_argument('--num_spectral_features', type=int, default=1,
+    parser.add_argument('--num_spectral_features', type=int, default=4,
                        help='Number of spectral features to integrate into LLM')
     parser.add_argument('--latent_ids', type=list, nargs='*', default=['Teff', 'logg', 'FeH'],
                        help='List of latent variable IDs to include (e.g., --latent_ids mass age metallicity)')
@@ -288,7 +288,7 @@ def parse_args():
                           help='Directory to load model checkpoint from, if any'),
     parser.add_argument('--train', type=bool, default=True,
                           help='Whether to train the model or just evaluate'),
-    parser.add_argument('--use_cfm', action='store_true', default=True, 
+    parser.add_argument('--use_cfm', action='store_true', default=False, 
                    help='Use Conditional Flow Matching')
     parser.add_argument('--cfm_weight', type=float, default=0.1,
                    help='Weight for CFM loss')
@@ -296,7 +296,7 @@ def parse_args():
                 
     
     # Training parameters
-    parser.add_argument('--batch_size', type=int, default=4,
+    parser.add_argument('--batch_size', type=int, default=8,
                        help='Batch size per GPU')
     parser.add_argument('--num_epochs', type=int, default=1000,
                        help='Number of training epochs')
@@ -311,7 +311,7 @@ def parse_args():
     parser.add_argument('--max_iter', type=int, default=-1,
                        help='Maximum training iterations per epoch (-1 for no cap)')
 
-    parser.add_argument('--use_amp', action='store_true', default=False,
+    parser.add_argument('--use_amp', action='store_true', default=True,
                        help='Use Automatic Mixed Precision training')
     parser.add_argument('--amp_opt_level', type=str, default='O1',
                        choices=['O0', 'O1', 'O2', 'O3'],
@@ -329,7 +329,7 @@ def parse_args():
                        default='/data/TalkingLatents/data/dataset/comparative_dataset.json',
                        help='Path to comparative questions JSON file (used in two_star mode)')
     
-    parser.add_argument('--single_sample_prob', type=float, default=0.5,
+    parser.add_argument('--single_sample_prob', type=float, default=0,
                        help='Probability of drawing a single-star sample when using the mixed dataset')
     
     # Memory optimization
