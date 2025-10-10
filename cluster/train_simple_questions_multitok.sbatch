@@ -37,7 +37,7 @@ SWITCH=${SWITCH:-3}
 mkdir -p "${OUTDIR}"
 
 srun --kill-on-bad-exit=1 \
- --container-image="/rg/perets_prj/ilay.kamai/containers/astro.sqsh" \
+ --container-image="/rg/perets_prj/ilay.kamai/containers/astro2.sqsh" \
      --mem=64G \
      --output=/home/ilay.kamai/athena/logs/TalkingLatents_%j_%s_%t.out \
      --error=/home/ilay.kamai/athena/logs/TalkingLatents_%j_%s_%t.err \

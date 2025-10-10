@@ -167,7 +167,7 @@ def create_datasets_and_loaders(args, device):
     return train_loader, val_loader, test_loader
 
 
-def build_model_multitok(args, device):
+def build_model_multitok(args, device, world_size=1):
     print("Loading LLM model...")
     llm = _load_llm_model(args)
     if args.llm_precision == 'fp16':
@@ -180,6 +180,11 @@ def build_model_multitok(args, device):
     if fm is not None:
         fm = fm.to(device)
 
+    # Disable gradient checkpointing for multi-GPU to avoid DDP issues
+    use_checkpoint = args.gradient_checkpointing and (world_size == 1)
+    if world_size > 1 and args.gradient_checkpointing:
+        print("Warning: Disabling gradient checkpointing for multi-GPU training to avoid DDP conflicts")
+    
     model = MultimodalLlamaModelMultiTokens(
         base_model=llm,
         fm_model=fm,
@@ -191,17 +196,11 @@ def build_model_multitok(args, device):
         cfm_weight=args.cfm_weight,  # CFM loss weight
         predict_stellar_params=True,  # Enable stellar parameter prediction
         stellar_params=['Teff', 'logg', 'FeH'],  # Predict these parameters
-        quantiles=args.quantiles  # CQR quantiles
+        quantiles=args.quantiles,  # CQR quantiles
+        use_checkpoint=use_checkpoint  # Conditional checkpointing
     ).to(device)
     
-    # Keep stellar predictor and transformer in FP32 for numerical stability
-    if hasattr(model, 'stellar_predictor') and model.stellar_predictor is not None:
-        model.stellar_predictor.float()
-    if hasattr(model, 'stellar_transformer') and model.stellar_transformer is not None:
-        for layer in model.stellar_transformer:
-            layer.float()
-    # Keep projector in float32 for numeric stability with GradScaler
-    # (base model runs in fp16/bf16; features are cast to projector dtype inside model)
+    # Note: stellar predictor and transformer will be set to FP32 after DDP wrapping
     return model
 
 
@@ -238,7 +237,7 @@ def main():
         tokenizer = train_loader.dataset.tokenizer
 
     print("Creating multitoken multimodal model...")
-    model = build_model_multitok(args, local_rank)
+    model = build_model_multitok(args, local_rank, world_size)
 
     # Clear memory after model creation
     gc.collect()
@@ -285,6 +284,16 @@ def main():
         )
     else:
         print("Single GPU - no DDP")
+
+    # Keep stellar predictor and transformer in FP32 for numerical stability (after DDP wrapping)
+    base_model = model.module if isinstance(model, DDP) else model
+    if hasattr(base_model, 'stellar_predictor') and base_model.stellar_predictor is not None:
+        base_model.stellar_predictor.float()
+        print("✓ Stellar predictor set to float32")
+    if hasattr(base_model, 'stellar_transformer') and base_model.stellar_transformer is not None:
+        for layer in base_model.stellar_transformer:
+            layer.float()
+        print("✓ Stellar transformer set to float32")
 
     print("Creating optimizer and scheduler...")
     optimizer, scheduler, scaler = create_optimizer_and_scheduler(model, args, train_loader)
