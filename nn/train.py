@@ -1027,7 +1027,7 @@ class LLMTrainer(Trainer):
                     loss = loss + stellar_loss  # Scale down stellar loss to prevent exploding gradients
                     
                     # Log stellar parameter loss for monitoring
-                    if batch_idx % 10 == 0:
+                    if batch_idx % 100 == 0:
                         print(f"  Stellar Param Loss: {stellar_loss.item():.4f}")
             else:
                 print("stellar predictions None!")

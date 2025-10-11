@@ -21,6 +21,7 @@ depreceated/
 *.npy
 *.csv
 *.pt
+*.out
 
 # Optional: Common additional ignores
 __pycache__/

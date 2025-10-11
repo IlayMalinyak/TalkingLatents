@@ -479,7 +479,6 @@ class MultimodalLlamaModelMultiTokens(nn.Module):
         if self.predict_stellar_params and hasattr(self, 'stellar_predictor'):
             # Ensure hidden states match predictor dtype
             # h_for_predictor = h.to(dtype=next(self.stellar_predictor.parameters()).dtype)
-            print("h shape: ", h.shape)
             
             # Check for NaN in hidden states before prediction
             # if torch.isnan(h_for_predictor).any() or torch.isinf(h_for_predictor).any():
@@ -490,7 +489,6 @@ class MultimodalLlamaModelMultiTokens(nn.Module):
             #                    for param in self.stellar_predictor.stellar_params}
             # else:
             cls_token = h[:, 0, :].float()  # Convert to float32 for stellar predictor
-            print("cls token single star: ", cls_token.shape)
             stellar_preds = self.stellar_predictor(cls_token)  # Use hidden states
                 
                 # # Check for NaN in stellar predictions

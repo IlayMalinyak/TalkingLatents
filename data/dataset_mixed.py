@@ -8,6 +8,7 @@ from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
 import torch
 from torch.utils.data import DataLoader, Dataset
+from torch.utils.data.distributed import DistributedSampler
 
 try:
     from .dataset_interpert import StellarQuestionsDataset
@@ -497,6 +498,8 @@ def create_mixed_dataloaders(
     drop_last: bool = False,
     pin_memory: bool = False,
     numeric_keys: Optional[Iterable[str]] = None,
+    world_size: int = 1,
+    device: Optional[str] = None,
 ) -> Tuple[DataLoader, DataLoader, DataLoader]:
     single_train = StellarQuestionsDataset(**{**single_kwargs, "split": "train"})
     single_val = StellarQuestionsDataset(**{**single_kwargs, "split": "val"})
@@ -544,9 +547,37 @@ def create_mixed_dataloaders(
         collate_fn=collate_mixed_fn,
     )
 
-    train_loader = DataLoader(train_dataset, shuffle=True, **loader_kwargs)
-    val_loader = DataLoader(val_dataset, shuffle=False, **loader_kwargs)
-    test_loader = DataLoader(test_dataset, shuffle=False, **loader_kwargs)
+    # Handle distributed training
+    if world_size > 1:
+        train_sampler = DistributedSampler(
+            train_dataset, 
+            num_replicas=world_size, 
+            shuffle=True, 
+            seed=seed,
+            drop_last=drop_last
+        )
+        val_sampler = DistributedSampler(
+            val_dataset, 
+            num_replicas=world_size, 
+            shuffle=False, 
+            seed=seed,
+            drop_last=False
+        )
+        test_sampler = DistributedSampler(
+            test_dataset, 
+            num_replicas=world_size, 
+            shuffle=False, 
+            seed=seed,
+            drop_last=False
+        )
+        
+        train_loader = DataLoader(train_dataset, sampler=train_sampler, **loader_kwargs)
+        val_loader = DataLoader(val_dataset, sampler=val_sampler, **loader_kwargs)
+        test_loader = DataLoader(test_dataset, sampler=test_sampler, **loader_kwargs)
+    else:
+        train_loader = DataLoader(train_dataset, shuffle=True, **loader_kwargs)
+        val_loader = DataLoader(val_dataset, shuffle=False, **loader_kwargs)
+        test_loader = DataLoader(test_dataset, shuffle=False, **loader_kwargs)
 
     return train_loader, val_loader, test_loader
 

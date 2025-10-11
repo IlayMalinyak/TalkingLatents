@@ -1,6 +1,6 @@
 {
   "lora_params": {
-    "freeze_strategy": "lora",
+    "freeze_strategy": "encoder_only",
     "lora_start_epoch": 5,
     "lora_lr_multiplier": 1.0,
     "lora_rank": 8,

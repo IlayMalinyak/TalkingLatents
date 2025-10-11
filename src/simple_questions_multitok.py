@@ -52,17 +52,16 @@ def create_datasets_and_loaders(args, device):
     
     # Only rank 0 loads spectral features to avoid OOM
     spectral_features = None
-    if rank == 0:
-        if args.features_file and os.path.exists(args.features_file):
-            print(f"Loading spectral features from {args.features_file}")
-            spectral_features = np.load(args.features_file)
-            print(f"Spectral features shape: {spectral_features.shape}")
-        else:
-            print("No spectral features file provided or file not found. Will use raw spectra on-the-fly.")
+    if args.features_file and os.path.exists(args.features_file):
+        print(f"Loading spectral features from {args.features_file}")
+        spectral_features = np.load(args.features_file)
+        print(f"Spectral features shape: {spectral_features.shape}")
+    else:
+        print("No spectral features file provided or file not found. Will use raw spectra on-the-fly.")
     
-    # Synchronize before proceeding
-    if dist.is_initialized():
-        dist.barrier()
+    # # Synchronize before proceeding
+    # if dist.is_initialized():
+    #     dist.barrier()
     
     model_path, tokenizer_path = get_model_path(args)
     transf = Compose([GeneralSpectrumPreprocessor(rv_norm=True), ToTensor()])
@@ -89,6 +88,8 @@ def create_datasets_and_loaders(args, device):
             tokenizer_path=tokenizer_path,
             max_length=args.max_seq_length,
             num_spectral_features=args.num_spectral_features,
+            world_size=world_size,
+            device=str(local_rank),
         )
         
     elif args.mode == "combined":
@@ -138,6 +139,8 @@ def create_datasets_and_loaders(args, device):
             persistent_workers=num_workers_per_rank > 0,
             pin_memory=torch.cuda.is_available(),
             numeric_keys=('Teff', 'logg', 'FeH'),
+            world_size=world_size,
+            device=str(device),
         )
         
     else:
@@ -158,11 +161,13 @@ def create_datasets_and_loaders(args, device):
             max_length=args.max_seq_length,
             batch_size=args.batch_size,
             num_workers=args.num_workers // world_size if world_size > 1 else args.num_workers,
+            world_size=world_size,
+            device=device,
         )
 
-    # Synchronize all processes after dataset creation
-    if dist.is_initialized():
-        dist.barrier()
+    # # Synchronize all processes after dataset creation
+    # if dist.is_initialized():
+    #     dist.barrier()
 
     return train_loader, val_loader, test_loader
 
@@ -209,9 +214,16 @@ def main():
     # allow override from env for quick tests
     date = __import__('datetime').datetime.now().strftime('%Y-%m-%d-%H-%M')
     args.output_dir = os.path.join(args.output_dir, date)
-    os.makedirs(args.output_dir, exist_ok=True)
-
+    
     local_rank, world_size, _ = setup()
+    
+    # Only rank 0 creates output directory to avoid multiple log dirs
+    if local_rank == 0:
+        os.makedirs(args.output_dir, exist_ok=True)
+    
+    # Synchronize all processes after directory creation
+    if dist.is_initialized():
+        dist.barrier()
     torch.manual_seed(args.random_seed)
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(args.random_seed)
@@ -348,12 +360,17 @@ def main():
 
     if args.train:
         trainer.evaluate_validation_samples(local_rank, 0)
-        _ = trainer.fit(
+        fit_res = trainer.fit(
             num_epochs=args.num_epochs,
             device=local_rank,
             early_stopping=args.early_stopping,
             best='loss'
         )
+        # Only rank 0 saves training results to avoid multiple files
+        if local_rank == 0:
+            output_filename = f'{args.output_dir}/fit_res.json'
+            with open(output_filename, "w") as f:
+                json.dump(fit_res, f, indent=2) 
 
 
 if __name__ == '__main__':

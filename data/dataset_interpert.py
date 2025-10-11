@@ -536,6 +536,8 @@ def create_stellar_dataloaders(json_file: str,
                              random_state: int = 42,
                              num_workers: int = 0,
                              cache_dir: Optional[str] = None,
+                             world_size: int = 1,
+                             device: Optional[str] = None,
                              **dataset_kwargs) -> Tuple[DataLoader, DataLoader, DataLoader]:
     """
     Create train, validation, and test dataloaders
@@ -581,50 +583,48 @@ def create_stellar_dataloaders(json_file: str,
         **dataset_kwargs
     )
 
-    train_sampler = DistributedSampler(train_dataset) if dist.is_initialized() else None
-    val_sampler = DistributedSampler(val_dataset, shuffle=False) if dist.is_initialized() else None
-    test_sampler = DistributedSampler(test_dataset, shuffle=False) if dist.is_initialized() else None
-    
-    # Create dataloaders
-    # Build DataLoader kwargs and only set prefetch/persistent when using workers
-    train_kwargs = dict(
+    # Common loader kwargs
+    loader_kwargs = dict(
         batch_size=batch_size,
-        sampler=train_sampler,
-        shuffle=(train_sampler is None),
-        num_workers=num_workers,
-        pin_memory=True,
-        collate_fn=collate_fn,
-        drop_last=False,
-    )
-    if num_workers > 0:
-        train_kwargs.update(persistent_workers=True, prefetch_factor=2)
-    train_loader = DataLoader(train_dataset, **train_kwargs)
-    
-    val_kwargs = dict(
-        batch_size=batch_size,
-        sampler=val_sampler,
-        shuffle=False,
         num_workers=num_workers,
         pin_memory=True if torch.cuda.is_available() else False,
         collate_fn=collate_fn,
         drop_last=False,
     )
     if num_workers > 0:
-        val_kwargs.update(persistent_workers=True, prefetch_factor=2)
-    val_loader = DataLoader(val_dataset, **val_kwargs)
+        loader_kwargs.update(persistent_workers=True, prefetch_factor=2)
     
-    test_kwargs = dict(
-        batch_size=batch_size,
-        sampler=test_sampler,
-        shuffle=False,
-        num_workers=num_workers,
-        pin_memory=True if torch.cuda.is_available() else False,
-        collate_fn=collate_fn,
-        drop_last=False,
-    )
-    if num_workers > 0:
-        test_kwargs.update(persistent_workers=True, prefetch_factor=2)
-    test_loader = DataLoader(test_dataset, **test_kwargs)
+    # Handle distributed training
+    if world_size > 1:
+        train_sampler = DistributedSampler(
+            train_dataset, 
+            num_replicas=world_size, 
+            shuffle=True, 
+            seed=random_state,
+            drop_last=False
+        )
+        val_sampler = DistributedSampler(
+            val_dataset, 
+            num_replicas=world_size, 
+            shuffle=False, 
+            seed=random_state,
+            drop_last=False
+        )
+        test_sampler = DistributedSampler(
+            test_dataset, 
+            num_replicas=world_size, 
+            shuffle=False, 
+            seed=random_state,
+            drop_last=False
+        )
+        
+        train_loader = DataLoader(train_dataset, sampler=train_sampler, **loader_kwargs)
+        val_loader = DataLoader(val_dataset, sampler=val_sampler, **loader_kwargs)
+        test_loader = DataLoader(test_dataset, sampler=test_sampler, **loader_kwargs)
+    else:
+        train_loader = DataLoader(train_dataset, shuffle=True, **loader_kwargs)
+        val_loader = DataLoader(val_dataset, shuffle=False, **loader_kwargs)
+        test_loader = DataLoader(test_dataset, shuffle=False, **loader_kwargs)
     
     return train_loader, val_loader, test_loader
 
