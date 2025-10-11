@@ -195,7 +195,7 @@ def get_model_path(args):
     """
     def is_valid_model_dir(p: str) -> bool:
         return os.path.isfile(os.path.join(p, 'params.json')) and os.path.isfile(os.path.join(p, 'tokenizer.model'))
-
+    print('llm root: ', args.llm_root)
     candidates = []
     if hasattr(args, 'llm_path') and args.llm_path:
         candidates.append(args.llm_path)
