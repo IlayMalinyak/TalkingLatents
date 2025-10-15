@@ -74,7 +74,6 @@ class StellarParameterPredictor(nn.Module):
             Dict of predicted stellar parameters (normalized to 0-1 range)
         """
 
-        print("hidden_states shape: ", hidden_states.shape)
         if hidden_states.dim() == 3:
             # Pool across sequence dimension (mean pooling)
             # Add small epsilon to avoid division by zero in case of all-zero sequences
@@ -134,7 +133,7 @@ class MultimodalLlamaModelMultiTokens(nn.Module):
     def __init__(self, base_model, fm_model, latent_dim, hidden_dim, num_spectral_features: int = 8,
                  use_checkpoint: bool = True, mode: str = "single_star", use_cfm=True, cfm_weight=0.1,
                  predict_stellar_params: bool = True, stellar_params: List[str] = ['Teff', 'logg', 'FeH'],
-                 quantiles: List[float] = [0.159, 0.5, 0.841]):
+                 quantiles: List[float] = [0.159, 0.5, 0.841], enable_classification: bool = True):
         super().__init__()
         self.base_model = base_model
         self.fm_model = fm_model
@@ -149,6 +148,7 @@ class MultimodalLlamaModelMultiTokens(nn.Module):
         self.stellar_params = stellar_params
         self.quantiles = quantiles
         self.num_quantiles = len(quantiles)
+        self.enable_classification = enable_classification
         
         # For two-star mode, create separate projectors for each star
         # if mode == "two_star":
@@ -201,6 +201,18 @@ class MultimodalLlamaModelMultiTokens(nn.Module):
                 )
         else:
             self.stellar_predictor = None
+        
+        # Classification head for comparative questions (STAR_A vs STAR_B)
+        if self.enable_classification:
+            self.classification_head = nn.Sequential(
+                nn.Linear(self.embedding_dim, self.embedding_dim // 2),
+                nn.LayerNorm(self.embedding_dim // 2),
+                nn.GELU(),
+                nn.Dropout(0.1),
+                nn.Linear(self.embedding_dim // 2, 2)  # Binary classification: STAR_A (0) or STAR_B (1)
+            )
+        else:
+            self.classification_head = None
            
 
     def forward(self, batch: Dict[str, Any]) -> Dict[str, torch.Tensor]:
@@ -348,6 +360,36 @@ class MultimodalLlamaModelMultiTokens(nn.Module):
             # Final prediction from pooled representation
             stellar_preds = self.stellar_predictor(pooled_h.float())  # Convert to float32 for stellar predictor
             outputs['stellar_predictions'] = stellar_preds
+        
+        # Add classification predictions for comparative samples
+        if self.classification_head is not None:
+            # Get comparative mask to identify which samples are comparative
+            comp_mask = batch.get('mode_mask_comparative', torch.zeros(batch_size, dtype=torch.bool, device=device))
+            
+            if comp_mask.any():
+                # Get classification head's target dtype for memory efficiency
+                if hasattr(self, 'classification_head') and self.classification_head is not None:
+                    class_head_dtype = next(self.classification_head.parameters()).dtype
+                else:
+                    class_head_dtype = h.dtype
+                
+                # Use classification head's dtype (could be FP16/BF16 for memory efficiency)
+                class_h = h.to(dtype=class_head_dtype)
+                
+                # Pass full sequence through small transformer (reuse stellar transformer)
+                if hasattr(self, 'stellar_transformer') and self.stellar_transformer is not None:
+                    # Convert to FP32 for stellar transformer (which is kept in FP32), then back
+                    class_h_fp32 = class_h.float()
+                    for layer in self.stellar_transformer:
+                        class_h_fp32 = layer(class_h_fp32)
+                    class_h = class_h_fp32.to(dtype=class_head_dtype)
+                
+                # Pool the sequence dimension (mean pooling)
+                pooled_class_h = class_h.mean(dim=1)
+                
+                # Get classification logits using classification head's native precision
+                classification_logits = self.classification_head(pooled_class_h)
+                outputs['classification_logits'] = classification_logits
         
         return outputs
 
@@ -599,7 +641,6 @@ class MultimodalLlamaModelMultiTokens(nn.Module):
             #                    for param in self.stellar_predictor.stellar_params}
             # else:
             cls_token = h[:, 0, :].float()  # Convert to float32 for stellar predictor
-            print("cls_token two star: ", cls_token.shape)
             stellar_preds = self.stellar_predictor(cls_token)  # Use hidden states
                 
                 # # Check for NaN in stellar predictions
@@ -656,25 +697,71 @@ class MultimodalLlamaModelMultiTokens(nn.Module):
         device = next(self.parameters()).device
         input_ids = batch_data['input_ids'][batch_idx:batch_idx+1].to(device)
         
-        # Determine the mode for this specific sample  
+        # Determine the mode for this specific sample
+        def _normalize_mode(mode_value):
+            if mode_value is None:
+                return None
+            if isinstance(mode_value, torch.Tensor):
+                if mode_value.ndim == 0:
+                    mode_value = mode_value.item()
+                else:
+                    mode_value = mode_value.tolist()
+            if isinstance(mode_value, (list, tuple)):
+                mode_value = mode_value[0]
+            if isinstance(mode_value, bytes):
+                mode_value = mode_value.decode('utf-8', errors='ignore')
+            mode_str = str(mode_value).lower()
+            if mode_str in {"two_star", "comparative", "comparison", "pair", "dual"}:
+                return "two_star"
+            if mode_str in {"single_star", "single", "singlemode", "one_star"}:
+                return "single_star"
+            # Combined mode is determined per-sample by additional metadata
+            return None
+
+        raw_mode = None
         if 'mode' in batch_data and batch_data['mode']:
-            current_mode = batch_data['mode'][batch_idx]
-        else:
-            # Fallback: check if it has comparative features
-            current_mode = "two_star" if ('masked_spectra_a' in batch_data and batch_data['masked_spectra_a'] is not None) else "single_star"
-            
+            try:
+                raw_mode = batch_data['mode'][batch_idx]
+            except (IndexError, KeyError, TypeError):
+                raw_mode = None
+        current_mode = _normalize_mode(raw_mode)
+
+        if current_mode is None:
+            comp_mask = batch_data.get('mode_mask_comparative')
+            if comp_mask is not None:
+                try:
+                    if isinstance(comp_mask, torch.Tensor):
+                        current_mode = "two_star" if bool(comp_mask[batch_idx].item()) else "single_star"
+                    else:
+                        current_mode = "two_star" if bool(comp_mask[batch_idx]) else "single_star"
+                except (IndexError, TypeError):
+                    current_mode = None
+
+        if current_mode is None:
+            has_two_star_features = (
+                batch_data.get('masked_spectra_a') is not None and
+                batch_data.get('masked_spectra_b') is not None
+            )
+            current_mode = "two_star" if has_two_star_features else "single_star"
+
         if current_mode == "two_star":
             star_a_features = batch_data['masked_spectra_a'][batch_idx:batch_idx+1].to(device)
             star_b_features = batch_data['masked_spectra_b'][batch_idx:batch_idx+1].to(device)
             star_a_indices = batch_data['star_a_feature_indices'][batch_idx:batch_idx+1].to(device)
             star_b_indices = batch_data['star_b_feature_indices'][batch_idx:batch_idx+1].to(device)
-            answer_start_idx = batch_data.get('answer_start_indices', [input_ids.shape[1]])[batch_idx]
+            answer_start_source = batch_data.get('answer_start_indices', [input_ids.shape[1]])
+            answer_start_idx = answer_start_source[batch_idx]
             if isinstance(answer_start_idx, torch.Tensor):
                 answer_start_idx = answer_start_idx.item()
         else:
             input_spectra = batch_data['masked_spectra'][batch_idx:batch_idx+1].to(device)
-            feature_start_idx = batch_data['feature_start_indices'][batch_idx].to(device)
-            answer_start_idx = batch_data['answer_start_indices'][batch_idx].item()
+            feature_start_raw = batch_data['feature_start_indices'][batch_idx]
+            if isinstance(feature_start_raw, torch.Tensor):
+                feature_start_idx = feature_start_raw.to(device)
+            else:
+                feature_start_idx = torch.tensor(int(feature_start_raw), device=device, dtype=torch.long)
+            answer_start_raw = batch_data['answer_start_indices'][batch_idx]
+            answer_start_idx = answer_start_raw.item() if isinstance(answer_start_raw, torch.Tensor) else int(answer_start_raw)
 
         # Handle different batch formats (mixed vs single dataset)
         if 'input_texts' in batch_data:

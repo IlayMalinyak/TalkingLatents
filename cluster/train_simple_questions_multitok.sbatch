@@ -53,4 +53,5 @@ srun --kill-on-bad-exit=1 \
     --llm_precision fp16 \
     --use_amp \
     --gradient_checkpointing \
+    --enable_classification \
     --max_iter -1

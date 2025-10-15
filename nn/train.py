@@ -540,7 +540,7 @@ class LLMTrainer(Trainer):
 
     def __init__(self, lora_params, alpha=1, beta=1, gamma=1,
                  cfm_weight=0.01, max_chunk_size=128, tokenizer=None, mode="single_star", 
-                 curriculum_decay_steps=0, quantiles=None, **kwargs):
+                 curriculum_decay_steps=0, quantiles=None, loss_lambda=1.0, **kwargs):
         if quantiles is None:
             quantiles = [0.159, 0.5, 0.841]  # Default: ~1-sigma + median
         super(LLMTrainer, self).__init__(**kwargs)
@@ -573,6 +573,7 @@ class LLMTrainer(Trainer):
         self.stellar_cqr_loss = CQR(quantiles=quantiles, reduction='mean')
         self.quantiles = quantiles
         self.num_quantiles = len(quantiles)
+        self.loss_lambda = float(loss_lambda)
         
         self._apply_freeze_strategy(self.freeze_strategy)
 
@@ -594,7 +595,7 @@ class LLMTrainer(Trainer):
             decay_steps_occurred = self.global_step // self.curriculum_decay_steps
             
             # Decrease by 0.1 each time, but stop at 0.5
-            target_prob = max(0.5, self.initial_single_sample_prob - (decay_steps_occurred * 0.1))
+            target_prob = max(0, self.initial_single_sample_prob - (decay_steps_occurred * 0.2))
             
             # Update dataset probability if it changed
             current_prob = self.train_dl.dataset.single_sample_prob
@@ -768,9 +769,6 @@ class LLMTrainer(Trainer):
         # Shift for autoregressive prediction
         shift_logits = logits[..., :-1, :].contiguous()
         shift_labels = target_ids[..., 1:].contiguous()
-
-        # shift_logits = logits
-        # shift_labels = target_ids
         
         # Only compute loss on actual answer tokens (not -100)
         active_mask = (shift_labels != -100)
@@ -786,42 +784,10 @@ class LLMTrainer(Trainer):
         active_logits = flat_logits[flat_mask]
         active_labels = flat_labels[flat_mask]
         
-        # # For two_star mode, weight first 2 tokens more heavily
-        # if hasattr(self, 'mode') and self.mode == 'two_star':
-        #     # Create weights for all active tokens
-        #     weights = torch.ones_like(active_labels, dtype=torch.float, device=logits.device)
-            
-        #     # Find positions of active tokens for each sample in batch
-        #     batch_size, seq_len = active_mask.shape
-        #     weight_multiplier = 3.0  # Make first 2 tokens 3x more important
-            
-        #     # Count active tokens per sample to identify first 2 tokens
-        #     for batch_idx in range(batch_size):
-        #         sample_active_mask = active_mask[batch_idx]
-        #         if sample_active_mask.any():
-        #             # Get indices of active tokens for this sample
-        #             active_indices = torch.nonzero(sample_active_mask, as_tuple=False).squeeze(-1)
-        #             if len(active_indices) >= 2:
-        #                 # Weight the first 2 active tokens more heavily
-        #                 first_two_global_indices = batch_idx * seq_len + active_indices[:2]
-        #                 # Find these indices in the flattened active_labels
-        #                 flat_active_indices = torch.nonzero(flat_mask, as_tuple=False).squeeze(-1)
-        #                 for global_idx in first_two_global_indices:
-        #                     local_idx = (flat_active_indices == global_idx).nonzero(as_tuple=False)
-        #                     if len(local_idx) > 0:
-        #                         weights[local_idx[0]] = weight_multiplier
-            
-        #     # Compute weighted cross entropy loss
-        #     loss = F.cross_entropy(active_logits, active_labels, reduction='none')
-        #     loss = (loss * weights).mean()
-        # else:
-        #     # Standard cross entropy loss for non-two_star modes
+        
         loss = F.cross_entropy(active_logits, active_labels, reduction='mean')
         
-        # Print diagnostic info
-        # print(f"Active tokens: {active_mask.sum().item()}/{active_mask.numel()} "
-        #     f"({100*active_mask.sum().item()/active_mask.numel():.1f}%)")
-        
+       
         return loss
     
     def get_logits(self, batch, device, val=False):
@@ -994,46 +960,67 @@ class LLMTrainer(Trainer):
         # Store CE loss
         self.ce_losses.append(lm_loss.item())
         
-        # Combine losses
-        loss = lm_loss
-        
+        # Track stellar loss for weighting
+        stellar_loss_tensor = None
+        stellar_loss_value = None
+
         # Add CFM loss if available
         cfm_loss_value = None
         if 'cfm_loss' in outputs:
             cfm_loss = outputs['cfm_loss']
             cfm_loss_value = cfm_loss.item()
-            loss = loss + self.cfm_weight * cfm_loss
-            
-            # Log CFM loss for monitoring
-            if batch_idx % 100 == 0:
-                print(f"  LM Loss: {lm_loss.item():.4f}, CFM Loss: {cfm_loss.item():.4f}")
-        
-        # Store CFM loss (None if not available)
-        self.cfm_losses.append(cfm_loss_value)
         
         # Add stellar parameter loss if available
-        stellar_loss_value = None
         if 'stellar_predictions' in outputs:
             stellar_preds = outputs['stellar_predictions']
-            
-            stellar_loss = self.compute_stellar_parameter_loss(stellar_preds, batch)
-            if stellar_loss is not None:
+            stellar_loss_candidate = self.compute_stellar_parameter_loss(stellar_preds, batch)
+            if stellar_loss_candidate is not None:
                 # Check for NaN in stellar loss
-                if torch.isnan(stellar_loss) or torch.isinf(stellar_loss):
+                if torch.isnan(stellar_loss_candidate) or torch.isinf(stellar_loss_candidate):
                     print(f"Warning: NaN/inf detected in stellar parameter loss, skipping")
                     # Don't add NaN loss to total loss
                 else:
-                    stellar_loss_value = stellar_loss.item()
-                    loss = loss + stellar_loss  # Scale down stellar loss to prevent exploding gradients
+                    stellar_loss_tensor = stellar_loss_candidate
+                    stellar_loss_value = stellar_loss_tensor.item()
                     
-                    # Log stellar parameter loss for monitoring
+                    # Log stellar parameter loss for monitoring (every 100 batches)
                     if batch_idx % 100 == 0:
-                        print(f"  Stellar Param Loss: {stellar_loss.item():.4f}")
+                        print(f"  Stellar Param Loss: {stellar_loss_tensor.item():.4f}", end=', ')
             else:
                 print("stellar predictions None!")
         
+        # Combine CE and stellar losses according to weighting
+        if stellar_loss_tensor is not None:
+            lambda_weight = max(0.0, min(1.0, self.loss_lambda))
+            loss = lambda_weight * lm_loss + (1.0 - lambda_weight) * stellar_loss_tensor
+        else:
+            loss = lm_loss
+
+        # Add CFM contribution after core loss combination
+        if cfm_loss_value is not None:
+            loss = loss + self.cfm_weight * outputs['cfm_loss']
+            if batch_idx % 100 == 0:
+                print(f"CFM Loss: {outputs['cfm_loss'].item():.4f}", end=', ')
+
+        # Store CFM loss (None if not available)
+        self.cfm_losses.append(cfm_loss_value)
+
         # Store stellar parameter loss (None if not available)
         self.stellar_losses.append(stellar_loss_value)
+        
+        # Add classification loss for comparative samples
+        if 'classification_logits' in outputs and 'pair_labels' in batch:
+            classification_loss_candidate = self.compute_classification_loss(outputs['classification_logits'], batch)
+            if classification_loss_candidate is not None:
+                # Check for NaN in classification loss
+                if torch.isnan(classification_loss_candidate) or torch.isinf(classification_loss_candidate):
+                    print(f"Warning: NaN/inf detected in classification loss, skipping")
+                else:
+                    loss = loss + classification_loss_candidate
+                    
+                    # Log classification loss for monitoring (every 100 batches)
+                    if batch_idx % 100 == 0:
+                        print(f"Classification Loss: {classification_loss_candidate.item():.4f}")
         
         # Check for NaN in total loss
         if torch.isnan(loss) or torch.isinf(loss):
@@ -1065,34 +1052,49 @@ class LLMTrainer(Trainer):
         
         lm_loss = self.get_loss(outputs['logits'], target_ids)
         
-        # Combine losses
-        loss = lm_loss
-        
+        stellar_loss_tensor = None
+
         # Add CFM loss if available
         if 'cfm_loss' in outputs:
             cfm_loss = outputs['cfm_loss']
-            loss = loss + self.cfm_weight * cfm_loss
-            
-            # Log CFM loss for monitoring
-            if batch_idx % 100 == 0:
-                print(f"  LM Loss: {lm_loss.item():.4f}, CFM Loss: {cfm_loss.item():.4f}")
         
         # Add stellar parameter loss if available
         if 'stellar_predictions' in outputs:
             stellar_preds = outputs['stellar_predictions']
-            
-            stellar_loss = self.compute_stellar_parameter_loss(stellar_preds, batch)
-            if stellar_loss is not None:
+            stellar_loss_candidate = self.compute_stellar_parameter_loss(stellar_preds, batch)
+            if stellar_loss_candidate is not None:
                 # Check for NaN in stellar loss
-                if torch.isnan(stellar_loss) or torch.isinf(stellar_loss):
+                if torch.isnan(stellar_loss_candidate) or torch.isinf(stellar_loss_candidate):
                     print(f"Warning: NaN/inf detected in stellar parameter loss, skipping")
-                    # Don't add NaN loss to total loss
                 else:
-                    loss = loss + stellar_loss  # Scale down stellar loss to prevent exploding gradients
-                    
-                    # Log stellar parameter loss for monitoring
+                    stellar_loss_tensor = stellar_loss_candidate
                     if batch_idx % 10 == 0:
-                        print(f"  Stellar Param Loss: {stellar_loss.item():.4f}")
+                        print(f"  Stellar Param Loss: {stellar_loss_tensor.item():.4f}")
+
+        if stellar_loss_tensor is not None:
+            lambda_weight = max(0.0, min(1.0, self.loss_lambda))
+            loss = lambda_weight * lm_loss + (1.0 - lambda_weight) * stellar_loss_tensor
+        else:
+            loss = lm_loss
+
+        if 'cfm_loss' in outputs:
+            loss = loss + self.cfm_weight * outputs['cfm_loss']
+            if batch_idx % 100 == 0:
+                print(f"  LM Loss: {lm_loss.item():.4f}, CFM Loss: {outputs['cfm_loss'].item():.4f}")
+        
+        # Add classification loss for comparative samples
+        if 'classification_logits' in outputs and 'pair_labels' in batch:
+            classification_loss_candidate = self.compute_classification_loss(outputs['classification_logits'], batch)
+            if classification_loss_candidate is not None:
+                # Check for NaN in classification loss
+                if torch.isnan(classification_loss_candidate) or torch.isinf(classification_loss_candidate):
+                    print(f"Warning: NaN/inf detected in classification loss, skipping")
+                else:
+                    loss = loss + classification_loss_candidate
+                    
+                    # Log classification loss for monitoring (every 100 batches)
+                    if batch_idx % 100 == 0:
+                        print(f"  Val Classification Loss: {classification_loss_candidate.item():.4f}")
         
         # Check for NaN in total loss
         if torch.isnan(loss) or torch.isinf(loss):
@@ -1194,6 +1196,49 @@ class LLMTrainer(Trainer):
             return total_loss / loss_count
         else:
             return None
+    
+    def compute_classification_loss(self, classification_logits, batch: Dict[str, Any]) -> Optional[torch.Tensor]:
+        """
+        Compute cross-entropy loss for comparative classification (STAR_A vs STAR_B)
+        
+        Args:
+            classification_logits: torch.Tensor of shape [batch_size, 2] - logits for STAR_A/STAR_B classification
+            batch: Batch containing pair_labels for comparative samples
+            
+        Returns:
+            Classification loss or None if no comparative samples available
+        """
+        if classification_logits is None:
+            return None
+            
+        device = classification_logits.device
+        
+        # Get comparative mask and pair labels
+        if 'pair_labels' not in batch or 'pair_label_present' not in batch:
+            return None
+            
+        pair_labels = batch['pair_labels'].to(device)  # Ground truth labels (0 for STAR_A, 1 for STAR_B)
+        pair_mask = batch['pair_label_present'].to(device)  # Mask for valid comparative samples
+        
+        if not pair_mask.any():
+            return None  # No comparative samples in this batch
+        
+        # Filter to only comparative samples
+        comp_logits = classification_logits[pair_mask]  # [num_comp_samples, 2]
+        comp_labels = pair_labels[pair_mask]  # [num_comp_samples]
+        
+        if len(comp_logits) == 0:
+            return None
+            
+        # Check for valid labels (should be 0 or 1)
+        if not torch.all((comp_labels == 0) | (comp_labels == 1)):
+            print("Warning: Invalid pair labels detected, skipping classification loss")
+            return None
+            
+        # Compute cross-entropy loss
+        classification_loss = F.cross_entropy(comp_logits, comp_labels)
+        
+        return classification_loss
     
     def _get_stellar_parameter_predictions(self, batch: Dict[str, Any], batch_idx: int, device: torch.device) -> Optional[str]:
         """Get stellar parameter predictions as JSON string"""

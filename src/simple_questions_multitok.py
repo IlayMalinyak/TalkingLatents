@@ -189,7 +189,8 @@ def build_model_multitok(args, device, world_size=1):
     use_checkpoint = args.gradient_checkpointing and (world_size == 1)
     if world_size > 1 and args.gradient_checkpointing:
         print("Warning: Disabling gradient checkpointing for multi-GPU training to avoid DDP conflicts")
-    
+    enable_cls = args.enable_classification if hasattr(args, 'enable_classification') else False
+     
     model = MultimodalLlamaModelMultiTokens(
         base_model=llm,
         fm_model=fm,
@@ -202,8 +203,9 @@ def build_model_multitok(args, device, world_size=1):
         predict_stellar_params=True,  # Enable stellar parameter prediction
         stellar_params=['Teff', 'logg', 'FeH'],  # Predict these parameters
         quantiles=args.quantiles,  # CQR quantiles
-        use_checkpoint=use_checkpoint  # Conditional checkpointing
-    ).to(device)
+        use_checkpoint=use_checkpoint,  # Conditional checkpointing
+        enable_classification=enable_cls
+        ).to(device)
     
     # Note: stellar predictor and transformer will be set to FP32 after DDP wrapping
     return model
@@ -306,6 +308,9 @@ def main():
         for layer in base_model.stellar_transformer:
             layer.float()
         print("✓ Stellar transformer set to float32")
+    # Note: Classification head remains in model precision (FP16/BF16) for memory efficiency
+    if hasattr(base_model, 'classification_head') and base_model.classification_head is not None:
+        print("✓ Classification head using model precision for memory efficiency")
 
     print("Creating optimizer and scheduler...")
     optimizer, scheduler, scaler = create_optimizer_and_scheduler(model, args, train_loader)
@@ -349,6 +354,7 @@ def main():
         mode=initial_mode,
         curriculum_decay_steps=args.curriculum_decay_steps,
         quantiles=args.quantiles,
+        loss_lambda=args.loss_lambda,
     )
     
     trainer.combined_mode = (args.mode == "combined")

@@ -40,6 +40,9 @@ class MixedSample:
     y_numeric_a: Optional[torch.Tensor] = None
     y_numeric_b: Optional[torch.Tensor] = None
     pair_label: Optional[torch.Tensor] = None
+    masked_spectra: Optional[torch.Tensor] = None
+    masked_spectra_a: Optional[torch.Tensor] = None
+    masked_spectra_b: Optional[torch.Tensor] = None
     metadata: Optional[Dict[str, Any]] = None
 
     def to_dict(self) -> Dict[str, Any]:
@@ -57,6 +60,9 @@ class MixedSample:
             "y_numeric_a": self.y_numeric_a,
             "y_numeric_b": self.y_numeric_b,
             "pair_label": self.pair_label,
+            "masked_spectra": self.masked_spectra,
+            "masked_spectra_a": self.masked_spectra_a,
+            "masked_spectra_b": self.masked_spectra_b,
             "metadata": self.metadata,
         }
 
@@ -148,6 +154,12 @@ class MixedStellarQADataset(Dataset):
         if features_raw is None:
             features_raw = raw.get("masked_spectra")
         features = self._coerce_tensor(features_raw)
+
+        masked_raw = raw.get("masked_spectra")
+        masked_spectra = self._coerce_tensor(masked_raw)
+        if masked_spectra is None and features is not None:
+            masked_spectra = features
+
         numeric = self._extract_numeric(raw.get("stellar_data"))
 
         metadata = {
@@ -156,7 +168,7 @@ class MixedStellarQADataset(Dataset):
             "question_start_idx": raw.get("question_start_idx"),
             "feature_start_idx": raw.get("feature_start_idx"),
             "feature_length": raw.get("feature_length"),
-            "masked_spectra": raw.get("masked_spectra"),
+            "masked_spectra": masked_spectra if masked_spectra is not None else masked_raw,
             "spectra": raw.get("spectra"),
             "answer_start_idx": raw.get("answer_start_idx"),
             "target_length": raw.get("target_length"),
@@ -169,8 +181,10 @@ class MixedStellarQADataset(Dataset):
             span_indices=span_indices,
             x_raw=features,
             y_numeric=numeric,
+            masked_spectra=masked_spectra,
             metadata=metadata,
         )
+
 
     def _normalize_comparative(self, raw: Dict[str, Any]) -> MixedSample:
         tokens = raw["input_ids"].clone()
@@ -188,7 +202,7 @@ class MixedStellarQADataset(Dataset):
                 features_a_raw = val
                 break
         features_a = self._coerce_tensor(features_a_raw)
-        
+
         features_b_raw = None
         for key in ["features_b", "star_b_features", "masked_spectra_b"]:
             val = raw.get(key)
@@ -196,6 +210,16 @@ class MixedStellarQADataset(Dataset):
                 features_b_raw = val
                 break
         features_b = self._coerce_tensor(features_b_raw)
+
+        masked_a_raw = raw.get("masked_spectra_a")
+        masked_b_raw = raw.get("masked_spectra_b")
+        masked_spectra_a = self._coerce_tensor(masked_a_raw)
+        masked_spectra_b = self._coerce_tensor(masked_b_raw)
+        if masked_spectra_a is None and features_a is not None:
+            masked_spectra_a = features_a
+        if masked_spectra_b is None and features_b is not None:
+            masked_spectra_b = features_b
+
         numeric_a = self._extract_numeric(raw.get("star_a") or raw.get("star_a_params"))
         numeric_b = self._extract_numeric(raw.get("star_b") or raw.get("star_b_params"))
         # Use explicit checking to avoid tensor boolean evaluation issues
@@ -214,8 +238,8 @@ class MixedStellarQADataset(Dataset):
             "options": raw.get("options"),
             "star_a_feature_indices": raw.get("star_a_feature_indices"),
             "star_b_feature_indices": raw.get("star_b_feature_indices"),
-            "masked_spectra_a": raw.get("masked_spectra_a"),
-            "masked_spectra_b": raw.get("masked_spectra_b"),
+            "masked_spectra_a": masked_spectra_a if masked_spectra_a is not None else masked_a_raw,
+            "masked_spectra_b": masked_spectra_b if masked_spectra_b is not None else masked_b_raw,
             "answer_start_idx": raw.get("answer_start_idx"),
             "target_length": raw.get("target_length"),
             "raw": raw,
@@ -230,8 +254,11 @@ class MixedStellarQADataset(Dataset):
             y_numeric_a=numeric_a,
             y_numeric_b=numeric_b,
             pair_label=pair_label,
+            masked_spectra_a=masked_spectra_a,
+            masked_spectra_b=masked_spectra_b,
             metadata=metadata,
         )
+
 
     def _coerce_tensor(self, value: Any) -> Optional[torch.Tensor]:
         if value is None:
@@ -404,7 +431,7 @@ def collate_mixed_fn(batch: List[Dict[str, Any]]) -> Dict[str, Any]:
     masked_spectra_a_values: List[Optional[torch.Tensor]] = []
     masked_spectra_b_values: List[Optional[torch.Tensor]] = []
 
-    for meta, span in zip(metadata, span_indices):
+    for idx, (meta, span) in enumerate(zip(metadata, span_indices)):
         raw_meta = meta.get("raw", {}) if meta else {}
         feature_start_idx = meta.get("feature_start_idx", -1) if meta else -1
         feature_start_indices.append(int(feature_start_idx) if feature_start_idx is not None else -1)
@@ -426,9 +453,21 @@ def collate_mixed_fn(batch: List[Dict[str, Any]]) -> Dict[str, Any]:
         star_a_lists.append(_to_list(meta.get("star_a_feature_indices") if meta else None))
         star_b_lists.append(_to_list(meta.get("star_b_feature_indices") if meta else None))
 
-        masked_spectra_values.append(meta.get("masked_spectra") if meta else None)
-        masked_spectra_a_values.append(meta.get("masked_spectra_a") if meta else None)
-        masked_spectra_b_values.append(meta.get("masked_spectra_b") if meta else None)
+        item = batch[idx]
+        masked_value = item.get("masked_spectra")
+        if masked_value is None and meta:
+            masked_value = meta.get("masked_spectra")
+        masked_spectra_values.append(masked_value)
+
+        masked_a_value = item.get("masked_spectra_a")
+        if masked_a_value is None and meta:
+            masked_a_value = meta.get("masked_spectra_a")
+        masked_spectra_a_values.append(masked_a_value)
+
+        masked_b_value = item.get("masked_spectra_b")
+        if masked_b_value is None and meta:
+            masked_b_value = meta.get("masked_spectra_b")
+        masked_spectra_b_values.append(masked_b_value)
 
     feature_start_indices_tensor = torch.tensor(feature_start_indices, dtype=torch.long)
     feature_lengths_tensor = torch.tensor(feature_lengths, dtype=torch.long)

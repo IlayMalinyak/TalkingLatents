@@ -306,6 +306,8 @@ def parse_args():
                        help='Weight decay')
     parser.add_argument('--warmup_epochs', type=int, default=2,
                        help='Number of warmup epochs')
+    parser.add_argument('--loss_lambda', type=float, default=0.1,
+                       help='Weight for cross-entropy loss when combining with stellar parameter loss')
     parser.add_argument('--early_stopping', type=int, default=20,
                        help='Early stopping patience')
     parser.add_argument('--max_iter', type=int, default=-1,
@@ -328,8 +330,12 @@ def parse_args():
     parser.add_argument('--comparative_json_file', type=str, 
                        default='/data/TalkingLatents/data/dataset/comparative_dataset.json',
                        help='Path to comparative questions JSON file (used in two_star mode)')
+    parser.add_argument('--enable_classification', action='store_true', default=True,
+                       help='Enable classification head for comparative questions (default: True)')
+    parser.add_argument('--disable_classification', action='store_true', default=False,
+                       help='Disable classification head to save memory')
     
-    parser.add_argument('--single_sample_prob', type=float, default=1,
+    parser.add_argument('--single_sample_prob', type=float, default=1.0,
                        help='Probability of drawing a single-star sample when using the mixed dataset')
     
     parser.add_argument('--curriculum_decay_steps', type=int, default=1000,
@@ -847,7 +853,8 @@ def create_trainer(model, optimizer, criterion, train_loader, val_loader,scaler,
         lora_params=lora_params,
         scaler=scaler,
         use_amp=args.use_amp,
-        max_grad_norm=args.max_grad_norm 
+        max_grad_norm=args.max_grad_norm,
+        loss_lambda=args.loss_lambda
     )
     
     return trainer
