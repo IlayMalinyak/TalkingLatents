@@ -1,0 +1,56 @@
+experiment:
+  output_dir: logs/late_fusion
+  seed: 42
+
+llm:
+  llm_root: /data/.llama
+  llm_model: Llama3.1-8B
+  llm_path: null
+  llm_precision: fp16
+
+data:
+  json_file: /data/TalkingLatents/data/dataset/stellar_descriptions_questions_short.json
+  tokenizer_path: /data/.llama/Llama3.1-8B/tokenizer.model
+  batch_size: 4
+  num_workers: 2
+  train_ratio: 0.7
+  val_ratio: 0.15
+  test_ratio: 0.15
+  random_state: 42
+  max_length: 128
+  cache_dir: cache/late_fusion
+  dataset_kwargs: {}
+
+model:
+  config_path: configs/late_fusion_model.json
+  overrides:
+    freeze_llm: true
+    freeze_spectral: true
+    modality_dropout:
+      enabled: true
+      drop_text_prob: 0.3
+      drop_spectra_prob: 0.3
+
+spectral_model:
+  enabled: true
+
+training:
+  distributed: True
+  num_epochs: 50
+  optimizer:
+    type: adamw
+    lr: 0.0001
+    weight_decay: 0.01
+    betas: [0.9, 0.999]
+  scheduler:
+    type: cosine
+    t_max: 5
+    min_lr: 1.0e-5
+  accumulation_steps: 1
+  grad_clip: true
+  max_grad_norm: 1.0
+  use_amp: true
+  log_losses_every: 100
+  best_metric: loss
+  early_stopping: null
+  save_full_every_epoch: true

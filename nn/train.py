@@ -51,7 +51,8 @@ class Trainer(object):
                  scheduler=None, val_dataloader=None,   max_iter=-1, scaler=None, use_amp=False,
                   grad_clip=False, max_grad_norm=1, log_path=None, exp_name=None, plot_every=None,
                    cos_inc=False, range_update=None, accumulation_step=1, wandb_log=False, num_quantiles=1,
-                   update_func=lambda x: x):
+                   update_func=lambda x: x, save_full_every_epoch=True):
+        import torch as _torch
         self.model = model
         self.optimizer = optimizer
         self.criterion = criterion
@@ -67,11 +68,19 @@ class Trainer(object):
         self.train_sampler = self.get_sampler_from_dataloader(train_dataloader)
         self.val_sampler = self.get_sampler_from_dataloader(val_dataloader)
         self.max_iter = max_iter
-        self.device = device
+
+        # Normalize device to torch.device for internal use
+        if isinstance(device, int):
+            self.device = _torch.device(f'cuda:{device}' if _torch.cuda.is_available() else 'cpu')
+        elif isinstance(device, str):
+            self.device = _torch.device(device)
+        else:
+            self.device = device  # assume torch.device
+
         self.world_size = world_size
-        self.exp_name = exp_name
-        self.log_path = log_path
-        self.best_state_dict = self.model.state_dict()
+        self.exp_name = exp_name or "experiment"
+        self.log_path = log_path or "./logs"
+        self.best_state_dict = None
         self.plot_every = plot_every
         self.logger = None
         self.range_update = range_update
@@ -80,35 +89,142 @@ class Trainer(object):
         self.num_quantiles = num_quantiles
         self.update_func = update_func
         self.epoch = 0
-        # if log_path is not None:
-        #     self.logger =SummaryWriter(f'{self.log_path}/exp{self.exp_num}')
-        #     # print(f"logger path: {self.log_path}/exp{self.exp_num}")
 
-        # print("logger is: ", self.logger)
-    
+        # NEW: control saving of a full resume checkpoint each epoch
+        self.save_full_every_epoch = save_full_every_epoch
+
+    def _unwrap_model(self):
+        """Return the underlying model (handle DDP/DataParallel wrappers)."""
+        return self.model.module if hasattr(self.model, "module") else self.model
+
+    def _collect_trainable_state_names(self, model):
+        """Collect parameter and buffer names needed to resume trainable components."""
+        trainable_param_names = {
+            name for name, param in model.named_parameters() if param.requires_grad
+        }
+
+        buffer_names = set()
+        if trainable_param_names:
+            for buffer_name, _ in model.named_buffers():
+                prefix = buffer_name.rsplit('.', 1)[0] if '.' in buffer_name else ''
+                if prefix:
+                    if any(name.startswith(f"{prefix}.") or name == prefix for name in trainable_param_names):
+                        buffer_names.add(buffer_name)
+                else:
+                    if any('.' not in name for name in trainable_param_names):
+                        buffer_names.add(buffer_name)
+        return trainable_param_names, buffer_names
+
+    def _get_trainable_state_dict(self):
+        """Return a state_dict containing only trainable parameters (and required buffers)."""
+        from collections import OrderedDict
+        model = self._unwrap_model()
+        trainable_names, buffer_names = self._collect_trainable_state_names(model)
+        keep_names = trainable_names | buffer_names
+
+        if not keep_names:
+            print("Warning: no trainable parameters found for checkpoint; returning empty state dict")
+            return OrderedDict()
+
+        current_state = model.state_dict()
+        filtered_state = OrderedDict()
+        for name in keep_names:
+            if name in current_state:
+                filtered_state[name] = current_state[name].detach().cpu()
+        return filtered_state
+
+    # NEW: full resume checkpoint payload
+    def _build_resume_checkpoint(self, epoch, min_loss, best_acc):
+        unwrapped = self._unwrap_model()
+        return {
+            "epoch": int(epoch),
+            "model_state_dict": unwrapped.state_dict(),  # full model, not filtered
+            "optimizer": self.optimizer.state_dict() if self.optimizer is not None else None,
+            "scheduler": self.scheduler.state_dict() if self.scheduler is not None else None,
+            "scaler": self.scaler.state_dict() if self.scaler is not None else None,
+            "min_loss": float(min_loss) if min_loss is not None else None,
+            "best_acc": float(best_acc) if best_acc is not None else None,
+            "exp_name": self.exp_name,
+            "backend_config": getattr(self, "backend_metadata", None),
+        }
+
+    # NEW: atomic save helper (rank-0 only)
+    def _atomic_save(self, obj, path):
+        import os, torch, tempfile
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        tmp = f"{path}.tmp"
+        torch.save(obj, tmp)
+        os.replace(tmp, path)
+
+    # NEW: public save wrapper; writes both weights-only and full resume if requested
+    def _save_all_checkpoints(self, is_best, epoch, min_loss, best_acc):
+        import os
+        rank0 = (not torch.distributed.is_initialized()) or torch.distributed.get_rank() == 0
+        if not rank0:
+            return
+
+        # 1) Weights-only (trainable params/buffers) → {exp}.pth (for inference/fine-tune)
+        weights_only_path = os.path.join(self.log_path, f"{self.exp_name}.pth")
+        try:
+            best_state = self._get_trainable_state_dict()
+        except Exception as e:
+            print(f"Warning collecting trainable state dict: {e}; falling back to full model state")
+            best_state = self._unwrap_model().state_dict()
+        try:
+            self.best_state_dict = best_state
+            self._atomic_save(best_state, weights_only_path)
+            print(f"✓ Weights-only checkpoint saved to {weights_only_path}")
+        except Exception as e:
+            print(f"Warning saving weights-only checkpoint: {e}")
+
+        # 2) Full resume checkpoint
+        resume_ckpt = self._build_resume_checkpoint(epoch, min_loss, best_acc)
+
+        # always keep a rolling "last" (useful for preemption)
+        resume_last_path = os.path.join(self.log_path, f"{self.exp_name}_resume_last.pth")
+        try:
+            self._atomic_save(resume_ckpt, resume_last_path)
+            print(f"✓ Resume (last) checkpoint saved to {resume_last_path}")
+        except Exception as e:
+            print(f"Warning saving resume_last checkpoint: {e}")
+
+        # save a stable "best" file only when improved
+        if is_best:
+            resume_best_path = os.path.join(self.log_path, f"{self.exp_name}_resume_best.pth")
+            try:
+                self._atomic_save(resume_ckpt, resume_best_path)
+                print(f"✓ Resume (best) checkpoint saved to {resume_best_path}")
+            except Exception as e:
+                print(f"Warning saving resume_best checkpoint: {e}")
+
     def get_sampler_from_dataloader(self, dataloader):
         if hasattr(dataloader, 'sampler'):
             if isinstance(dataloader.sampler, torch.utils.data.DistributedSampler):
                 return dataloader.sampler
             elif hasattr(dataloader.sampler, 'sampler'):
                 return dataloader.sampler.sampler
-        
+
         if hasattr(dataloader, 'batch_sampler') and hasattr(dataloader.batch_sampler, 'sampler'):
             return dataloader.batch_sampler.sampler
-        
+
         return None
-    
+
     def fit(self, num_epochs, device,  early_stopping=None, start_epoch=0, best='loss', conf=False,
             initial_min_loss=None, initial_best_acc=None):
         """
         Fits the model for the given number of epochs.
         """
+        # Ignore the passed-in device and use normalized self.device
+        _ = device  # kept for backward compatibility
+
+        import json, os, time, numpy as np, torch, torch.distributed as dist
+
         min_loss = float(initial_min_loss) if initial_min_loss is not None else np.inf
         best_acc = float(initial_best_acc) if initial_best_acc is not None else 0.0
-        train_loss, val_loss,  = [], []
+        train_loss, val_loss = [], []
         train_acc, val_acc = [], []
-        lrs = []
-        epochs = []
+        lrs, epochs = [], []
+
         self.train_aux_loss_1 = []
         self.train_aux_loss_2 = []
         self.train_aux_loss_3 = []
@@ -119,36 +235,40 @@ class Trainer(object):
         self.train_logits_std = []
         self.val_logits_mean = []
         self.val_logits_std = []
-        # self.optim_params['lr_history'] = []
+
         epochs_without_improvement = 0
-        main_proccess = (torch.distributed.is_initialized() and torch.distributed.get_rank() == 0) or self.device == 'cpu'
+        main_process = (torch.distributed.is_initialized() and torch.distributed.get_rank() == 0) or self.device.type == 'cpu'
 
         print(f"Starting training for {num_epochs} epochs")
-        print("is main process: ", main_proccess, flush=True)
+        print("is main process: ", main_process, flush=True)
         global_time = time.time()
         self.epoch = 0
+
         for epoch in range(start_epoch, start_epoch + num_epochs):
             epochs.append(epoch)
             self.epoch = epoch
             start_time = time.time()
             plot = (self.plot_every is not None) and (epoch % self.plot_every == 0)
-            t_loss, t_acc = self.train_epoch(device, epoch=epoch)
+
+            # ---- train ----
+            t_loss, t_acc = self.train_epoch(self.device, epoch=epoch)
             t_loss_mean = np.nanmean(t_loss)
             train_loss.extend(t_loss)
             global_train_accuracy, global_train_loss = self.process_loss(t_acc, t_loss_mean)
-            if main_proccess:  # Only perform this on the master GPU
+            if main_process:
                 train_acc.append(global_train_accuracy.mean().item())
-                
-            v_loss, v_acc = self.eval_epoch(device, epoch=epoch)
+
+            # ---- val ----
+            v_loss, v_acc = self.eval_epoch(self.device, epoch=epoch)
             v_loss_mean = np.nanmean(v_loss)
             val_loss.extend(v_loss)
             global_val_accuracy, global_val_loss = self.process_loss(v_acc, v_loss_mean)
-            if main_proccess:  # Only perform this on the master GPU                
+            if main_process:
                 val_acc.append(global_val_accuracy.mean().item())
-                
+
+                # ---- choose objective & track best ----
                 current_objective = global_val_loss if best == 'loss' else global_val_accuracy.mean()
                 improved = False
-                
                 if best == 'loss':
                     if current_objective < min_loss:
                         min_loss = current_objective
@@ -157,102 +277,79 @@ class Trainer(object):
                     if current_objective > best_acc:
                         best_acc = current_objective
                         improved = True
-                
-                if improved and (not dist.is_initialized() or dist.get_rank() == 0):
-                    # Save best composite checkpoint (rank 0 only)
-                    model_name = f'{self.log_path}/{self.exp_name}.pth'
-                    resume_best = f'{self.log_path}/{self.exp_name}_resume_best.pth'
-                    print(f"saving model at {model_name}...")
-                    try:
-                        # atomic save: write temp then move
-                        tmp_model = model_name + '.tmp'
-                        torch.save(self.model.state_dict(), tmp_model)
-                        os.replace(tmp_model, model_name)
-                        self.best_state_dict = self.model.state_dict()
-                    except Exception as e:
-                        print(f"Warning saving state_dict only: {e}")
-                    try:
-                        tmp_best = resume_best + '.tmp'
-                        torch.save({
-                            'epoch': epoch,
-                            'model': self.model.state_dict(),
-                            'optimizer': self.optimizer.state_dict() if self.optimizer is not None else None,
-                            'scheduler': self.scheduler.state_dict() if self.scheduler is not None else None,
-                            'scaler': self.scaler.state_dict() if self.scaler is not None else None,
-                            'min_loss': float(min_loss) if isinstance(min_loss, np.generic) else min_loss,
-                            'best_acc': float(best_acc) if isinstance(best_acc, np.generic) else best_acc,
-                        }, tmp_best)
-                        os.replace(tmp_best, resume_best)
-                    except Exception as e:
-                        print(f"Warning saving best composite checkpoint: {e}")
-                    # model_path, output_filename = save_compressed_checkpoint(
-                    #                            self.model, model_name, res, use_zip=True )
-                    epochs_without_improvement = 0
-                else:
-                    epochs_without_improvement += 1
 
-                res = {"epochs": epochs, "train_loss": train_loss, "val_loss": val_loss,
-                        "train_acc": train_acc, "val_acc": val_acc, "train_aux_loss_1": self.train_aux_loss_1,
-                        "train_aux_loss_2":self.train_aux_loss_2, "train_aux_loss_3":self.train_aux_loss_3,
-                         "val_aux_loss_1":self.val_aux_loss_1, "val_aux_loss_2": self.val_aux_loss_2,
-                          "val_aux_loss_3": self.val_aux_loss_3, "train_logits_mean": self.train_logits_mean,
-                         "train_logits_std": self.train_logits_std, "val_logits_mean": self.val_logits_mean,
-                          "val_logits_std": self.val_logits_std, "lrs": lrs}
-
-                current_lr = self.optimizer.param_groups[0]['lr'] if self.scheduler is None \
-                            else self.scheduler.get_last_lr()[0]
-                
-                lrs.append(current_lr)
-                
+                # ---- save checkpoints (rank-0) ----
                 if (not dist.is_initialized()) or dist.get_rank() == 0:
+                    # Always keep JSON metrics up to date
+                    res = {
+                        "epochs": epochs, "train_loss": train_loss, "val_loss": val_loss,
+                        "train_acc": train_acc, "val_acc": val_acc,
+                        "train_aux_loss_1": self.train_aux_loss_1, "train_aux_loss_2": self.train_aux_loss_2,
+                        "train_aux_loss_3": self.train_aux_loss_3, "val_aux_loss_1": self.val_aux_loss_1,
+                        "val_aux_loss_2": self.val_aux_loss_2, "val_aux_loss_3": self.val_aux_loss_3,
+                        "train_logits_mean": self.train_logits_mean, "train_logits_std": self.train_logits_std,
+                        "val_logits_mean": self.val_logits_mean, "val_logits_std": self.val_logits_std,
+                        "lrs": lrs
+                    }
                     output_filename = f'{self.log_path}/{self.exp_name}.json'
+                    os.makedirs(os.path.dirname(output_filename), exist_ok=True)
                     tmp_json = output_filename + '.tmp'
                     with open(tmp_json, "w") as f:
                         json.dump(res, f, indent=2)
                     os.replace(tmp_json, output_filename)
                     print(f"saved results at {output_filename}")
-                
-                print(f'Epoch {epoch}, lr {current_lr}, Train Loss: {global_train_loss:.6f}, Val Loss:'\
-                
-                        f'{global_val_loss:.6f}, Train Acc: {global_train_accuracy.round(decimals=4).tolist()}, '\
-                f'Val Acc: {global_val_accuracy.round(decimals=4).tolist()},'\
-                  f'Time: {time.time() - start_time:.2f}s, Total Time: {(time.time() - global_time)/3600} hr', flush=True)
-                if ((not dist.is_initialized()) or dist.get_rank() == 0) and (epoch % 10 == 0):
-                    print(os.system('nvidia-smi'))
 
-                if epochs_without_improvement == early_stopping:
+                    # Save resume-last every epoch (optional toggle), and resume-best on improvement
+                    if self.save_full_every_epoch or improved:
+                        self._save_all_checkpoints(is_best=improved, epoch=epoch, min_loss=min_loss, best_acc=best_acc)
+
+                # ---- LR logging ----
+                try:
+                    if self.scheduler is None:
+                        current_lr = self.optimizer.param_groups[0]['lr']
+                    else:
+                        # get_last_lr() returns list for most schedulers
+                        lr_list = getattr(self.scheduler, "get_last_lr", lambda: [self.optimizer.param_groups[0]['lr']])()
+                        current_lr = lr_list[0] if isinstance(lr_list, (list, tuple)) else lr_list
+                except Exception:
+                    current_lr = self.optimizer.param_groups[0]['lr']
+                lrs.append(current_lr)
+
+                # ---- progress line ----
+                print(
+                    f'Epoch {epoch}, lr {current_lr:.6g}, '
+                    f'Train Loss: {global_train_loss:.6f}, Val Loss: {global_val_loss:.6f}, '
+                    f'Train Acc: {global_train_accuracy.round(decimals=4).tolist()}, '
+                    f'Val Acc: {global_val_accuracy.round(decimals=4).tolist()}, '
+                    f'Time: {time.time() - start_time:.2f}s, Total Time: {(time.time() - global_time)/3600:.2f} hr',
+                    flush=True
+                )
+                if ((not dist.is_initialized()) or dist.get_rank() == 0) and (epoch % 10 == 0):
+                    try:
+                        os.system('nvidia-smi')
+                    except Exception:
+                        pass
+
+                # ---- early stop / wall time ----
+                epochs_without_improvement = 0 if improved else (epochs_without_improvement + 1)
+                if early_stopping is not None and epochs_without_improvement == early_stopping:
                     print('early stopping!', flush=True)
                     break
                 if time.time() - global_time > (23.83 * 3600):
                     print("time limit reached")
-                    break 
+                    break
 
-            # Always save last composite checkpoint to allow exact resume (rank 0 only)
-            if (not dist.is_initialized()) or dist.get_rank() == 0:
-                try:
-                    last_path = f'{self.log_path}/{self.exp_name}_resume_last.pth'
-                    tmp_last = last_path + '.tmp'
-                    torch.save({
-                        'epoch': epoch,
-                        'model': self.model.state_dict(),
-                        'optimizer': self.optimizer.state_dict() if self.optimizer is not None else None,
-                        'scheduler': self.scheduler.state_dict() if self.scheduler is not None else None,
-                        'scaler': self.scaler.state_dict() if self.scaler is not None else None,
-                        'min_loss': float(min_loss) if isinstance(min_loss, np.generic) else min_loss,
-                        'best_acc': float(best_acc) if isinstance(best_acc, np.generic) else best_acc,
-                    }, tmp_last)
-                    os.replace(tmp_last, last_path)
-                except Exception as e:
-                    print(f"Warning saving last composite checkpoint: {e}")
+        return {
+            "epochs": epochs, "train_loss": train_loss, "val_loss": val_loss,
+            "train_acc": train_acc, "val_acc": val_acc,
+            "train_aux_loss_1": self.train_aux_loss_1, "train_aux_loss_2": self.train_aux_loss_2,
+            "train_aux_loss_3": self.train_aux_loss_3, "val_aux_loss_1": self.val_aux_loss_1,
+            "val_aux_loss_2": self.val_aux_loss_2, "val_aux_loss_3": self.val_aux_loss_3,
+            "train_logits_mean": self.train_logits_mean, "train_logits_std": self.train_logits_std,
+            "val_logits_mean": self.val_logits_mean, "val_logits_std": self.val_logits_std,
+            "lrs": lrs
+        }
 
-        return {"epochs":epochs, "train_loss": train_loss,
-                 "val_loss": val_loss, "train_acc": train_acc,
-                "val_acc": val_acc, "train_aux_loss_1": self.train_aux_loss_1,
-                "train_aux_loss_2":self.train_aux_loss_2, "train_aux_loss_3":self.train_aux_loss_3,
-                    "val_aux_loss_1":self.val_aux_loss_1, "val_aux_loss_2": self.val_aux_loss_2,
-                    "val_aux_loss_3": self.val_aux_loss_3, "train_logits_mean": self.train_logits_mean,
-                 "train_logits_std": self.train_logits_std, "val_logits_mean": self.val_logits_mean,
-                  "val_logits_std": self.val_logits_std, "lrs": lrs}
 
     def process_loss(self, acc, loss_mean):
         if  torch.cuda.is_available() and torch.distributed.is_initialized():
@@ -540,10 +637,20 @@ class LLMTrainer(Trainer):
 
     def __init__(self, lora_params, alpha=1, beta=1, gamma=1,
                  cfm_weight=0.01, max_chunk_size=128, tokenizer=None, mode="single_star", 
-                 curriculum_decay_steps=0, quantiles=None, loss_lambda=1.0, **kwargs):
+                 curriculum_decay_steps=1000, quantiles=None, loss_lambda=1.0,
+                 backend_config=None, **kwargs):
         if quantiles is None:
             quantiles = [0.159, 0.5, 0.841]  # Default: ~1-sigma + median
         super(LLMTrainer, self).__init__(**kwargs)
+        if backend_config is not None:
+            if hasattr(backend_config, "to_dict"):
+                self.backend_metadata = backend_config.to_dict()
+            elif isinstance(backend_config, dict):
+                self.backend_metadata = backend_config
+            else:
+                self.backend_metadata = {"backend": str(backend_config)}
+        else:
+            self.backend_metadata = None
         self.alpha = alpha
         self.beta = beta
         self.gamma = gamma
@@ -595,7 +702,7 @@ class LLMTrainer(Trainer):
             decay_steps_occurred = self.global_step // self.curriculum_decay_steps
             
             # Decrease by 0.1 each time, but stop at 0.5
-            target_prob = max(0, self.initial_single_sample_prob - (decay_steps_occurred * 0.2))
+            target_prob = max(0.5, self.initial_single_sample_prob - (decay_steps_occurred * 0.1))
             
             # Update dataset probability if it changed
             current_prob = self.train_dl.dataset.single_sample_prob
@@ -791,8 +898,15 @@ class LLMTrainer(Trainer):
         return loss
     
     def get_logits(self, batch, device, val=False):
-        input_ids = batch['input_ids'].to(device)
-        target_ids = batch['target_ids'].to(device)
+        batch_device = {}
+        for key, value in batch.items():
+            if isinstance(value, torch.Tensor):
+                batch_device[key] = value.to(device)
+            else:
+                batch_device[key] = value
+
+        input_ids = batch_device['input_ids']
+        target_ids = batch_device['target_ids']
 
         mode = getattr(self, 'mode', 'single_star')
 
@@ -800,39 +914,7 @@ class LLMTrainer(Trainer):
         with autocast(enabled=getattr(self, 'use_amp', False)):
             cm = torch.no_grad() if val else torch.enable_grad()
             with cm:
-                if mode == "two_star":
-                    star_a_spectra = batch['masked_spectra_a'].to(device)
-                    star_b_spectra = batch['masked_spectra_b'].to(device)
-                    star_a_indices = batch['star_a_feature_indices'].to(device)
-                    star_b_indices = batch['star_b_feature_indices'].to(device)
-
-                    outputs = self.model(
-                        input_ids=input_ids,
-                        input_spectra=None,
-                        special_token_positions=None,
-                        star_a_spectra=star_a_spectra,
-                        star_b_spectra=star_b_spectra,
-                        star_a_indices=star_a_indices,
-                        star_b_indices=star_b_indices,
-                    )
-                elif mode == "combined":
-                    # Move batch data to device
-                    batch_device = {}
-                    for key, value in batch.items():
-                        if isinstance(value, torch.Tensor):
-                            batch_device[key] = value.to(device)
-                        else:
-                            batch_device[key] = value
-                    outputs = self.model(batch_device)
-                else:
-                    special_token_positions = batch['feature_start_indices'].to(device)
-                    input_spectra = batch['masked_spectra'].to(device)
-
-                    outputs = self.model(
-                        input_ids=input_ids,
-                        input_spectra=input_spectra,
-                        special_token_positions=special_token_positions,
-                    )
+                outputs = self.model(batch_device)
 
         return outputs
 
@@ -956,22 +1038,24 @@ class LLMTrainer(Trainer):
         # Compute loss
         # Compute language modeling loss
         lm_loss = self.get_loss(outputs['logits'], target_ids)
-        
+
         # Store CE loss
         self.ce_losses.append(lm_loss.item())
-        
+
         # Track stellar loss for weighting
         stellar_loss_tensor = None
         stellar_loss_value = None
 
         # Add CFM loss if available
+        cfm_loss_tensor = None
         cfm_loss_value = None
         if 'cfm_loss' in outputs:
-            cfm_loss = outputs['cfm_loss']
-            cfm_loss_value = cfm_loss.item()
-        
+            cfm_loss_tensor = outputs['cfm_loss']
+            cfm_loss_value = cfm_loss_tensor.item()
+
         # Add stellar parameter loss if available
         if 'stellar_predictions' in outputs:
+            print("stellar prediction in outputs!")
             stellar_preds = outputs['stellar_predictions']
             stellar_loss_candidate = self.compute_stellar_parameter_loss(stellar_preds, batch)
             if stellar_loss_candidate is not None:
@@ -980,15 +1064,16 @@ class LLMTrainer(Trainer):
                     print(f"Warning: NaN/inf detected in stellar parameter loss, skipping")
                     # Don't add NaN loss to total loss
                 else:
-                    stellar_loss_tensor = stellar_loss_candidate
+                    # Convert stellar loss to match model precision if needed
+                    stellar_loss_tensor = stellar_loss_candidate.to(lm_loss.dtype)
                     stellar_loss_value = stellar_loss_tensor.item()
-                    
+
                     # Log stellar parameter loss for monitoring (every 100 batches)
                     if batch_idx % 100 == 0:
-                        print(f"  Stellar Param Loss: {stellar_loss_tensor.item():.4f}", end=', ')
-            else:
-                print("stellar predictions None!")
-        
+                        print(f"Stellar Param Loss: {stellar_loss_tensor.item():.4f}")
+
+        # else:
+        #     print("stellar_prediction do not exists")
         # Combine CE and stellar losses according to weighting
         if stellar_loss_tensor is not None:
             lambda_weight = max(0.0, min(1.0, self.loss_lambda))
@@ -997,10 +1082,11 @@ class LLMTrainer(Trainer):
             loss = lm_loss
 
         # Add CFM contribution after core loss combination
-        if cfm_loss_value is not None:
-            loss = loss + self.cfm_weight * outputs['cfm_loss']
+        if cfm_loss_tensor is not None:
+            cfm_loss_scaled = (self.cfm_weight * cfm_loss_tensor).to(loss.dtype)
+            loss = loss + cfm_loss_scaled
             if batch_idx % 100 == 0:
-                print(f"CFM Loss: {outputs['cfm_loss'].item():.4f}", end=', ')
+                print(f"CFM Loss: {cfm_loss_tensor.item():.4f}", end=', ')
 
         # Store CFM loss (None if not available)
         self.cfm_losses.append(cfm_loss_value)
@@ -1016,27 +1102,55 @@ class LLMTrainer(Trainer):
                 if torch.isnan(classification_loss_candidate) or torch.isinf(classification_loss_candidate):
                     print(f"Warning: NaN/inf detected in classification loss, skipping")
                 else:
-                    loss = loss + classification_loss_candidate
-                    
+                    classification_loss_converted = classification_loss_candidate.to(loss.dtype)
+                    loss = loss + classification_loss_converted
+
                     # Log classification loss for monitoring (every 100 batches)
                     if batch_idx % 100 == 0:
                         print(f"Classification Loss: {classification_loss_candidate.item():.4f}")
-        
+
+        # Add feature prediction loss if available
+        if 'predicted_features' in outputs:
+            predicted_features = outputs['predicted_features']
+            feature_loss_candidate = self.compute_feature_prediction_loss(predicted_features, batch)
+            if feature_loss_candidate is not None:
+                # Check for NaN in feature loss
+                if torch.isnan(feature_loss_candidate) or torch.isinf(feature_loss_candidate):
+                    print(f"Warning: NaN/inf detected in feature prediction loss, skipping")
+                else:
+                    # Get feature loss weight from model if available
+                    feature_weight = getattr(self._unwrap_model(), 'feature_loss_weight', 1.0)
+                    # Scale the feature loss (already in fp16 from fp16 inputs)
+                    feature_loss_scaled = (feature_weight * feature_loss_candidate).to(loss.dtype)
+                    loss = loss + feature_loss_scaled
+
+                    # Log feature prediction loss for monitoring (every 100 batches)
+                    if batch_idx % 100 == 0:
+                        print(f"Feature Prediction Loss: {feature_loss_candidate.item():.4f}")
+
         # Check for NaN in total loss
         if torch.isnan(loss) or torch.isinf(loss):
             print(f"Warning: NaN/inf detected in total loss at batch {batch_idx}")
             print(f"  LM Loss: {lm_loss.item() if not torch.isnan(lm_loss) else 'NaN'}")
             if 'cfm_loss' in outputs:
                 print(f"  CFM Loss: {outputs['cfm_loss'].item() if not torch.isnan(outputs['cfm_loss']) else 'NaN'}")
-            # Skip this batch by returning a small loss
-            loss = torch.tensor(1e-6, device=device, requires_grad=True)
-        
-        
-        # Backward pass (skip scaler for FP16 compatibility)
-        loss.backward()
-        
-        
-        self.optimizer.step()
+            # Skip this batch by returning a small loss that matches model precision
+            loss = torch.tensor(1e-6, device=device, dtype=loss.dtype, requires_grad=True)
+
+        # Backward pass with gradient scaling for mixed precision compatibility
+        # Loss terms are already aligned to the main loss dtype
+        if self.scaler is not None:
+            self.scaler.scale(loss).backward()
+            if self.max_grad_norm is not None and self.max_grad_norm > 0:
+                self.scaler.unscale_(self.optimizer)
+                torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.max_grad_norm)
+            self.scaler.step(self.optimizer)
+            self.scaler.update()
+        else:
+            loss.backward()
+            if self.max_grad_norm is not None and self.max_grad_norm > 0:
+                torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.max_grad_norm)
+            self.optimizer.step()
        
         # Learning rate scheduler
         if self.scheduler is not None:
@@ -1091,11 +1205,29 @@ class LLMTrainer(Trainer):
                     print(f"Warning: NaN/inf detected in classification loss, skipping")
                 else:
                     loss = loss + classification_loss_candidate
-                    
+
                     # Log classification loss for monitoring (every 100 batches)
                     if batch_idx % 100 == 0:
                         print(f"  Val Classification Loss: {classification_loss_candidate.item():.4f}")
-        
+
+        # Add feature prediction loss if available
+        if 'predicted_features' in outputs:
+            feature_loss_candidate = self.compute_feature_prediction_loss(outputs['predicted_features'], batch)
+            if feature_loss_candidate is not None:
+                # Check for NaN in feature loss
+                if torch.isnan(feature_loss_candidate) or torch.isinf(feature_loss_candidate):
+                    print(f"Warning: NaN/inf detected in feature prediction loss, skipping")
+                else:
+                    # Get feature loss weight from model if available
+                    feature_weight = getattr(self._unwrap_model(), 'feature_loss_weight', 1.0)
+                    # Convert feature loss to match main loss dtype for mixed precision compatibility
+                    feature_loss_converted = (feature_weight * feature_loss_candidate).to(loss.dtype)
+                    loss = loss + feature_loss_converted
+
+                    # Log feature prediction loss for monitoring (every 100 batches)
+                    if batch_idx % 100 == 0:
+                        print(f"  Val Feature Prediction Loss: {feature_loss_candidate.item():.4f}")
+
         # Check for NaN in total loss
         if torch.isnan(loss) or torch.isinf(loss):
             print(f"Warning: NaN/inf detected in total loss at batch {batch_idx}")
@@ -1104,7 +1236,7 @@ class LLMTrainer(Trainer):
                 print(f"  CFM Loss: {outputs['cfm_loss'].item() if not torch.isnan(outputs['cfm_loss']) else 'NaN'}")
             # Skip this batch by returning a small loss
             loss = torch.tensor(1e-6, device=device, requires_grad=True)
-        
+
         return loss, 0, outputs['h']
     
     def compute_stellar_parameter_loss(self, stellar_predictions, batch: Dict[str, Any]) -> Optional[torch.Tensor]:
@@ -1196,7 +1328,51 @@ class LLMTrainer(Trainer):
             return total_loss / loss_count
         else:
             return None
-    
+
+    def compute_feature_prediction_loss(self, predicted_features, batch: Dict[str, Any]) -> Optional[torch.Tensor]:
+        """
+        Compute MSE loss for feature predictions
+
+        Args:
+            predicted_features: torch.Tensor of shape [batch_size, feature_dim] (can be fp16 or fp32)
+            batch: Batch containing ground truth features (features_star2)
+
+        Returns:
+            MSE loss or None if no ground truth available
+        """
+        if predicted_features is None:
+            print("provided predictions are none")
+            return None
+
+        device = predicted_features.device
+        pred_dtype = predicted_features.dtype
+        compute_dtype = torch.float32 if pred_dtype == torch.float16 else pred_dtype
+        predicted_for_loss = predicted_features.to(compute_dtype)
+
+        # Check if target features are available
+        if 'features_star2' not in batch:
+            print("features_star2 are none")
+            return None
+
+        # Match target features dtype to prediction compute dtype for stable loss
+        target_features = batch['features_star2'].to(device, dtype=compute_dtype)  # [batch_size, feature_dim]
+
+        # Check for NaN in targets
+        if torch.isnan(target_features).any() or torch.isinf(target_features).any():
+            print("Warning: NaN/inf detected in target features, skipping feature loss")
+            return None
+
+        # Compute MSE loss in same dtype as predictions
+        feature_loss = F.mse_loss(predicted_for_loss, target_features, reduction='mean')
+
+        # Check for NaN in loss
+        if torch.isnan(feature_loss) or torch.isinf(feature_loss):
+            print("Warning: NaN/inf detected in feature prediction loss")
+            print(feature_loss)
+            return None
+
+        return feature_loss
+
     def compute_classification_loss(self, classification_logits, batch: Dict[str, Any]) -> Optional[torch.Tensor]:
         """
         Compute cross-entropy loss for comparative classification (STAR_A vs STAR_B)
@@ -1243,23 +1419,52 @@ class LLMTrainer(Trainer):
     def _get_stellar_parameter_predictions(self, batch: Dict[str, Any], batch_idx: int, device: torch.device) -> Optional[str]:
         """Get stellar parameter predictions as JSON string"""
         try:
-            # Run forward pass to get predictions
             outputs = self.get_logits(batch, device, val=True)
-            
-            if 'stellar_predictions' in outputs:
-                predictions = outputs['stellar_predictions']
-                
-                # Extract predictions for the specific batch index
-                pred_dict = {}
-                for param_name, pred_tensor in predictions.items():
-                    if batch_idx < len(pred_tensor):
-                        pred_dict[param_name] = round(pred_tensor[batch_idx].item(), 2)
-                
-                if pred_dict:
-                    import json
-                    return json.dumps(pred_dict, separators=(',', ':'))
-            
-            return None
+            if 'stellar_predictions' not in outputs:
+                return None
+
+            predictions = outputs['stellar_predictions']
+            if predictions is None:
+                return None
+
+            if not isinstance(predictions, torch.Tensor):
+                print(f"Unexpected stellar_predictions type: {type(predictions)}")
+                return None
+
+            model_ref = self._unwrap_model()
+            param_names = getattr(model_ref, 'stellar_params', ['Teff', 'logg', 'FeH'])
+            num_params = len(param_names)
+            quantiles = getattr(self, 'quantiles', getattr(model_ref, 'quantiles', [0.159, 0.5, 0.841]))
+            num_quantiles = len(quantiles)
+
+            if predictions.dim() != 2 or predictions.size(1) != num_params * num_quantiles:
+                print(f"Unexpected stellar_predictions shape: {predictions.shape}")
+                return None
+
+            preds = predictions.detach().cpu().view(-1, num_params, num_quantiles)
+            if batch_idx >= preds.size(0):
+                return None
+
+            sample_preds = preds[batch_idx]
+            bounds = {
+                'Teff': (3000.0, 7500.0),
+                'logg': (0.0, 5.0),
+                'FeH': (-3.0, 0.5),
+            }
+            formatted = {}
+            for param_idx, param_name in enumerate(param_names):
+                param_values = sample_preds[param_idx]
+                lo, hi = bounds.get(param_name, (0.0, 1.0))
+                scale = hi - lo
+                inner = {}
+                for q_idx, q in enumerate(quantiles):
+                    norm_val = float(param_values[q_idx])
+                    physical = lo + norm_val * scale
+                    inner[f"{q:.3f}".rstrip('0').rstrip('.')] = round(physical, 3)
+                formatted[param_name] = inner
+
+            import json
+            return json.dumps(formatted, separators=(',', ':'))
         except Exception as e:
             print(f"Error getting stellar predictions: {e}")
             return None
@@ -1637,7 +1842,7 @@ class LLMTrainer(Trainer):
         self.model.eval()
         
         if self.best_state_dict is not None:
-            self.model.load_state_dict(self.best_state_dict)
+            self.model.load_state_dict(self.best_state_dict, strict=False)
             print("Loaded best model state")
         
         all_losses = []
@@ -2249,7 +2454,7 @@ class CLIPTrainer(Trainer):
         Enhanced prediction method for CLIP model
         """
         if load_best and hasattr(self, 'best_state_dict'):
-            self.model.load_state_dict(self.best_state_dict)
+            self.model.load_state_dict(self.best_state_dict, strict=False)
             
         self.model.eval()
         
@@ -2316,3 +2521,111 @@ class CLIPTrainer(Trainer):
             results['retrieval_metrics'] = final_retrieval_metrics
         
         return results
+
+
+class LateFusionTrainer(Trainer):
+    """
+    Trainer for the Perceiver-based late fusion model. Handles both reconstruction
+    (fusion) and contrastive objectives exposed by `LateFusionModel`.
+    """
+
+    def __init__(self, log_loss_every: Optional[int] = None, **kwargs):
+        super().__init__(**kwargs)
+        self.log_loss_every = log_loss_every or 0
+        self._last_logged_step = -1
+
+    def _move_to_device(self, obj, device):
+        if torch.is_tensor(obj):
+            return obj.to(device, non_blocking=True)
+        if isinstance(obj, dict):
+            return {k: self._move_to_device(v, device) for k, v in obj.items()}
+        if isinstance(obj, list):
+            return [self._move_to_device(v, device) for v in obj]
+        if isinstance(obj, tuple):
+            return tuple(self._move_to_device(v, device) for v in obj)
+        return obj
+
+    @staticmethod
+    def _loss_value(outputs: Dict[str, torch.Tensor], key: str) -> float:
+        value = outputs.get(key)
+        if value is None:
+            return 0.0
+        return float(value.detach().cpu().item())
+
+    def _record_train_metrics(self, outputs: Dict[str, torch.Tensor]) -> None:
+        self.train_aux_loss_1.append(self._loss_value(outputs, "reconstruction_loss"))
+        self.train_aux_loss_2.append(self._loss_value(outputs, "contrastive_loss"))
+        self.train_aux_loss_3.append(0.0)
+
+    def _record_val_metrics(self, outputs: Dict[str, torch.Tensor]) -> None:
+        self.val_aux_loss_1.append(self._loss_value(outputs, "reconstruction_loss"))
+        self.val_aux_loss_2.append(self._loss_value(outputs, "contrastive_loss"))
+        self.val_aux_loss_3.append(0.0)
+
+    def _maybe_log_losses(self, outputs: Dict[str, torch.Tensor], batch_idx: int, split: str) -> None:
+        if not self.log_loss_every or self.log_loss_every <= 0:
+            return
+        if (batch_idx + 1) % self.log_loss_every != 0:
+            return
+        if torch.distributed.is_initialized() and torch.distributed.get_rank() != 0:
+            return
+        recon = outputs.get("reconstruction_loss")
+        contrast = outputs.get("contrastive_loss")
+        recon_val = float(recon.detach().cpu().item()) if recon is not None else 0.0
+        contrast_val = float(contrast.detach().cpu().item()) if contrast is not None else 0.0
+        print(
+            f"[{split} step {batch_idx+1}] reconstruction_loss={recon_val:.6f}, "
+            f"contrastive_loss={contrast_val:.6f}",
+            flush=True,
+        )
+
+    def train_batch(self, batch, batch_idx, device):
+        batch = self._move_to_device(batch, device)
+        bsz = batch["input_ids"].size(0)
+
+        with autocast(enabled=self.use_amp):
+            outputs = self.model(batch)
+            loss = outputs["total_loss"]
+
+        self._record_train_metrics(outputs)
+        self._maybe_log_losses(outputs, batch_idx, split="train")
+
+        if self.scaler is not None:
+            self.scaler.scale(loss).backward()
+            if (batch_idx + 1) % self.accumulation_step == 0:
+                self.scaler.unscale_(self.optimizer)
+                if self.grad_clip and self.max_grad_norm:
+                    torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.max_grad_norm)
+                self.scaler.step(self.optimizer)
+                self.scaler.update()
+                if self.scheduler is not None:
+                    self.scheduler.step()
+        else:
+            loss.backward()
+            if (batch_idx + 1) % self.accumulation_step == 0:
+                if self.grad_clip and self.max_grad_norm:
+                    torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.max_grad_norm)
+                if self.optimizer is not None:
+                    self.optimizer.step()
+                if self.scheduler is not None:
+                    self.scheduler.step()
+
+        loss_detached = loss.detach()
+        acc = torch.zeros(self.output_dim, device=device)
+        dummy_targets = torch.zeros(bsz, device=device)
+        return loss_detached, acc, dummy_targets
+
+    def eval_batch(self, batch, batch_idx, device):
+        batch = self._move_to_device(batch, device)
+        bsz = batch["input_ids"].size(0)
+
+        with torch.no_grad():
+            with autocast(enabled=self.use_amp):
+                outputs = self.model(batch)
+                loss = outputs["total_loss"].detach()
+
+        self._record_val_metrics(outputs)
+        self._maybe_log_losses(outputs, batch_idx, split="val")
+        acc = torch.zeros(self.output_dim, device=device)
+        dummy_targets = torch.zeros(bsz, device=device)
+        return loss, acc, dummy_targets

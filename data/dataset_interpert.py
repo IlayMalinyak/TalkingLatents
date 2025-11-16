@@ -4,10 +4,12 @@ from torch.utils.data import Dataset, DataLoader
 import torch.distributed as dist
 from torch.utils.data.distributed import DistributedSampler
 import json
+import math
 import numpy as np
 import pandas as pd
+import random
 from sklearn.model_selection import train_test_split
-from typing import Optional, Tuple, Dict, Any, List
+from typing import Optional, Tuple, Dict, Any, List, Type
 import os
 from pathlib import Path
 from astropy.io import fits
@@ -23,6 +25,8 @@ print("running from ", ROOT_DIR)
 
 from llama3.llama.tokenizer import Tokenizer
 from data.transforms import RandomMasking
+from data.feature_normalizer import FeatureNormalizer
+from src.follow_up_templates import create_follow_up_specs
 
 
 class StellarQuestionsDataset(Dataset):
@@ -56,8 +60,17 @@ class StellarQuestionsDataset(Dataset):
                  filter_valid_descriptions: bool = True,
                  cache_dir: Optional[str] = None,
                  tokenizer_path: Optional[str] = None,
+                 tokenizer: Optional[Any] = None,
+                 tokenizer_backend: str = 'llama',
                  max_length: int = 512,
-                 num_spectral_features: int = 1):
+                 num_spectral_features: int = 1,
+                 normalize_features: bool = True,
+                 feature_stats: Optional[Dict[str, np.ndarray]] = None,
+                 feature_norm_epsilon: float = 1e-6,
+                 enable_followup: bool = False,
+                 followup_prob: float = 0.0,
+                 max_followup_turns: int = 1,
+                 followup_seed: int = 42):
         
         assert split in ['train', 'val', 'test'], f"Split must be 'train', 'val', or 'test', got {split}"
         assert abs(train_ratio + val_ratio + test_ratio - 1.0) < 1e-6, "Ratios must sum to 1.0"
@@ -69,17 +82,42 @@ class StellarQuestionsDataset(Dataset):
         self.random_state = random_state
         self.filter_valid_descriptions = filter_valid_descriptions
         self.tokenizer_path = tokenizer_path
+        self.tokenizer_backend = tokenizer_backend
         self.max_length = max_length
-        self.tokenizer = None
+        self.tokenizer = tokenizer
         self.transforms = spectral_transforms
         self.mask_transform = RandomMasking()  # Example masking
+        self.normalize_features = normalize_features and (self.features_array is not None)
+        self.feature_norm_epsilon = feature_norm_epsilon
+        self.feature_normalizer = FeatureNormalizer(
+            enabled=self.normalize_features,
+            epsilon=self.feature_norm_epsilon,
+        )
+        self.enable_followup = enable_followup
+        self.followup_prob = followup_prob
+        self.max_followup_turns = max_followup_turns
+        seed_offset = followup_seed + hash((split, random_state))
+        self.followup_rng = random.Random(seed_offset)
         
-        # Load tokenizer if available
-        self._load_tokenizer()
+        self.numeric_bounds = {
+            'Teff': (3000.0, 7500.0),
+            'logg': (0.0, 5.0),
+            'FeH': (-3.0, 0.5),
+        }
+        self.numeric_key_alternatives = {
+            'Teff': ['Teff', 'teff_k', 'teff', 'effective_temperature'],
+            'logg': ['logg', 'log_g'],
+            'FeH': ['FeH', 'feh', '[Fe/H]', 'metallicity'],
+        }
+
+        # Load tokenizer if not provided
+        if self.tokenizer is None:
+            self._load_tokenizer()
         
         # Load and process data
         self._load_data()
         self._create_splits(train_ratio, val_ratio, test_ratio, cache_dir)
+        self._initialize_feature_normalizer(feature_stats)
         
     def _load_tokenizer(self):
         """Load SentencePiece tokenizer if available"""
@@ -145,8 +183,69 @@ class StellarQuestionsDataset(Dataset):
             for word in words:
                 word_hash = hash(word) % 10000
                 token_ids.append(abs(word_hash) + 1)
-                
+
             return token_ids, len(token_ids)
+
+    def _extend_with_tokens(self,
+                            full_tokens: List[int],
+                            target_tokens: List[int],
+                            tokens: List[int],
+                            mask_targets: bool) -> None:
+        if not tokens:
+            return
+        available = self.max_length - len(full_tokens)
+        if available <= 0:
+            return
+        chunk = tokens[:available]
+        full_tokens.extend(chunk)
+        if mask_targets:
+            target_tokens.extend([-100] * len(chunk))
+        else:
+            target_tokens.extend(chunk)
+
+    def _extract_physical_params(self, stellar_data: Dict[str, Any]) -> Dict[str, Optional[float]]:
+        """Return raw Teff/logg/FeH values when available."""
+        params: Dict[str, Optional[float]] = {}
+        if not isinstance(stellar_data, dict):
+            return params
+        for param in ['Teff', 'logg', 'FeH']:
+            value = None
+            for key in self.numeric_key_alternatives.get(param, [param]):
+                raw_val = stellar_data.get(key)
+                if raw_val is not None:
+                    try:
+                        value = float(raw_val)
+                    except (TypeError, ValueError):
+                        value = None
+                    break
+            params[param] = value
+        return params
+
+    def _append_followup_turns(self,
+                               full_tokens: List[int],
+                               target_tokens: List[int],
+                               stellar_params: Dict[str, Optional[float]]) -> None:
+        if not self.enable_followup or self.followup_prob <= 0.0:
+            return
+        if self.followup_rng.random() > self.followup_prob:
+            return
+        followups = create_follow_up_specs(
+            stellar_params,
+            self.followup_rng,
+            max_pairs=self.max_followup_turns,
+            include_answers=True,
+        )
+        for spec in followups:
+            question_text = f"\nFollow-up question: {spec['question']}\nAnswer:"
+            q_tokens, _ = self._tokenize_text_no_pad(question_text, bos=False)
+            answer_text = (spec.get('answer') or "").strip()
+            if not answer_text:
+                answer_text = "It would remain broadly consistent apart from the requested adjustment."
+            a_tokens, _ = self._tokenize_text_no_pad(answer_text, bos=False)
+            self._extend_with_tokens(full_tokens, target_tokens, q_tokens, mask_targets=True)
+            self._extend_with_tokens(full_tokens, target_tokens, a_tokens, mask_targets=False)
+            if len(full_tokens) >= self.max_length:
+                break
     
     def _load_data(self):
         """Load data from JSON file"""
@@ -290,7 +389,7 @@ class StellarQuestionsDataset(Dataset):
     
     def _create_splits(self, train_ratio: float, val_ratio: float, test_ratio: float, cache_dir: Optional[str] = None):
         """Create train/val/test splits with caching for consistency"""
-        
+
         n_samples = len(self.raw_data)
         indices = np.arange(n_samples)
         
@@ -344,9 +443,41 @@ class StellarQuestionsDataset(Dataset):
             self.split_indices = val_indices
         else:  # test
             self.split_indices = test_indices
-            
+
         print(f"Split sizes - Train: {len(train_indices)}, Val: {len(val_indices)}, Test: {len(test_indices)}")
         print(f"Current split ({self.split}): {len(self.split_indices)} samples")
+
+    def _initialize_feature_normalizer(self, provided_stats: Optional[Dict[str, np.ndarray]]) -> None:
+        if self.feature_normalizer is None or self.features_array is None:
+            return
+        indices = self._collect_feature_indices()
+        self.feature_normalizer.initialize(self.features_array, indices, provided_stats)
+
+    def _collect_feature_indices(self) -> List[int]:
+        indices: List[int] = []
+        if self.features_array is None:
+            return indices
+        for raw_idx in self.split_indices:
+            sample = self.raw_data[raw_idx]
+            df_idx = sample.get('index')
+            if df_idx is not None and 0 <= df_idx < len(self.features_array):
+                indices.append(df_idx)
+        return indices
+
+    def get_feature_normalization_stats(self, copy: bool = True) -> Optional[Dict[str, np.ndarray]]:
+        if self.feature_normalizer is None:
+            return None
+        return self.feature_normalizer.get_stats(copy=copy)
+
+    def denormalize_features(self, features: torch.Tensor) -> torch.Tensor:
+        if self.feature_normalizer is None:
+            return features
+        return self.feature_normalizer.inverse(features)
+
+    def _apply_feature_normalization(self, features: np.ndarray) -> np.ndarray:
+        if self.feature_normalizer is None:
+            return np.asarray(features, dtype=np.float32)
+        return self.feature_normalizer.transform(features)
         
     def read_lamost_spectra(self, filename):
         try:
@@ -448,46 +579,60 @@ class StellarQuestionsDataset(Dataset):
             total_tokens = available_length
         
         # Create the full sequence with feature space AT THE BEGINNING
-        # Structure: [FEATURE_SPACE] + [question_tokens] + [answer_tokens] + [PADDING]
-        full_sequence = []
-        
-        # Reserve space for features at the beginning (fill with -100, will be replaced during training)
+        # Structure: [FEATURE_SPACE] + [question_tokens] + [answer_tokens] + follow-ups + [PADDING]
         feature_start_idx = 0
-        full_sequence.extend([-100] * self.num_spectral_features)
-        
+        full_sequence: List[int] = [-100] * self.num_spectral_features
+        target_sequence: List[int] = [-100] * self.num_spectral_features
+
         # Add question tokens after features
         question_start_idx = len(full_sequence)
-        full_sequence.extend(question_tokens[:num_tok_q])
-        
-        # Add answer tokens  
+        base_question_tokens = question_tokens[:num_tok_q]
+        full_sequence.extend(base_question_tokens)
+        target_sequence.extend([-100] * len(base_question_tokens))
+
+        # Add answer tokens
         answer_start_idx = len(full_sequence)
-        full_sequence.extend(answer_tokens[:num_tok_a])
-        
-        # Pad remaining space with -100
+        base_answer_tokens = answer_tokens[:num_tok_a]
+        full_sequence.extend(base_answer_tokens)
+        target_sequence.extend(base_answer_tokens)
+        base_answer_length = len(base_answer_tokens)
+
+        # Optional follow-up turns conditioned on stellar parameters
+        stellar_data = sample.get('stellar_data', {})
+        stellar_params = self._extract_physical_params(stellar_data)
+        if self.enable_followup:
+            self._append_followup_turns(full_sequence, target_sequence, stellar_params)
+
+        # Pad remaining space with -100 placeholders
         remaining_space = self.max_length - len(full_sequence)
-        full_sequence.extend([-100] * remaining_space)
-        
+        if remaining_space > 0:
+            full_sequence.extend([-100] * remaining_space)
+            target_sequence.extend([-100] * remaining_space)
+        elif remaining_space < 0:
+            full_sequence = full_sequence[:self.max_length]
+            target_sequence = target_sequence[:self.max_length]
+
         # Convert to tensor
         input_ids = torch.tensor(full_sequence, dtype=torch.long)
-        
-        # Create targets: mask features AND question with -100
-        target_ids = input_ids.clone()
-        target_ids[:answer_start_idx] = -100  # Mask features + question
-        # Answer tokens and padding (-100) remain as they are
+        target_ids = torch.tensor(target_sequence, dtype=torch.long)
         
         # Get other data
         df_index = sample.get('index')
-        spectra, masked_spectra, _ = self.get_raw_spectra(sample['obsid'])
         
         if self.features_array is not None and df_index is not None:
-            features = torch.tensor(self.features_array[df_index].astype(np.float32))
+            norm_features = self._apply_feature_normalization(self.features_array[df_index])
+            features = torch.from_numpy(norm_features)
             masked_spectra = features
+            spectra = features
         else:
+            spectra, masked_spectra, _ = self.get_raw_spectra(sample['obsid'])
             features = masked_spectra
         
         stellar_data = sample.get('stellar_data', {})
         obsid = sample.get('obsid', None)
         
+        numeric_tensor = self._extract_numeric_tensor(stellar_data)
+
         return {
             'input_ids': input_ids,                    # [-100,-100,Q1,Q2,A1,A2,-100,-100,...]
             'target_ids': target_ids,                  # [-100,-100,-100,-100,A1,A2,-100,-100,...]
@@ -496,7 +641,7 @@ class StellarQuestionsDataset(Dataset):
             'feature_length': self.num_spectral_features,        # Number of feature tokens
             'question_start_idx': question_start_idx,  # Where question begins
             'answer_start_idx': answer_start_idx,      # Where answer begins
-            'target_length': num_tok_a,                # Length of answer portion
+            'target_length': base_answer_length,                # Length of base answer portion
             'input_text': parsed_desc['question'],
             'target_text': parsed_desc['answer'],
             'features': features,
@@ -505,9 +650,39 @@ class StellarQuestionsDataset(Dataset):
             'stellar_data': stellar_data,
             'obsid': obsid,
             'df_index': df_index,
-            'sample_index': sample_idx
+            'sample_index': sample_idx,
+            'y_numeric': numeric_tensor,
         }
     
+    def _extract_numeric_tensor(self, stellar_data: Optional[Dict[str, Any]]) -> Optional[torch.Tensor]:
+        """Extract normalized Teff/logg/FeH vector if available."""
+        if not isinstance(stellar_data, dict):
+            return None
+
+        values = []
+        for param in ('Teff', 'logg', 'FeH'):
+            raw_val = None
+            for key in self.numeric_key_alternatives.get(param, [param]):
+                if key in stellar_data and stellar_data[key] is not None:
+                    raw_val = stellar_data[key]
+                    break
+            if raw_val is None:
+                return None
+            try:
+                val = float(raw_val)
+            except (TypeError, ValueError):
+                return None
+            if math.isnan(val):
+                return None
+            low, high = self.numeric_bounds[param]
+            norm = (val - low) / (high - low)
+            norm = max(0.0, min(1.0, norm))
+            values.append(norm)
+
+        if len(values) != 3:
+            return None
+        return torch.tensor(values, dtype=torch.float32)
+
     def get_split_info(self) -> Dict[str, int]:
         """Get information about all splits"""
         # This requires recreating splits temporarily
@@ -538,16 +713,20 @@ def create_stellar_dataloaders(json_file: str,
                              cache_dir: Optional[str] = None,
                              world_size: int = 1,
                              device: Optional[str] = None,
+                             dataset_cls: Type["StellarQuestionsDataset"] = StellarQuestionsDataset,
                              **dataset_kwargs) -> Tuple[DataLoader, DataLoader, DataLoader]:
     """
     Create train, validation, and test dataloaders
-    
+
     Returns:
         Tuple[DataLoader, DataLoader, DataLoader]: train, val, test dataloaders
     """
-    
+
+    dataset_cls = dataset_cls or StellarQuestionsDataset
+    shared_feature_stats = dataset_kwargs.pop('feature_stats', None)
+
     # Create datasets for each split
-    train_dataset = StellarQuestionsDataset(
+    train_dataset = dataset_cls(
         json_file=json_file,
         features_array=features_array,
         split='train',
@@ -556,10 +735,15 @@ def create_stellar_dataloaders(json_file: str,
         test_ratio=test_ratio,
         random_state=random_state,
         cache_dir=cache_dir,
+        feature_stats=shared_feature_stats,
         **dataset_kwargs
     )
-    
-    val_dataset = StellarQuestionsDataset(
+
+    feature_stats = train_dataset.get_feature_normalization_stats(copy=True)
+    if feature_stats is None:
+        feature_stats = shared_feature_stats
+
+    val_dataset = dataset_cls(
         json_file=json_file,
         features_array=features_array,
         split='val',
@@ -568,10 +752,11 @@ def create_stellar_dataloaders(json_file: str,
         test_ratio=test_ratio,
         random_state=random_state,
         cache_dir=cache_dir,
+        feature_stats=feature_stats,
         **dataset_kwargs
     )
-    
-    test_dataset = StellarQuestionsDataset(
+
+    test_dataset = dataset_cls(
         json_file=json_file,
         features_array=features_array,
         split='test',
@@ -580,6 +765,7 @@ def create_stellar_dataloaders(json_file: str,
         test_ratio=test_ratio,
         random_state=random_state,
         cache_dir=cache_dir,
+        feature_stats=feature_stats,
         **dataset_kwargs
     )
 
@@ -593,7 +779,7 @@ def create_stellar_dataloaders(json_file: str,
     )
     if num_workers > 0:
         loader_kwargs.update(persistent_workers=True, prefetch_factor=2)
-    
+
     # Handle distributed training
     if world_size > 1:
         train_sampler = DistributedSampler(
@@ -617,7 +803,7 @@ def create_stellar_dataloaders(json_file: str,
             seed=random_state,
             drop_last=False
         )
-        
+
         train_loader = DataLoader(train_dataset, sampler=train_sampler, **loader_kwargs)
         val_loader = DataLoader(val_dataset, sampler=val_sampler, **loader_kwargs)
         test_loader = DataLoader(test_dataset, sampler=test_sampler, **loader_kwargs)
@@ -625,9 +811,8 @@ def create_stellar_dataloaders(json_file: str,
         train_loader = DataLoader(train_dataset, shuffle=True, **loader_kwargs)
         val_loader = DataLoader(val_dataset, shuffle=False, **loader_kwargs)
         test_loader = DataLoader(test_dataset, shuffle=False, **loader_kwargs)
-    
-    return train_loader, val_loader, test_loader
 
+    return train_loader, val_loader, test_loader
 
 def collate_fn(batch: List[Dict[str, Any]]) -> Dict[str, Any]:
     """
@@ -656,8 +841,8 @@ def collate_fn(batch: List[Dict[str, Any]]) -> Dict[str, Any]:
     stellar_data = [item['stellar_data'] for item in batch]
     spectra = [item['spectra'] for item in batch]
     masked_spectra = [item['masked_spectra'] for item in batch]
-    
-    
+    y_numeric_list = [item.get('y_numeric') for item in batch]
+
     # Handle features - check if any sample has features
     features_list = [item['features'] for item in batch]
     if any(f is not None for f in features_list):
@@ -680,6 +865,8 @@ def collate_fn(batch: List[Dict[str, Any]]) -> Dict[str, Any]:
             features_tensor = None
     else:
         features_tensor = None
+
+    y_numeric, y_numeric_present = _stack_numeric(y_numeric_list)
     
     return {
         'input_ids':  input_ids,                    # [batch, seq_len]
@@ -697,8 +884,32 @@ def collate_fn(batch: List[Dict[str, Any]]) -> Dict[str, Any]:
         'masked_spectra': torch.stack(masked_spectra),
         'obsids': obsids,
         'df_indices': df_indices,
-        'stellar_data': stellar_data
+        'stellar_data': stellar_data,
+        'y_numeric': y_numeric,
+        'y_numeric_present': y_numeric_present
     }
+
+
+def _stack_numeric(values: List[Optional[torch.Tensor]]) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Stack optional numeric tensors with a presence mask."""
+    if not values:
+        return torch.zeros((0, 3), dtype=torch.float32), torch.zeros(0, dtype=torch.bool)
+
+    valid = [v for v in values if v is not None]
+    if not valid:
+        zeros = torch.zeros((len(values), 3), dtype=torch.float32)
+        mask = torch.zeros(len(values), dtype=torch.bool)
+        return zeros, mask
+
+    shape = valid[0].shape
+    batch = torch.zeros((len(values),) + shape, dtype=torch.float32)
+    mask = torch.zeros(len(values), dtype=torch.bool)
+    for idx, tensor in enumerate(values):
+        if tensor is None:
+            continue
+        batch[idx] = tensor.to(dtype=torch.float32)
+        mask[idx] = True
+    return batch, mask
 
 
 # Example usage and testing
@@ -707,7 +918,7 @@ if __name__ == "__main__":
     TOKENIZER_PATH = "/data/.llama/Llama3.2-1B/tokenizer.model"
     tokenizer = Tokenizer(model_path=TOKENIZER_PATH)
 
-    json_path = '/data/TalkingLatents/data/dataset/stellar_descriptions_questions.json'
+    json_path = "/data/TalkingLatents/data/dataset/stellar_descriptions_questions_short.json"
     spectral_features = np.load('/data/TalkingLatents/logs/2025-07-29/features.npy')
     # Example usage
     print("Example usage:")
@@ -721,7 +932,7 @@ if __name__ == "__main__":
         val_ratio=0.1,
         test_ratio=0.1,
         tokenizer_path=TOKENIZER_PATH,
-        num_spectral_features=32,
+        num_spectral_features=8,
         cache_dir='cache/'  # Cache splits for consistency
     )
     
@@ -731,7 +942,16 @@ if __name__ == "__main__":
         print("f start indices:", data['feature_start_indices'], " feature lengths:", data['feature_lengths'])
         print("Answer start indices:", data['answer_start_indices'], " target lengths:", data['target_lengths'])
         print(data['input_ids'][0][:100])
+        first_tokens = data['input_ids'][0][:100].tolist()
+        first_targets = data['target_ids'][0][:100].tolist()
+        printable_tokens = [tok for tok in first_tokens if tok >= 0]
+        printable_targets = [tok for tok in first_targets if tok >= 0]
+        print("decoded: ", tokenizer.decode(printable_tokens) if printable_tokens else "")
+        print("decoded target: ", tokenizer.decode(printable_targets) if printable_targets else "")
+
+        print(data['input_texts'][0][:100])
         print(data['target_ids'][0][:100])
+        print(data['target_texts'][0][:100])
         print("tot lengths: ", data['input_lengths'] + data['target_lengths'])
 
         if i == 10:

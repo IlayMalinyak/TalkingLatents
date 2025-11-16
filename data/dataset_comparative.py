@@ -4,6 +4,7 @@ from torch.utils.data import Dataset, DataLoader
 import torch.distributed as dist
 from torch.utils.data.distributed import DistributedSampler
 import json
+import math
 import numpy as np
 import pandas as pd
 from sklearn.model_selection import train_test_split
@@ -23,6 +24,7 @@ print("running from ", ROOT_DIR)
 
 from llama3.llama.tokenizer import Tokenizer
 from data.transforms import RandomMasking
+from data.feature_normalizer import FeatureNormalizer
 
 
 
@@ -58,9 +60,14 @@ class StellarComparativeDataset(Dataset):
                  spectral_transforms: Optional[Any] = None,
                  cache_dir: Optional[str] = None,
                  tokenizer_path: Optional[str] = None,
+                 tokenizer: Optional[Any] = None,
+                 tokenizer_backend: str = 'llama',
                  max_length: int = 512,
                  num_spectral_features: int = 64,
-                 include_error_stats: bool = True):
+                 include_error_stats: bool = True,
+                 normalize_features: bool = True,
+                 feature_stats: Optional[Dict[str, np.ndarray]] = None,
+                 feature_norm_epsilon: float = 1e-6):
         
         assert split in ['train', 'val', 'test'], f"Split must be 'train', 'val', or 'test', got {split}"
         assert abs(train_ratio + val_ratio + test_ratio - 1.0) < 1e-6, "Ratios must sum to 1.0"
@@ -70,19 +77,27 @@ class StellarComparativeDataset(Dataset):
         self.split = split
         self.random_state = random_state
         self.tokenizer_path = tokenizer_path
+        self.tokenizer_backend = tokenizer_backend
         self.max_length = max_length
         self.num_spectral_features = num_spectral_features  # Features for each star (2 stars total)
         self.transforms = spectral_transforms
         self.mask_transform = RandomMasking()
         self.include_error_stats = include_error_stats
-        self.tokenizer = None
+        self.normalize_features = normalize_features and (self.features_array is not None)
+        self.feature_norm_epsilon = feature_norm_epsilon
+        self.feature_normalizer = FeatureNormalizer(
+            enabled=self.normalize_features,
+            epsilon=self.feature_norm_epsilon,
+        )
+        self.tokenizer = tokenizer
         
-        # Load tokenizer if available
-        self._load_tokenizer()
+        if self.tokenizer is None:
+            self._load_tokenizer()
         
         # Load and process data
         self._load_data()
         self._create_splits(train_ratio, val_ratio, test_ratio, cache_dir)
+        self._initialize_feature_normalizer(feature_stats)
         
     def _load_tokenizer(self):
         """Load SentencePiece tokenizer if available"""
@@ -231,9 +246,48 @@ class StellarComparativeDataset(Dataset):
             self.split_indices = val_indices
         else:  # test
             self.split_indices = test_indices
-            
+    
         print(f"Split sizes - Train: {len(train_indices)}, Val: {len(val_indices)}, Test: {len(test_indices)}")
         print(f"Current split ({self.split}): {len(self.split_indices)} samples")
+
+    def _initialize_feature_normalizer(self, provided_stats: Optional[Dict[str, np.ndarray]]) -> None:
+        if self.feature_normalizer is None or self.features_array is None:
+            return
+        indices = self._collect_feature_indices()
+        self.feature_normalizer.initialize(self.features_array, indices, provided_stats)
+
+    def _collect_feature_indices(self) -> List[int]:
+        indices: List[int] = []
+        if self.features_array is None:
+            return indices
+        for raw_idx in self.split_indices:
+            sample = self.raw_data[raw_idx]
+            for key in ('index', 'index_a', 'index_b'):
+                df_idx = sample.get(key)
+                if df_idx is not None and 0 <= df_idx < len(self.features_array):
+                    indices.append(df_idx)
+            # Some datasets include nested entries for STAR_A / STAR_B
+            for key in ('star_a', 'star_b'):
+                nested = sample.get(key, {})
+                df_idx = nested.get('index')
+                if df_idx is not None and 0 <= df_idx < len(self.features_array):
+                    indices.append(df_idx)
+        return indices
+
+    def get_feature_normalization_stats(self, copy: bool = True) -> Optional[Dict[str, np.ndarray]]:
+        if self.feature_normalizer is None:
+            return None
+        return self.feature_normalizer.get_stats(copy=copy)
+
+    def denormalize_features(self, features: torch.Tensor) -> torch.Tensor:
+        if self.feature_normalizer is None:
+            return features
+        return self.feature_normalizer.inverse(features)
+
+    def _apply_feature_normalization(self, features: np.ndarray) -> np.ndarray:
+        if self.feature_normalizer is None:
+            return np.asarray(features, dtype=np.float32)
+        return self.feature_normalizer.transform(features)
         
     def format_stellar_data(self, obs_data: Dict[str, Any]) -> str:
         """Format observational data into a readable string"""
@@ -458,7 +512,8 @@ class StellarComparativeDataset(Dataset):
         spectra, masked_spectra, _ = self.get_raw_spectra(obsid)
         
         if self.features_array is not None and index is not None:
-            features = torch.tensor(self.features_array[index].astype(np.float32))
+            normalized = self._apply_feature_normalization(self.features_array[index])
+            features = torch.from_numpy(normalized)
             masked_spectra = features
         else:
             features = masked_spectra
@@ -546,13 +601,19 @@ class StellarComparativeDataset(Dataset):
         # Create target_ids: mask question with -100, keep only answer (like in dataset_interpert.py)
         target_ids = input_ids.clone()
         target_ids[:answer_start_in_expanded] = -100  # Mask question and features
-        # Answer tokens and padding remain as they are in input_ids
+        # Mask padding after the answer span to avoid LM loss on pads
+        answer_end_idx = answer_start_in_expanded + num_tok_a
+        if answer_end_idx < target_ids.numel():
+            target_ids[answer_end_idx:] = -100
 
         # Get other data
         df_indices = sample.get('indices')
         obsids = sample['obsids']
         spectra_a, masked_spectra_a, features_a = self.create_features(df_indices['a'], obsids['a'])
         spectra_b, masked_spectra_b, features_b = self.create_features(df_indices['b'], obsids['b'])
+
+        y_numeric_a = self._extract_numeric_tensor(star_a_params)
+        y_numeric_b = self._extract_numeric_tensor(star_b_params)
 
         
         # For compatibility with the training code, we keep target_ids but it will be mostly masked
@@ -589,8 +650,51 @@ class StellarComparativeDataset(Dataset):
             'masked_spectra_b': masked_spectra_b,
             'pair_id': sample.get('pair_id', ''),
             'obsid': sample.get('obsids', {}),
-            'sample_index': sample_idx
+            'sample_index': sample_idx,
+            'pair_label': target_index,
+            'y_numeric_a': y_numeric_a,
+            'y_numeric_b': y_numeric_b,
         }
+    
+    def _extract_numeric_tensor(self, stellar_data: Optional[Dict[str, Any]]) -> Optional[torch.Tensor]:
+        """Extract normalized Teff/logg/FeH tensor; return None if any value missing."""
+        if not isinstance(stellar_data, dict):
+            return None
+
+        numeric_bounds = {
+            'Teff': (3000.0, 7500.0),
+            'logg': (0.0, 5.0),
+            'FeH': (-3.0, 0.5),
+        }
+        alternatives = {
+            'Teff': ['Teff', 'teff_k', 'teff', 'effective_temperature'],
+            'logg': ['logg', 'log_g'],
+            'FeH': ['FeH', 'feh', '[Fe/H]', 'metallicity'],
+        }
+
+        values = []
+        for param in ('Teff', 'logg', 'FeH'):
+            raw_val = None
+            for key in alternatives.get(param, [param]):
+                if key in stellar_data and stellar_data[key] is not None:
+                    raw_val = stellar_data[key]
+                    break
+            if raw_val is None:
+                return None
+            try:
+                val = float(raw_val)
+            except (TypeError, ValueError):
+                return None
+            if math.isnan(val):
+                return None
+            low, high = numeric_bounds[param]
+            norm = (val - low) / (high - low)
+            norm = max(0.0, min(1.0, norm))
+            values.append(norm)
+
+        if len(values) != 3:
+            return None
+        return torch.tensor(values, dtype=torch.float32)
     
     def get_split_info(self) -> Dict[str, int]:
         """Get information about all splits"""
@@ -629,7 +733,8 @@ def create_comparative_dataloaders(json_file: str,
     Returns:
         Tuple[DataLoader, DataLoader, DataLoader]: train, val, test dataloaders
     """
-    print("crete_dataset: features arryu: {features+arra}")
+    shared_feature_stats = dataset_kwargs.pop('feature_stats', None)
+
     # Create datasets for each split
     train_dataset = StellarComparativeDataset(
         json_file=json_file,
@@ -640,8 +745,13 @@ def create_comparative_dataloaders(json_file: str,
         test_ratio=test_ratio,
         random_state=random_state,
         cache_dir=cache_dir,
+        feature_stats=shared_feature_stats,
         **dataset_kwargs
     )
+
+    feature_stats = train_dataset.get_feature_normalization_stats(copy=True)
+    if feature_stats is None:
+        feature_stats = shared_feature_stats
     
     val_dataset = StellarComparativeDataset(
         json_file=json_file,
@@ -652,6 +762,7 @@ def create_comparative_dataloaders(json_file: str,
         test_ratio=test_ratio,
         random_state=random_state,
         cache_dir=cache_dir,
+        feature_stats=feature_stats,
         **dataset_kwargs
     )
     
@@ -664,6 +775,7 @@ def create_comparative_dataloaders(json_file: str,
         test_ratio=test_ratio,
         random_state=random_state,
         cache_dir=cache_dir,
+        feature_stats=feature_stats,
         **dataset_kwargs
     )
 
@@ -756,6 +868,13 @@ def collate_comparative_fn(batch: List[Dict[str, Any]]) -> Dict[str, Any]:
     spectra_b = [item['spectra_b'] for item in batch]
     masked_spectra_b = [item['masked_spectra_b'] for item in batch]
     features_b = [item['features_b'] for item in batch]
+    y_numeric_a_list = [item.get('y_numeric_a') for item in batch]
+    y_numeric_b_list = [item.get('y_numeric_b') for item in batch]
+    pair_label_values = [item.get('pair_label') for item in batch]
+
+    y_numeric_a, y_numeric_a_present = _stack_numeric(y_numeric_a_list)
+    y_numeric_b, y_numeric_b_present = _stack_numeric(y_numeric_b_list)
+    pair_labels, pair_label_present = _stack_pair_labels(pair_label_values)
     
     return {
         'input_ids': input_ids,                              # [batch, seq_len] with question + answer and feature placeholders
@@ -785,8 +904,48 @@ def collate_comparative_fn(batch: List[Dict[str, Any]]) -> Dict[str, Any]:
         'masked_spectra_b': torch.stack(masked_spectra_b),
         'obsid': obsids,
         'star_a_params': star_a_params,
-        'star_b_params': star_b_params
+        'star_b_params': star_b_params,
+        'y_numeric_a': y_numeric_a,
+        'y_numeric_a_present': y_numeric_a_present,
+        'y_numeric_b': y_numeric_b,
+        'y_numeric_b_present': y_numeric_b_present,
+        'pair_labels': pair_labels,
+        'pair_label_present': pair_label_present,
     }
+
+
+def _stack_numeric(values: List[Optional[torch.Tensor]]) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Stack optional numeric tensors with a presence mask (expects length-3 vectors)."""
+    batch_size = len(values)
+    stacked = torch.zeros((batch_size, 3), dtype=torch.float32)
+    mask = torch.zeros(batch_size, dtype=torch.bool)
+    for idx, tensor in enumerate(values):
+        if tensor is None:
+            continue
+        tensor = tensor.view(-1)
+        if tensor.numel() != 3:
+            continue
+        stacked[idx] = tensor.to(dtype=torch.float32)
+        mask[idx] = True
+    return stacked, mask
+
+
+def _stack_pair_labels(values: List[Optional[Any]]) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Stack scalar pair labels into tensor with presence mask."""
+    batch_size = len(values)
+    labels = torch.zeros(batch_size, dtype=torch.long)
+    mask = torch.zeros(batch_size, dtype=torch.bool)
+    for idx, value in enumerate(values):
+        if value is None:
+            continue
+        if isinstance(value, torch.Tensor):
+            if value.numel() != 1:
+                continue
+            labels[idx] = int(value.item())
+        else:
+            labels[idx] = int(value)
+        mask[idx] = True
+    return labels, mask
 
 
 # Example usage and testing

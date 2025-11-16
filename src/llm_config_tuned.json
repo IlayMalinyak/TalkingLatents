@@ -1,11 +1,11 @@
 {
   "lora_params": {
     "freeze_strategy": "encoder_only",
-    "lora_start_epoch": 5,
+    "lora_start_epoch": 2,
     "lora_lr_multiplier": 1.0,
-    "lora_rank": 8,
-    "lora_alpha": 8.0,
-    "lora_dropout": 0.0,
+    "lora_rank": 4,
+    "lora_alpha": 4.0,
+    "lora_dropout": 0.1,
     "lora_target_modules": [
       "base_model.layers.*.attention.wq",
       "base_model.layers.*.attention.wk",

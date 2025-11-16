@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import random
 from dataclasses import dataclass
-from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
+from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple, Type
 
 import torch
 from torch.utils.data import DataLoader, Dataset
@@ -220,8 +220,15 @@ class MixedStellarQADataset(Dataset):
         if masked_spectra_b is None and features_b is not None:
             masked_spectra_b = features_b
 
-        numeric_a = self._extract_numeric(raw.get("star_a") or raw.get("star_a_params"))
-        numeric_b = self._extract_numeric(raw.get("star_b") or raw.get("star_b_params"))
+        numeric_a_raw = raw.get("y_numeric_a")
+        numeric_b_raw = raw.get("y_numeric_b")
+        numeric_a = self._coerce_tensor(numeric_a_raw) if numeric_a_raw is not None else None
+        numeric_b = self._coerce_tensor(numeric_b_raw) if numeric_b_raw is not None else None
+        if numeric_a is None:
+            numeric_a = self._extract_numeric(raw.get("star_a") or raw.get("star_a_params"))
+        if numeric_b is None:
+            numeric_b = self._extract_numeric(raw.get("star_b") or raw.get("star_b_params"))
+
         # Use explicit checking to avoid tensor boolean evaluation issues
         pair_label = raw.get("pair_label")
         if pair_label is None:
@@ -329,7 +336,7 @@ class MixedStellarQADataset(Dataset):
                 normalized_val = max(0.0, min(1.0, normalized_val))
                 values.append(normalized_val)
         
-        if not values:
+        if len(values) != len(keys):
             return None
         return torch.tensor(values, dtype=torch.float32)
 
@@ -539,10 +546,13 @@ def create_mixed_dataloaders(
     numeric_keys: Optional[Iterable[str]] = None,
     world_size: int = 1,
     device: Optional[str] = None,
+    single_dataset_cls: Type[StellarQuestionsDataset] = StellarQuestionsDataset,
 ) -> Tuple[DataLoader, DataLoader, DataLoader]:
-    single_train = StellarQuestionsDataset(**{**single_kwargs, "split": "train"})
-    single_val = StellarQuestionsDataset(**{**single_kwargs, "split": "val"})
-    single_test = StellarQuestionsDataset(**{**single_kwargs, "split": "test"})
+    single_dataset_cls = single_dataset_cls or StellarQuestionsDataset
+
+    single_train = single_dataset_cls(**{**single_kwargs, "split": "train"})
+    single_val = single_dataset_cls(**{**single_kwargs, "split": "val"})
+    single_test = single_dataset_cls(**{**single_kwargs, "split": "test"})
 
     comparative_train = comparative_val = comparative_test = None
     if comparative_kwargs is not None:
@@ -617,6 +627,7 @@ def create_mixed_dataloaders(
         train_loader = DataLoader(train_dataset, shuffle=True, **loader_kwargs)
         val_loader = DataLoader(val_dataset, shuffle=False, **loader_kwargs)
         test_loader = DataLoader(test_dataset, shuffle=False, **loader_kwargs)
+
 
     return train_loader, val_loader, test_loader
 

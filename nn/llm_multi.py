@@ -1,5 +1,5 @@
 import math
-from typing import Optional, Tuple, Dict, Any, List
+from typing import Optional, Tuple, Dict, Any, List, Sequence
 
 import torch
 import torch.nn as nn
@@ -8,6 +8,7 @@ from torch.utils.checkpoint import checkpoint
 
 # Reuse RoPE utils from the existing implementation
 from .llm import apply_rotary_emb, repeat_kv
+from llama3.llama.model import precompute_freqs_cis
 from nn.cfm import SpectralFlowBridge
 
 
@@ -39,12 +40,12 @@ class SpectralTokensProjector(nn.Module):
 
 class StellarParameterPredictor(nn.Module):
     """Predicts stellar parameters from hidden representations"""
-    
+
     def __init__(self, hidden_dim: int, stellar_params: List[str] = ['Teff', 'logg', 'FeH']):
         super().__init__()
         self.stellar_params = stellar_params
         self.num_params = len(stellar_params)
-        
+
         # Parameter-specific prediction heads
         self.param_heads = nn.ModuleDict()
         for param in stellar_params:
@@ -54,7 +55,7 @@ class StellarParameterPredictor(nn.Module):
                 nn.Dropout(0.1),
                 nn.Linear(hidden_dim // 2, 1)
             )
-            
+
             # Initialize weights to prevent initial NaN issues
             with torch.no_grad():
                 for layer in layers:
@@ -63,9 +64,9 @@ class StellarParameterPredictor(nn.Module):
                         nn.init.xavier_uniform_(layer.weight)
                         if layer.bias is not None:
                             nn.init.zeros_(layer.bias)
-            
+
             self.param_heads[param] = layers
-    
+
     def forward(self, hidden_states: torch.Tensor) -> Dict[str, torch.Tensor]:
         """
         Args:
@@ -82,34 +83,361 @@ class StellarParameterPredictor(nn.Module):
                 hidden_states = (hidden_states * seq_mask).sum(dim=1) / (seq_mask.sum(dim=1) + 1e-8)  # [batch_size, hidden_dim]
             else:
                 hidden_states = hidden_states.mean(dim=1)  # Fallback to simple mean
-        
+
         # Check for NaN/inf in pooled hidden states
         if torch.isnan(hidden_states).any() or torch.isinf(hidden_states).any():
             print("Warning: NaN/inf detected in pooled hidden states, using zeros")
             hidden_states = torch.zeros_like(hidden_states)
-        
+
         # Ensure hidden states match the dtype of the predictor parameters
         predictor_dtype = next(self.param_heads[self.stellar_params[0]].parameters()).dtype
         hidden_states = hidden_states.to(dtype=predictor_dtype)
-        
+
         predictions = {}
         for param in self.stellar_params:
             raw_pred = self.param_heads[param](hidden_states).squeeze(-1)  # [batch_size]
-            
+
             # Check for NaN in raw predictions
             if torch.isnan(raw_pred).any() or torch.isinf(raw_pred).any():
                 print(f"Warning: NaN/inf detected in raw {param} prediction, using zeros")
                 raw_pred = torch.zeros_like(raw_pred)
-            
+
             # Apply sigmoid to get 0-1 range, then apply small bounds to avoid exact 0/1
             normalized_pred = torch.sigmoid(raw_pred)
             # Clamp to [0.001, 0.999] to avoid extreme values in loss computation
             predictions[param] = torch.clamp(normalized_pred, min=0.001, max=0.999)
-        
+
         return predictions
 
 
-class MultimodalLlamaModelMultiTokens(nn.Module):
+class FeaturePredictor(nn.Module):
+    """Predicts latent features from hidden representations using MLP"""
+
+    def __init__(self, hidden_dim: int, feature_dim: int):
+        super().__init__()
+        self.feature_dim = feature_dim
+
+        # MLP for feature prediction
+        self.feature_head = nn.Sequential(
+            nn.Linear(hidden_dim, hidden_dim // 2),
+            nn.LayerNorm(hidden_dim // 2),
+            nn.GELU(),
+            nn.Dropout(0.1),
+            nn.Linear(hidden_dim // 2, feature_dim)
+        )
+
+        # Initialize weights
+        with torch.no_grad():
+            for layer in self.feature_head:
+                if isinstance(layer, nn.Linear):
+                    nn.init.xavier_uniform_(layer.weight)
+                    if layer.bias is not None:
+                        nn.init.zeros_(layer.bias)
+
+    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        """
+        Args:
+            hidden_states: [batch_size, seq_len, hidden_dim] or [batch_size, hidden_dim]
+        Returns:
+            Predicted features: [batch_size, feature_dim]
+        """
+        if hidden_states.dim() == 3:
+            # Pool across sequence dimension (mean pooling)
+            seq_mask = (hidden_states.abs().sum(dim=-1) > 1e-8).float().unsqueeze(-1)  # [batch_size, seq_len, 1]
+            if seq_mask.sum() > 0:
+                hidden_states = (hidden_states * seq_mask).sum(dim=1) / (seq_mask.sum(dim=1) + 1e-8)  # [batch_size, hidden_dim]
+            else:
+                hidden_states = hidden_states.mean(dim=1)  # Fallback to simple mean
+
+        # Check for NaN/inf
+        if torch.isnan(hidden_states).any() or torch.isinf(hidden_states).any():
+            print("Warning: NaN/inf detected in hidden states for feature prediction, using zeros")
+            hidden_states = torch.zeros_like(hidden_states)
+
+        # Predict features
+        features = self.feature_head(hidden_states)  # [batch_size, feature_dim]
+
+        # Check for NaN in predictions
+        if torch.isnan(features).any() or torch.isinf(features).any():
+            print("Warning: NaN/inf detected in feature predictions, using zeros")
+            features = torch.zeros_like(features)
+
+        return features
+
+
+class MultimodalBackboneBase(nn.Module):
+    """Shared multimodal utilities (projectors, auxiliary heads, losses)."""
+
+    def __init__(
+        self,
+        base_model,
+        fm_model,
+        latent_dim,
+        hidden_dim,
+        num_spectral_features: int = 8,
+        use_checkpoint: bool = True,
+        mode: str = "single_star",
+        use_cfm: bool = True,
+        cfm_weight: float = 0.1,
+        predict_stellar_params: bool = True,
+        stellar_params: Optional[List[str]] = None,
+        quantiles: Optional[List[float]] = None,
+        enable_classification: bool = True,
+        predict_features: bool = False,
+        feature_dim: int = 2048,
+        feature_loss_weight: float = 1.0,
+        embedding_dim: Optional[int] = None,
+        vocab_size: Optional[int] = None,
+    ):
+        super().__init__()
+        stellar_params = stellar_params or ['Teff', 'logg', 'FeH']
+        quantiles = quantiles or [0.159, 0.5, 0.841]
+
+        self.base_model = base_model
+        self.fm_model = fm_model
+        self.mode = mode
+        self.use_checkpoint = use_checkpoint
+        self.use_cfm = use_cfm
+        self.cfm_weight = cfm_weight
+        self.predict_stellar_params = predict_stellar_params
+        self.stellar_params = stellar_params
+        self.quantiles = quantiles
+        self.num_quantiles = len(quantiles)
+        self.enable_classification = enable_classification
+        self.predict_features = predict_features
+        self.feature_dim = feature_dim
+        self.feature_loss_weight = feature_loss_weight
+        self.num_spectral_features = int(num_spectral_features)
+
+        self.embedding_dim = embedding_dim
+        if self.embedding_dim is None:
+            base_params = getattr(base_model, "params", None)
+            self.embedding_dim = getattr(base_params, "dim", None)
+        if self.embedding_dim is None and hasattr(base_model, "config"):
+            self.embedding_dim = getattr(base_model.config, "hidden_size", None)
+        if self.embedding_dim is None:
+            raise ValueError("embedding_dim could not be inferred; provide it explicitly.")
+
+        if vocab_size is None:
+            base_params = getattr(base_model, "params", None)
+            vocab_size = getattr(base_params, "vocab_size", None)
+        if vocab_size is None and hasattr(base_model, "config"):
+            vocab_size = getattr(base_model.config, "vocab_size", None)
+        self.vocab_size = vocab_size
+
+        self._init_projectors(latent_dim, hidden_dim)
+
+        if self.use_cfm:
+            if self.vocab_size is None:
+                raise ValueError("vocab_size is required when use_cfm is True.")
+            self.flow_bridge = SpectralFlowBridge(
+                vocab_size=self.vocab_size,
+                feature_dim=latent_dim,
+                hidden_dim=hidden_dim,
+            )
+        else:
+            self.flow_bridge = None
+
+        self._init_stellar_predictor()
+        self._init_classification_head()
+        self._init_feature_predictor()
+
+    # ------------------------------------------------------------------ #
+    # Initialization helpers
+    # ------------------------------------------------------------------ #
+    def _init_projectors(self, latent_dim: int, hidden_dim: int) -> None:
+        self.projector_a = SpectralTokensProjector(
+            latent_dim=latent_dim,
+            d_model=self.embedding_dim,
+            hidden_dim=hidden_dim,
+            num_tokens=self.num_spectral_features,
+        )
+        self.projector_b = SpectralTokensProjector(
+            latent_dim=latent_dim,
+            d_model=self.embedding_dim,
+            hidden_dim=hidden_dim,
+            num_tokens=self.num_spectral_features,
+        )
+        self.projector = SpectralTokensProjector(
+            latent_dim=latent_dim,
+            d_model=self.embedding_dim,
+            hidden_dim=hidden_dim,
+            num_tokens=self.num_spectral_features,
+        )
+
+    def _init_stellar_predictor(self) -> None:
+        if not self.predict_stellar_params:
+            self.stellar_transformer = None
+            self.stellar_predictor = None
+            return
+        self.stellar_transformer = nn.ModuleList([
+            nn.TransformerEncoderLayer(
+                d_model=self.embedding_dim,
+                nhead=8,
+                dim_feedforward=self.embedding_dim * 2,
+                dropout=0.1,
+                batch_first=True,
+            )
+            for _ in range(2)
+        ])
+        self.stellar_predictor = nn.Sequential(
+            nn.Linear(self.embedding_dim, self.embedding_dim // 2),
+            nn.LayerNorm(self.embedding_dim // 2),
+            nn.GELU(),
+            nn.Dropout(0.1),
+            nn.Linear(self.embedding_dim // 2, len(self.stellar_params) * self.num_quantiles),
+        )
+
+    def _init_classification_head(self) -> None:
+        if not self.enable_classification:
+            self.classification_head = None
+            return
+        self.classification_head = nn.Sequential(
+            nn.Linear(self.embedding_dim, self.embedding_dim // 2),
+            nn.LayerNorm(self.embedding_dim // 2),
+            nn.GELU(),
+            nn.Dropout(0.1),
+            nn.Linear(self.embedding_dim // 2, 2),
+        )
+
+    def _init_feature_predictor(self) -> None:
+        if not self.predict_features:
+            self.feature_predictor = None
+            return
+        print("creating features predictor...")
+        self.feature_predictor = FeaturePredictor(
+            hidden_dim=self.embedding_dim,
+            feature_dim=self.feature_dim,
+        ).float()
+
+    # ------------------------------------------------------------------ #
+    # Shared utilities
+    # ------------------------------------------------------------------ #
+    def _normalize_hidden_for_cfm(self, h: torch.Tensor) -> torch.Tensor:
+        mean = h.mean(dim=-1, keepdim=True)
+        std = h.std(dim=-1, keepdim=True) + 1e-8
+        return (h - mean) / std
+
+    def _compute_cfm_loss(self, h: torch.Tensor, cfm_targets: List[torch.Tensor]) -> Optional[torch.Tensor]:
+        if not self.use_cfm or self.flow_bridge is None or not cfm_targets:
+            return None
+        cfm_param_dtype = next(self.flow_bridge.parameters()).dtype
+        hidden_states = h.to(dtype=cfm_param_dtype)
+        normalized_hidden = self._normalize_hidden_for_cfm(hidden_states)
+        cfm_losses = []
+        for i, target in enumerate(cfm_targets):
+            cfm_target = target.to(dtype=cfm_param_dtype)
+            cfm_loss = self.flow_bridge.training_step(normalized_hidden[i:i + 1], cfm_target.unsqueeze(0))
+            cfm_losses.append(cfm_loss)
+        if cfm_losses:
+            return torch.stack(cfm_losses).mean()
+        return None
+
+    def _run_stellar_predictor(self, h: torch.Tensor) -> Optional[torch.Tensor]:
+        if self.stellar_predictor is None:
+            return None
+        stellar_h = h.float()
+        for layer in self.stellar_transformer:
+            stellar_h = layer(stellar_h)
+        pooled_h = stellar_h.mean(dim=1)
+        return self.stellar_predictor(pooled_h.float())
+
+    def _run_classification_head(self, h: torch.Tensor, batch: Dict[str, Any]) -> Optional[torch.Tensor]:
+        if self.classification_head is None:
+            return None
+        comp_mask = batch.get('mode_mask_comparative', None)
+        if comp_mask is None or not torch.any(comp_mask):
+            return None
+        class_head_dtype = next(self.classification_head.parameters()).dtype
+        class_h = h.to(dtype=class_head_dtype)
+        if self.stellar_transformer is not None:
+            class_h_fp32 = class_h.float()
+            for layer in self.stellar_transformer:
+                class_h_fp32 = layer(class_h_fp32)
+            class_h = class_h_fp32.to(dtype=class_head_dtype)
+        pooled = class_h.mean(dim=1)
+        return self.classification_head(pooled)
+
+    def _run_feature_predictor(self, h: torch.Tensor) -> Optional[torch.Tensor]:
+        if self.feature_predictor is None:
+            return None
+        return self.feature_predictor(h.float())
+
+    def _add_common_outputs(
+        self,
+        h: torch.Tensor,
+        outputs: Dict[str, torch.Tensor],
+        batch: Dict[str, Any],
+        cfm_targets: Optional[List[torch.Tensor]] = None,
+    ) -> Dict[str, torch.Tensor]:
+        if cfm_targets is not None:
+            cfm_loss = self._compute_cfm_loss(h, cfm_targets)
+            if cfm_loss is not None:
+                outputs['cfm_loss'] = cfm_loss
+        stellar_preds = self._run_stellar_predictor(h)
+        if stellar_preds is not None:
+            outputs['stellar_predictions'] = stellar_preds
+        class_logits = self._run_classification_head(h, batch)
+        if class_logits is not None:
+            outputs['classification_logits'] = class_logits
+        feature_preds = self._run_feature_predictor(h)
+        if feature_preds is not None:
+            outputs['predicted_features'] = feature_preds
+        return outputs
+
+    def _encode_latent_features(self, spectra: torch.Tensor) -> torch.Tensor:
+        if self.fm_model is not None:
+            self.fm_model.eval()
+            with torch.no_grad():
+                _, _, latent_features = self.fm_model(spectra)
+                if latent_features.dim() == 3:
+                    latent_features = latent_features.mean(dim=1)
+        else:
+            latent_features = spectra.float()
+        return latent_features
+
+    def _project_spectra(self, spectra: torch.Tensor, projector: nn.Module) -> torch.Tensor:
+        latent = self._encode_latent_features(spectra)
+        proj_param = next(projector.parameters())
+        latent = latent.to(device=proj_param.device, dtype=proj_param.dtype)
+        return projector(latent)
+
+    def _extract_text_fields(self, batch_data: Dict[str, Any], batch_idx: int) -> Tuple[str, str]:
+        input_text = ''
+        target_text = ''
+        if 'input_texts' in batch_data:
+            input_list = batch_data.get('input_texts', [''])
+            target_list = batch_data.get('target_texts', [''])
+            if len(input_list) > batch_idx:
+                input_text = input_list[batch_idx]
+            if len(target_list) > batch_idx:
+                target_text = target_list[batch_idx]
+        elif 'input_text' in batch_data:
+            raw_input = batch_data.get('input_text', '')
+            raw_target = batch_data.get('target_text', '')
+            if isinstance(raw_input, list):
+                if len(raw_input) > batch_idx:
+                    input_text = raw_input[batch_idx]
+            else:
+                input_text = raw_input
+            if isinstance(raw_target, list):
+                if len(raw_target) > batch_idx:
+                    target_text = raw_target[batch_idx]
+            else:
+                target_text = raw_target
+        elif 'metadata' in batch_data and batch_data['metadata']:
+            meta = batch_data['metadata'][batch_idx]
+            if meta and isinstance(meta, dict):
+                if 'raw' in meta and isinstance(meta['raw'], dict):
+                    input_text = meta['raw'].get('input_text', '') or ''
+                    target_text = meta['raw'].get('target_text', '') or ''
+                else:
+                    input_text = meta.get('input_text', '') or ''
+                    target_text = meta.get('target_text', '') or ''
+        return input_text or '', target_text or ''
+
+
+class MultimodalLlamaModelMultiTokens(MultimodalBackboneBase):
     """
     Multimodal wrapper that injects K spectral tokens into the LLaMA token sequence.
 
@@ -133,87 +461,27 @@ class MultimodalLlamaModelMultiTokens(nn.Module):
     def __init__(self, base_model, fm_model, latent_dim, hidden_dim, num_spectral_features: int = 8,
                  use_checkpoint: bool = True, mode: str = "single_star", use_cfm=True, cfm_weight=0.1,
                  predict_stellar_params: bool = True, stellar_params: List[str] = ['Teff', 'logg', 'FeH'],
-                 quantiles: List[float] = [0.159, 0.5, 0.841], enable_classification: bool = True):
-        super().__init__()
-        self.base_model = base_model
-        self.fm_model = fm_model
-        self.embedding_dim = base_model.params.dim
+                 quantiles: List[float] = [0.159, 0.5, 0.841], enable_classification: bool = True,
+                 predict_features: bool = False, feature_dim: int = 2048, feature_loss_weight: float = 1.0):
+        super().__init__(
+            base_model=base_model,
+            fm_model=fm_model,
+            latent_dim=latent_dim,
+            hidden_dim=hidden_dim,
+            num_spectral_features=num_spectral_features,
+            use_checkpoint=use_checkpoint,
+            mode=mode,
+            use_cfm=use_cfm,
+            cfm_weight=cfm_weight,
+            predict_stellar_params=predict_stellar_params,
+            stellar_params=stellar_params,
+            quantiles=quantiles,
+            enable_classification=enable_classification,
+            predict_features=predict_features,
+            feature_dim=feature_dim,
+            feature_loss_weight=feature_loss_weight,
+        )
         print("self.embedding dim: ", self.embedding_dim)
-        self.num_spectral_features = int(num_spectral_features)
-        self.use_checkpoint = use_checkpoint
-        self.mode = mode  # "single_star" or "two_star"
-        self.use_cfm = use_cfm
-        self.cfm_weight = cfm_weight
-        self.predict_stellar_params = predict_stellar_params
-        self.stellar_params = stellar_params
-        self.quantiles = quantiles
-        self.num_quantiles = len(quantiles)
-        self.enable_classification = enable_classification
-        
-        # For two-star mode, create separate projectors for each star
-        # if mode == "two_star":
-        self.projector_a = SpectralTokensProjector(
-            latent_dim=latent_dim,
-            d_model=self.embedding_dim,
-            hidden_dim=hidden_dim,
-            num_tokens=self.num_spectral_features,
-        )
-        self.projector_b = SpectralTokensProjector(
-            latent_dim=latent_dim,
-            d_model=self.embedding_dim,
-            hidden_dim=hidden_dim,
-            num_tokens=self.num_spectral_features,
-        )
-    # else:
-        self.projector = SpectralTokensProjector(
-            latent_dim=latent_dim,
-            d_model=self.embedding_dim,
-            hidden_dim=hidden_dim,
-            num_tokens=self.num_spectral_features,
-            )
-        if self.use_cfm:
-            vocab_size = base_model.params.vocab_size
-            self.flow_bridge = SpectralFlowBridge(
-                vocab_size=vocab_size,
-                feature_dim=latent_dim,
-                hidden_dim=hidden_dim
-            )
-        
-        # Initialize stellar parameter predictor
-        if self.predict_stellar_params:
-            # Small transformer for stellar prediction
-            self.stellar_transformer = nn.ModuleList([
-                nn.TransformerEncoderLayer(
-                    d_model=self.embedding_dim,
-                    nhead=8,
-                    dim_feedforward=self.embedding_dim*2,
-                    dropout=0.1,
-                    batch_first=True
-                ) for _ in range(2)
-            ])
-            
-            self.stellar_predictor = nn.Sequential(
-                nn.Linear(self.embedding_dim, self.embedding_dim//2),
-                nn.LayerNorm(self.embedding_dim//2),
-                nn.GELU(),
-                nn.Dropout(0.1),
-                nn.Linear(self.embedding_dim//2, len(stellar_params) * self.num_quantiles)
-                )
-        else:
-            self.stellar_predictor = None
-        
-        # Classification head for comparative questions (STAR_A vs STAR_B)
-        if self.enable_classification:
-            self.classification_head = nn.Sequential(
-                nn.Linear(self.embedding_dim, self.embedding_dim // 2),
-                nn.LayerNorm(self.embedding_dim // 2),
-                nn.GELU(),
-                nn.Dropout(0.1),
-                nn.Linear(self.embedding_dim // 2, 2)  # Binary classification: STAR_A (0) or STAR_B (1)
-            )
-        else:
-            self.classification_head = None
-           
 
     def forward(self, batch: Dict[str, Any]) -> Dict[str, torch.Tensor]:
         """
@@ -238,20 +506,7 @@ class MultimodalLlamaModelMultiTokens(nn.Module):
                 single_spectra = batch['masked_spectra'].index_select(0, single_indices)
                 single_positions = batch['feature_start_indices'].index_select(0, single_indices)
                 
-                # Process spectra through FM model if available
-                if self.fm_model is not None:
-                    self.fm_model.eval()
-                    with torch.no_grad():
-                        _, _, latent_features = self.fm_model(single_spectra)
-                        if latent_features.dim() == 3:
-                            latent_features = latent_features.mean(dim=1)
-                else:
-                    latent_features = single_spectra.float()
-                
-                # Project to tokens
-                proj_param = next(self.projector.parameters())
-                latent_features = latent_features.to(device=proj_param.device, dtype=proj_param.dtype)
-                spec_tokens = self.projector(latent_features)
+                spec_tokens = self._project_spectra(single_spectra, self.projector)
                 
                 # Insert tokens at specified positions
                 for i, global_idx in enumerate(single_indices):
@@ -277,26 +532,8 @@ class MultimodalLlamaModelMultiTokens(nn.Module):
                 comp_indices_a = batch['star_a_feature_indices'].index_select(0, comp_indices)
                 comp_indices_b = batch['star_b_feature_indices'].index_select(0, comp_indices)
                 
-                # Process both stars' spectra
-                if self.fm_model is not None:
-                    self.fm_model.eval()
-                    with torch.no_grad():
-                        _, _, latent_a = self.fm_model(comp_spectra_a)
-                        _, _, latent_b = self.fm_model(comp_spectra_b)
-                        if latent_a.dim() == 3:
-                            latent_a = latent_a.mean(dim=1)
-                        if latent_b.dim() == 3:
-                            latent_b = latent_b.mean(dim=1)
-                else:
-                    latent_a = comp_spectra_a.float()
-                    latent_b = comp_spectra_b.float()
-                
-                # Project to tokens using same projector
-                proj_param = next(self.projector.parameters())
-                latent_a = latent_a.to(device=proj_param.device, dtype=proj_param.dtype)
-                latent_b = latent_b.to(device=proj_param.device, dtype=proj_param.dtype)
-                spec_tokens_a = self.projector(latent_a)
-                spec_tokens_b = self.projector(latent_b)
+                spec_tokens_a = self._project_spectra(comp_spectra_a, self.projector)
+                spec_tokens_b = self._project_spectra(comp_spectra_b, self.projector)
                 
                 # Insert tokens at exact positions
                 for i, global_idx in enumerate(comp_indices):
@@ -329,77 +566,79 @@ class MultimodalLlamaModelMultiTokens(nn.Module):
                                torch.zeros_like(logits), logits)
         
         outputs = {"logits": logits, "h": h}
-        
-        # Add CFM loss if enabled
-        if self.use_cfm and cfm_targets:
-            cfm_param_dtype = next(self.flow_bridge.parameters()).dtype
-            hidden_states = h.to(dtype=cfm_param_dtype)
-            normalized_hidden = (hidden_states - hidden_states.mean(dim=-1, keepdim=True)) / (hidden_states.std(dim=-1, keepdim=True) + 1e-8)
-            
-            cfm_losses = []
-            for i, target in enumerate(cfm_targets):
-                cfm_target = target.to(dtype=cfm_param_dtype)
-                cfm_loss = self.flow_bridge.training_step(normalized_hidden[i:i+1], cfm_target.unsqueeze(0))
-                cfm_losses.append(cfm_loss)
-            
-            if cfm_losses:
-                outputs['cfm_loss'] = torch.stack(cfm_losses).mean()
-        
-        # Add stellar parameter predictions if enabled
-        if self.stellar_predictor is not None:
-            # Convert to FP32 for stellar components (they are kept in FP32 for stability)
-            stellar_h = h.float()
-            
-            # Pass full sequence through small transformer
-            for layer in self.stellar_transformer:
-                stellar_h = layer(stellar_h)
-            
-            # Pool the sequence dimension (mean pooling)
-            pooled_h = stellar_h.mean(dim=1)
-            
-            # Final prediction from pooled representation
-            stellar_preds = self.stellar_predictor(pooled_h.float())  # Convert to float32 for stellar predictor
-            outputs['stellar_predictions'] = stellar_preds
-        
-        # Add classification predictions for comparative samples
-        if self.classification_head is not None:
-            # Get comparative mask to identify which samples are comparative
-            comp_mask = batch.get('mode_mask_comparative', torch.zeros(batch_size, dtype=torch.bool, device=device))
-            
-            if comp_mask.any():
-                # Get classification head's target dtype for memory efficiency
-                if hasattr(self, 'classification_head') and self.classification_head is not None:
-                    class_head_dtype = next(self.classification_head.parameters()).dtype
-                else:
-                    class_head_dtype = h.dtype
-                
-                # Use classification head's dtype (could be FP16/BF16 for memory efficiency)
-                class_h = h.to(dtype=class_head_dtype)
-                
-                # Pass full sequence through small transformer (reuse stellar transformer)
-                if hasattr(self, 'stellar_transformer') and self.stellar_transformer is not None:
-                    # Convert to FP32 for stellar transformer (which is kept in FP32), then back
-                    class_h_fp32 = class_h.float()
-                    for layer in self.stellar_transformer:
-                        class_h_fp32 = layer(class_h_fp32)
-                    class_h = class_h_fp32.to(dtype=class_head_dtype)
-                
-                # Pool the sequence dimension (mean pooling)
-                pooled_class_h = class_h.mean(dim=1)
-                
-                # Get classification logits using classification head's native precision
-                classification_logits = self.classification_head(pooled_class_h)
-                outputs['classification_logits'] = classification_logits
-        
-        return outputs
+        return self._add_common_outputs(h, outputs, batch, cfm_targets)
 
-    def _transformer_forward(self, token_embeddings: torch.Tensor) -> torch.Tensor:
+    def _ensure_generation_capacity(self,
+                                    batch_size: int,
+                                    required_len: int,
+                                    device: torch.device) -> None:
+        base_model = self.base_model
+        # Extend RoPE cache if needed
+        if required_len > base_model.freqs_cis.shape[0]:
+            head_dim = base_model.params.dim // base_model.params.n_heads
+            new_len = max(required_len, base_model.freqs_cis.shape[0] * 2)
+            base_model.freqs_cis = precompute_freqs_cis(
+                head_dim,
+                new_len,
+                base_model.params.rope_theta,
+            ).to(base_model.freqs_cis.device)
+
+        for layer in base_model.layers:
+            attn = layer.attention
+            cache_k = attn.cache_k
+            cache_v = attn.cache_v
+            need_batch = max(batch_size, cache_k.shape[0])
+            need_len = max(required_len, cache_k.shape[1])
+            if need_batch == cache_k.shape[0] and need_len == cache_k.shape[1]:
+                continue
+            new_shape = (need_batch, need_len, cache_k.shape[2], cache_k.shape[3])
+            new_k = cache_k.new_zeros(new_shape)
+            new_v = cache_v.new_zeros(new_shape)
+            new_k[:cache_k.shape[0], :cache_k.shape[1]] = cache_k
+            new_v[:cache_v.shape[0], :cache_v.shape[1]] = cache_v
+            attn.cache_k = new_k
+            attn.cache_v = new_v
+
+    def _forward_no_cache(self, input_ids: torch.Tensor, latent_features: torch.Tensor,
+                          feature_start_indices) -> Dict[str, torch.Tensor]:
+        return self._forward_single_mode(
+            input_ids=input_ids,
+            latent_features=latent_features,
+            feature_start_indices=feature_start_indices,
+            start_pos=0,
+            use_cache=False,
+        )
+
+    def _transformer_forward(self,
+                             token_embeddings: torch.Tensor,
+                             start_pos: int = 0,
+                             use_cache: bool = False,
+                             cache_rows: Optional[Sequence[int]] = None) -> torch.Tensor:
         """
         Unified transformer forward pass for token embeddings.
         """
         h = token_embeddings
         device = token_embeddings.device
         seqlen = token_embeddings.size(1)
+        normalized_rows: Optional[List[int]] = None
+        if cache_rows is not None:
+            if len(cache_rows) != token_embeddings.size(0):
+                raise ValueError("cache_rows must match batch size for cached forward passes")
+            normalized_rows = [int(r) for r in cache_rows]
+
+        if use_cache:
+            base_model = self.base_model
+            required_len = start_pos + seqlen
+            effective_batch = token_embeddings.size(0)
+            if normalized_rows:
+                effective_batch = max(effective_batch, max(normalized_rows) + 1)
+            self._ensure_generation_capacity(effective_batch, required_len, device)
+            base_model.freqs_cis = base_model.freqs_cis.to(device)
+            freqs_cis = base_model.freqs_cis[start_pos:required_len]
+            for layer in base_model.layers:
+                h = layer(h, start_pos, freqs_cis, mask=None, cache_rows=normalized_rows)
+            h = base_model.norm(h)
+            return h
         
         # Build RoPE frequencies
         head_dim = self.base_model.params.dim // self.base_model.params.n_heads
@@ -433,8 +672,13 @@ class MultimodalLlamaModelMultiTokens(nn.Module):
         h = self.base_model.norm(h)
         return h
 
-    def _forward_no_cache(self, input_ids: torch.Tensor, latent_features: torch.Tensor,
-                          feature_start_indices) -> Dict[str, torch.Tensor]:
+    def _forward_single_mode(self,
+                             input_ids: torch.Tensor,
+                             latent_features: torch.Tensor,
+                             feature_start_indices,
+                             start_pos: int = 0,
+                             use_cache: bool = False,
+                             cache_rows: Optional[Sequence[int]] = None) -> Dict[str, torch.Tensor]:
         bsz, seqlen = input_ids.shape
         device = input_ids.device
 
@@ -463,54 +707,30 @@ class MultimodalLlamaModelMultiTokens(nn.Module):
             fsi = torch.full((bsz,), int(feature_start_indices), dtype=torch.long, device=input_ids.device)
 
         # Insert the K tokens per sample at reserved positions
-        K = self.num_spectral_features
+        K = spec_tokens.shape[1]
         for b in range(bsz):
-            s = int(fsi[b].item())
-            e = s + K
-            if 0 <= s and e <= seqlen:
-                token_embeddings[b, s:e, :] = spec_tokens[b]
-            else:
-                # If indices are out of range, fallback to prefix insertion
-                token_embeddings[b, :K, :] = spec_tokens[b]
+            start_idx = int(fsi[b].item())
+            relative_start = start_idx - start_pos
+            relative_end = relative_start + K
+            if relative_end <= 0 or relative_start >= seqlen:
+                continue
+            insert_start = max(0, relative_start)
+            insert_end = min(seqlen, relative_end)
+            spec_start = insert_start - relative_start
+            spec_end = spec_start + (insert_end - insert_start)
+            token_embeddings[b, insert_start:insert_end, :] = spec_tokens[b, spec_start:spec_end, :]
 
-        # Simple transformer forward (no cache), reusing the logic used in your current model
-        h = token_embeddings
-
-        # Build RoPE frequencies
-        head_dim = self.base_model.params.dim // self.base_model.params.n_heads
-        freqs = 1.0 / (self.base_model.params.rope_theta ** (
-            torch.arange(0, head_dim, 2, device=device).float() / head_dim))
-        t = torch.arange(seqlen, device=device, dtype=torch.float32)
-        freqs = torch.outer(t, freqs)
-        freqs_cis = torch.polar(torch.ones_like(freqs), freqs)
-
-        # Causal mask
-        mask = None
-        if seqlen > 1:
-            mask = torch.full((seqlen, seqlen), float("-inf"), device=device, dtype=h.dtype)
-            mask = torch.triu(mask, diagonal=1)
-
-        def layer_block(h_in, layer):
-            # Attention
-            h_norm = layer.attention_norm(h_in)
-            attn_out = self._attn_no_cache(h_norm, freqs_cis, mask, layer.attention)
-            h_mid = h_in + attn_out
-            # FFN
-            ff_norm = layer.ffn_norm(h_mid)
-            return h_mid + layer.feed_forward(ff_norm)
-
-        for layer in self.base_model.layers:
-            if self.training and self.use_checkpoint:
-                h = checkpoint(layer_block, h, layer, use_reentrant=False)
-            else:
-                h = layer_block(h, layer)
-
-        h = self.base_model.norm(h)
+        h = self._transformer_forward(
+            token_embeddings,
+            start_pos=start_pos,
+            use_cache=use_cache,
+            cache_rows=cache_rows,
+        )
         logits = self.base_model.output(h).float()
         
         # Check for NaN in logits
         if torch.isnan(logits).any() or torch.isinf(logits).any():
-            print("Warning: NaN/inf detected in model logits")
+            print("Warning: NaN/inf detected in model logits: ", torch.isnan(logits).sum(), logits.shape)
             # Replace NaN/inf with zeros
             logits = torch.where(torch.isnan(logits) | torch.isinf(logits), 
                                torch.zeros_like(logits), logits)
@@ -547,9 +767,15 @@ class MultimodalLlamaModelMultiTokens(nn.Module):
         
         return outputs
 
-    def _forward_no_cache_two_star(self, input_ids: torch.Tensor, 
-                                   star_a_features: torch.Tensor, star_b_features: torch.Tensor,
-                                   star_a_indices: torch.Tensor, star_b_indices: torch.Tensor) -> Dict[str, torch.Tensor]:
+    def _forward_two_star_mode(self,
+                               input_ids: torch.Tensor,
+                               star_a_features: torch.Tensor,
+                               star_b_features: torch.Tensor,
+                               star_a_indices: torch.Tensor,
+                               star_b_indices: torch.Tensor,
+                               start_pos: int = 0,
+                               use_cache: bool = False,
+                               cache_rows: Optional[Sequence[int]] = None) -> Dict[str, torch.Tensor]:
         """Forward pass for two-star mode using exact feature indices for each star"""
         bsz, seqlen = input_ids.shape
         device = input_ids.device
@@ -561,61 +787,37 @@ class MultimodalLlamaModelMultiTokens(nn.Module):
         spec_tokens_a = self.projector_a(star_a_features)  # (B, K, d_model)
         spec_tokens_b = self.projector_b(star_b_features)  # (B, K, d_model)
 
-        # Ensure spectral tokens match token embeddings dtype
         spec_tokens_a = spec_tokens_a.to(dtype=token_embeddings.dtype)
         spec_tokens_b = spec_tokens_b.to(dtype=token_embeddings.dtype)
 
-        # Insert the K tokens per sample at exact positions specified by indices
+        star_a_indices = torch.as_tensor(star_a_indices, device=device).long()
+        star_b_indices = torch.as_tensor(star_b_indices, device=device).long()
+
         for b in range(bsz):
-            # Replace tokens at star_a_indices positions
-            indices_a = star_a_indices[b]  # Should be tensor of K indices
-            valid_indices_a = indices_a[indices_a < seqlen]  # Filter out out-of-bounds indices
-            if len(valid_indices_a) > 0:
-                # Only replace as many tokens as we have valid indices
-                num_tokens_a = min(len(valid_indices_a), spec_tokens_a.shape[1])
-                token_embeddings[b, valid_indices_a[:num_tokens_a], :] = spec_tokens_a[b, :num_tokens_a, :]
+            indices_a = star_a_indices[b]
+            if indices_a.numel() > 0:
+                rel_indices_a = indices_a - start_pos
+                keep_mask = (rel_indices_a >= 0) & (rel_indices_a < seqlen)
+                rel_indices_a = rel_indices_a[keep_mask]
+                if rel_indices_a.numel() > 0:
+                    num_tokens_a = min(rel_indices_a.numel(), spec_tokens_a.shape[1])
+                    token_embeddings[b, rel_indices_a[:num_tokens_a], :] = spec_tokens_a[b, :num_tokens_a, :]
 
-            # Replace tokens at star_b_indices positions  
-            indices_b = star_b_indices[b]  # Should be tensor of K indices
-            valid_indices_b = indices_b[indices_b < seqlen]  # Filter out out-of-bounds indices
-            if len(valid_indices_b) > 0:
-                # Only replace as many tokens as we have valid indices
-                num_tokens_b = min(len(valid_indices_b), spec_tokens_b.shape[1])
-                token_embeddings[b, valid_indices_b[:num_tokens_b], :] = spec_tokens_b[b, :num_tokens_b, :]
+            indices_b = star_b_indices[b]
+            if indices_b.numel() > 0:
+                rel_indices_b = indices_b - start_pos
+                keep_mask = (rel_indices_b >= 0) & (rel_indices_b < seqlen)
+                rel_indices_b = rel_indices_b[keep_mask]
+                if rel_indices_b.numel() > 0:
+                    num_tokens_b = min(rel_indices_b.numel(), spec_tokens_b.shape[1])
+                    token_embeddings[b, rel_indices_b[:num_tokens_b], :] = spec_tokens_b[b, :num_tokens_b, :]
 
-        # Simple transformer forward (no cache), reusing the logic used in your current model
-        h = token_embeddings
-
-        # Build RoPE frequencies
-        head_dim = self.base_model.params.dim // self.base_model.params.n_heads
-        freqs = 1.0 / (self.base_model.params.rope_theta ** (
-            torch.arange(0, head_dim, 2, device=device).float() / head_dim))
-        t = torch.arange(seqlen, device=device, dtype=torch.float32)
-        freqs = torch.outer(t, freqs)
-        freqs_cis = torch.polar(torch.ones_like(freqs), freqs)
-
-        # Causal mask
-        mask = None
-        if seqlen > 1:
-            mask = torch.full((seqlen, seqlen), float("-inf"), device=device, dtype=h.dtype)
-            mask = torch.triu(mask, diagonal=1)
-
-        def layer_block(h_in, layer):
-            # Attention
-            h_norm = layer.attention_norm(h_in)
-            attn_out = self._attn_no_cache(h_norm, freqs_cis, mask, layer.attention)
-            h_mid = h_in + attn_out
-            # FFN
-            ff_norm = layer.ffn_norm(h_mid)
-            return h_mid + layer.feed_forward(ff_norm)
-
-        for layer in self.base_model.layers:
-            if self.training and self.use_checkpoint:
-                h = checkpoint(layer_block, h, layer, use_reentrant=False)
-            else:
-                h = layer_block(h, layer)
-
-        h = self.base_model.norm(h)
+        h = self._transformer_forward(
+            token_embeddings,
+            start_pos=start_pos,
+            use_cache=use_cache,
+            cache_rows=cache_rows,
+        )
         logits = self.base_model.output(h).float()
         
         # Check for NaN in logits
@@ -626,31 +828,20 @@ class MultimodalLlamaModelMultiTokens(nn.Module):
                                torch.zeros_like(logits), logits)
         
         outputs = {"logits": logits, "h": h}
-        
-        # Add stellar parameter predictions if enabled
-        if self.predict_stellar_params and hasattr(self, 'stellar_predictor'):
-            # # Ensure hidden states match predictor dtype
-            # h_for_predictor = h.to(dtype=next(self.stellar_predictor.parameters()).dtype)
-            
-            # # Check for NaN in hidden states before prediction
-            # if torch.isnan(h_for_predictor).any() or torch.isinf(h_for_predictor).any():
-            #     print("Warning: NaN/inf detected in hidden states for stellar prediction")
-            #     # Create dummy predictions to avoid breaking the forward pass (use 0.5 for normalized range)
-            #     predictor_dtype = next(self.stellar_predictor.parameters()).dtype
-            #     stellar_preds = {param: torch.full((h.size(0),), 0.5, device=h.device, dtype=predictor_dtype) 
-            #                    for param in self.stellar_predictor.stellar_params}
-            # else:
-            cls_token = h[:, 0, :].float()  # Convert to float32 for stellar predictor
-            stellar_preds = self.stellar_predictor(cls_token)  # Use hidden states
-                
-                # # Check for NaN in stellar predictions
-                # for param, pred in stellar_preds.items():
-                #     if torch.isnan(pred).any() or torch.isinf(pred).any():
-                #         print(f"Warning: NaN/inf detected in stellar prediction for {param}")
-                #         stellar_preds[param] = torch.zeros_like(pred)
-            outputs['stellar_predictions'] = stellar_preds
-        
-        return outputs
+        return self._add_common_outputs(h, outputs, batch={}, cfm_targets=None)
+
+    def _forward_no_cache_two_star(self, input_ids: torch.Tensor, 
+                                   star_a_features: torch.Tensor, star_b_features: torch.Tensor,
+                                   star_a_indices: torch.Tensor, star_b_indices: torch.Tensor) -> Dict[str, torch.Tensor]:
+        return self._forward_two_star_mode(
+            input_ids=input_ids,
+            star_a_features=star_a_features,
+            star_b_features=star_b_features,
+            star_a_indices=star_a_indices,
+            star_b_indices=star_b_indices,
+            start_pos=0,
+            use_cache=False,
+        )
 
     def _attn_no_cache(self, x: torch.Tensor, freqs_cis: torch.Tensor,
                         mask: Optional[torch.Tensor], attention_layer) -> torch.Tensor:
@@ -763,23 +954,7 @@ class MultimodalLlamaModelMultiTokens(nn.Module):
             answer_start_raw = batch_data['answer_start_indices'][batch_idx]
             answer_start_idx = answer_start_raw.item() if isinstance(answer_start_raw, torch.Tensor) else int(answer_start_raw)
 
-        # Handle different batch formats (mixed vs single dataset)
-        if 'input_texts' in batch_data:
-            # Single dataset format
-            input_text = batch_data.get('input_texts', [''])[batch_idx]
-            target_text = batch_data.get('target_texts', [''])[batch_idx]
-        elif 'metadata' in batch_data and batch_data['metadata']:
-            # Mixed dataset format
-            meta = batch_data['metadata'][batch_idx]
-            if meta and 'raw' in meta:
-                input_text = meta.get('input_text', '')
-                target_text = meta.get('target_text', '')
-            else:
-                input_text = ''
-                target_text = ''
-        else:
-            input_text = ''
-            target_text = ''
+        input_text, target_text = self._extract_text_fields(batch_data, batch_idx)
 
         # Prompt = features + question (truncate before answer start)
         prompt = input_ids[:, :max(1, min(answer_start_idx, input_ids.shape[1]))].clone()
