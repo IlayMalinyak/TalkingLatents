@@ -5,7 +5,8 @@ pretrained_models/
 checkpoints/
 llama_url.txt
 google_api.txt
-
+baseline_followup*/
+cycle_fusion.md
 # Specific files
 data/dataset_noiseless.tar.gz
 data/dataset_noiseless/

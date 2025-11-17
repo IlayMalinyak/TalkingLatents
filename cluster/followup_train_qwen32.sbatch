@@ -11,6 +11,7 @@
   #SBATCH --cpus-per-task=8
   #SBATCH --gpus-per-node=a100:2
   #SBATCH --qos=basic
+  #SBATCH --mem=64G
 
   # Optional: Hugging Face caches on fast storage
 
@@ -18,6 +19,11 @@
   export TRANSFORMERS_CACHE=${TRANSFORMERS_CACHE:-$HF_HOME/transformers}
   export HF_DATASETS_CACHE=${HF_DATASETS_CACHE:-$HF_HOME/datasets}
   export HUGGINGFACE_HUB_CACHE=${HUGGINGFACE_HUB_CACHE:-$HF_HOME/hub}
+
+  # Memory/allocator hints (safe defaults)
+  export PYTORCH_CUDA_ALLOC_CONF=${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}
+  # Allow CPU offload headroom when using HF device_map=auto
+  export HF_CPU_OFFLOAD_GB=${HF_CPU_OFFLOAD_GB:-64}
 
   # Base paths
 
@@ -36,9 +42,20 @@
   TOKS=${TOKS:-8}
   LAMBDA=${LAMBDA:-1.0}
 
+  # Quick GPU visibility sanity check inside the container
   srun --kill-on-bad-exit=1 \
   --container-image="/rg/perets_prj/ilay.kamai/containers/astro2.sqsh" \
-  --mem=64G \
+  --no-container-entrypoint \
+  --container-mounts=/home/ilay.kamai/work:/data \
+  bash -lc 'echo "=== NVIDIA SMI ==="; nvidia-smi || true; echo "=== PyTorch CUDA ==="; python - <<PY
+import torch
+print("CUDA available:", torch.cuda.is_available())
+print("CUDA devices:", torch.cuda.device_count())
+print("Device names:", [torch.cuda.get_device_name(i) for i in range(torch.cuda.device_count())])
+PY'
+
+  srun --kill-on-bad-exit=1 \
+  --container-image="/rg/perets_prj/ilay.kamai/containers/astro2.sqsh" \
   --output=/home/ilay.kamai/athena/logs/%x_%j_%s_%t.out \
   --error=/home/ilay.kamai/athena/logs/%x_%j_%s_%t.err \
   --no-container-entrypoint \
@@ -47,10 +64,10 @@
   --llm_backend qwen \
   --hf_model_name Qwen/Qwen2.5-32B-Instruct \
   --hf_quantization 4bit \
-  --hf_max_memory_gb 38 \
+  --hf_max_memory_gb 35 \
   --hf_device_map auto \
   --hf_trust_remote_code \
-  --hf_max_memory_gb 38 \
+  \
   --json_file "${JSON_FILE}" \
   --mode single_star \
   --single_dataset_type regular \

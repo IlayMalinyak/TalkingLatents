@@ -6,7 +6,7 @@
 #SBATCH --cpus-per-task=16
 #SBATCH --mem=128G
 #SBATCH --partition=l40s-shared
-#SBATCH --qos=72h_8g
+#SBATCH --qos=24h_4g
 #SBATCH -t 24:00:00
 
 set -euo pipefail

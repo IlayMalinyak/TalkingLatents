@@ -13,7 +13,7 @@ import os
 import random
 import sys
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
 import torch
@@ -199,10 +199,134 @@ def run_late_fusion(
             "masked_spectra": masked_spectra.to(device),
         }
         outputs = model(batch)
+    # Keep both a tensor version (for generation) and a JSON-friendly version
+    prefix_embeds = outputs.get("prefix_embeddings")
+    prefix_embeds_list = (
+        prefix_embeds.detach().cpu().tolist() if isinstance(prefix_embeds, torch.Tensor) else None
+    )
     return {
         "spectral_prediction": outputs["spectral_reconstruction"][0].detach().cpu().tolist(),
-        "prefix_embeddings": outputs.get("prefix_embeddings", torch.zeros(1)).detach().cpu().tolist(),
+        "prefix_embeddings_tensor": prefix_embeds,
+        "prefix_embeddings": prefix_embeds_list,
     }
+
+
+@torch.no_grad()
+def _llama_forward_from_embeds(base_model, inputs_embeds: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+    """
+    Run a LLaMA forward pass given input embeddings. Returns (hidden, logits).
+    """
+    hidden = inputs_embeds
+    seqlen = hidden.size(1)
+    device = hidden.device
+
+    # Causal mask
+    mask = None
+    if seqlen > 1:
+        mask = torch.full((seqlen, seqlen), float("-inf"), device=device)
+        mask = torch.triu(mask, diagonal=1).to(hidden.dtype)
+
+    # Rotary frequencies
+    start_pos = 0
+    base_model.freqs_cis = base_model.freqs_cis.to(device)
+    freqs_cis = base_model.freqs_cis[start_pos : start_pos + seqlen]
+
+    # Transformer layers
+    for layer in base_model.layers:
+        hidden = layer(hidden, start_pos, freqs_cis, mask)
+    hidden = base_model.norm(hidden)
+    logits = base_model.output(hidden).float()
+    return hidden, logits
+
+
+@torch.no_grad()
+def generate_text_with_prefix(
+    model: LateFusionModel,
+    tokenizer: Tokenizer,
+    prompt_ids: torch.Tensor,
+    prefix_embeddings: torch.Tensor,
+    max_new_tokens: int = 64,
+    temperature: float = 0.7,
+    top_p: float = 0.9,
+) -> str:
+    """
+    Generate text by prepending learned prefix embeddings to the token embeddings of the prompt.
+    Supports LLaMA backends directly; for HF backends, falls back to generate(inputs_embeds=...).
+    """
+    device = next(model.parameters()).device
+    base_llm = getattr(model.llm_model, "base_model", model.llm_model)
+
+    # Ensure correct dtypes/devices
+    tok_embed = base_llm.tok_embeddings(prompt_ids.to(device))
+    if prefix_embeddings is None:
+        inputs_embeds = tok_embed
+    else:
+        # Concatenate prefix in front of the prompt embeddings
+        inputs_embeds = torch.cat([
+            prefix_embeddings.to(device, dtype=tok_embed.dtype),
+            tok_embed,
+        ], dim=1)
+        # Important: many LLaMA cache implementations preallocate a fixed number of
+        # rows tied to the original prompt length. Keep the total initial context
+        # length equal to the prompt length by trimming the tail (typically padding).
+        max_context = tok_embed.size(1)
+        if inputs_embeds.size(1) > max_context:
+            inputs_embeds = inputs_embeds[:, :max_context, :]
+
+    # Simple decode loop: re-run full context each step (ok for analysis/inference)
+    generated: List[int] = []
+    pad_id = getattr(tokenizer, "pad_id", 0)
+    eos_id = getattr(tokenizer, "eos_id", None)
+
+    def sample_top_p(logits_row: torch.Tensor) -> int:
+        logits_row = torch.clamp(logits_row, min=-1e4, max=1e4)
+        if temperature > 0:
+            logits_row = logits_row / temperature
+        logits_row = logits_row - logits_row.max()
+        probs = torch.softmax(logits_row, dim=-1)
+        if 0 < top_p < 1.0:
+            sorted_probs, sorted_idx = torch.sort(probs, descending=True)
+            cdf = torch.cumsum(sorted_probs, dim=-1)
+            cutoff = int((cdf > top_p).float().argmax().item())
+            cutoff = max(1, cutoff)
+            sorted_probs = sorted_probs[:cutoff]
+            sorted_idx = sorted_idx[:cutoff]
+            sorted_probs = sorted_probs / (sorted_probs.sum() + 1e-8)
+            next_local = torch.multinomial(sorted_probs, 1).item()
+            return int(sorted_idx[next_local].item())
+        return int(torch.multinomial(probs, 1).item())
+
+    # Helper to reset KV cache to the current context length to avoid size mismatches
+    def _reset_kv_cache(cur_len: int) -> None:
+        for layer in getattr(base_llm, "layers", []):
+            attn = getattr(layer, "attention", None)
+            if attn is None:
+                continue
+            n_kv = getattr(attn, "n_local_kv_heads", None)
+            hd = getattr(attn, "head_dim", None)
+            if n_kv is None or hd is None:
+                continue
+            # cache layout: [batch, seq, heads, head_dim]
+            cache_shape = (1, cur_len, int(n_kv), int(hd))
+            dtype = inputs_embeds.dtype
+            attn.cache_k = torch.zeros(cache_shape, device=device, dtype=dtype)
+            attn.cache_v = torch.zeros(cache_shape, device=device, dtype=dtype)
+
+    for _ in range(max_new_tokens):
+        _reset_kv_cache(inputs_embeds.size(1))
+        _, logits = _llama_forward_from_embeds(base_llm, inputs_embeds)
+        next_token_logits = logits[:, -1, :].squeeze(0)
+        next_id = sample_top_p(next_token_logits)
+        generated.append(next_id)
+
+        if eos_id is not None and next_id == eos_id:
+            break
+
+        next_id_tensor = torch.tensor([[next_id]], device=device, dtype=prompt_ids.dtype)
+        next_embed = base_llm.tok_embeddings(next_id_tensor)
+        inputs_embeds = torch.cat([inputs_embeds, next_embed], dim=1)
+
+    return tokenizer.decode(generated) if generated else ""
 
 
 def main() -> None:
@@ -283,6 +407,19 @@ def main() -> None:
                 device,
             )
 
+            # Text generation using prefix embeddings
+            base_generated = ""
+            if base_prediction.get("prefix_embeddings_tensor") is not None:
+                base_generated = generate_text_with_prefix(
+                    model,
+                    tokenizer,
+                    base_ids,
+                    base_prediction["prefix_embeddings_tensor"],
+                    max_new_tokens=50,
+                    temperature=0.7,
+                    top_p=0.9,
+                )
+
             star_params = extract_params(stellar_data)
             followup_specs = create_follow_up_specs(
                 star_params,
@@ -306,11 +443,23 @@ def main() -> None:
                     masked_spectra,
                     device,
                 )
+                follow_generated = ""
+                if follow_pred.get("prefix_embeddings_tensor") is not None:
+                    follow_generated = generate_text_with_prefix(
+                        model,
+                        tokenizer,
+                        follow_ids,
+                        follow_pred["prefix_embeddings_tensor"],
+                        max_new_tokens=50,
+                        temperature=0.7,
+                        top_p=0.9,
+                    )
                 followup_turns.append(
                     {
                         "question": question,
                         "template_answer": spec.get("answer"),
                         "spectral_prediction": follow_pred["spectral_prediction"],
+                        "generated_text": follow_generated,
                     }
                 )
                 conversation_text = appended
@@ -320,6 +469,7 @@ def main() -> None:
                 "obsid": batch["obsids"][idx],
                 "base_text": base_text,
                 "base_prediction": base_prediction["spectral_prediction"],
+                "base_generated_text": base_generated,
                 "follow_up_turns": followup_turns,
             }
             results.append(sample_result)
