@@ -41,10 +41,10 @@ def make_base_args(output_dir: str) -> Any:
     args.mode = 'single_star'                # Ablation focuses on single-star description QA
     args.batch_size = 8
     args.num_epochs = 2
-    args.max_iter = 500                      # Constrain iterations per epoch (trainer reshuffles each epoch)
+    args.max_iter = 5000                      # Constrain iterations per epoch (trainer reshuffles each epoch)
     args.random_seed = 123
     args.num_spectral_features = 4
-    args.max_seq_length = 512
+    args.max_seq_length = 128
 
     # Keep training stable but light
     args.use_amp = True
