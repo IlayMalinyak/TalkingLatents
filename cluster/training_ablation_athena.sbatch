@@ -1,5 +1,5 @@
 #!/bin/bash
-#SBATCH --job-name=TL_late_fusion
+#SBATCH --job-name=TL_ablation
 #SBATCH --nodes=1
 #SBATCH --ntasks=1                   
 #SBATCH --gres=gpu:nvidia_l40s:4
@@ -34,4 +34,4 @@ srun --ntasks=$SLURM_NNODES --ntasks-per-node=1 \
        --node_rank=${SLURM_NODEID:-0} \
        --master_addr=${MASTER_ADDR} \
        --master_port=${MASTER_PORT} \
-        /data/TalkingLatents/src/late_fusion.py
+        /data/TalkingLatents/src/training_ablation.py

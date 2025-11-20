@@ -184,6 +184,18 @@ def build_dataloaders(data_cfg: Dict[str, Any], world_size: int):
     if cache_dir:
         dataset_kwargs["cache_dir"] = str(cache_dir)
 
+    # Cycle-fusion follow-up controls (optional)
+    if data_cfg.get("use_followups") is not None:
+        dataset_kwargs["use_followups"] = bool(data_cfg.get("use_followups"))
+    if data_cfg.get("followup_prob") is not None:
+        dataset_kwargs["followup_prob"] = float(data_cfg.get("followup_prob"))
+    if data_cfg.get("max_followups") is not None:
+        dataset_kwargs["max_followups"] = int(data_cfg.get("max_followups"))
+    if data_cfg.get("followup_seed") is not None:
+        dataset_kwargs["followup_seed"] = int(data_cfg.get("followup_seed"))
+    if data_cfg.get("append_answer_prompt") is not None:
+        dataset_kwargs["append_answer_prompt"] = bool(data_cfg.get("append_answer_prompt"))
+
     train_loader, val_loader, test_loader = create_late_fusion_dataloaders(
         json_file=str(resolve_path(data_cfg["json_file"])),
         batch_size=data_cfg.get("batch_size", 4),
@@ -259,6 +271,105 @@ def main():
     data_cfg = config.get("data", {})
     train_loader, val_loader, _ = build_dataloaders(data_cfg, world_size)
 
+    # Print sample follow-up questions before training
+    if (not distributed) or local_rank == 0:
+        print("\n" + "="*80)
+        print("SAMPLE FOLLOW-UP QUESTIONS AND ANSWERS")
+        print("="*80)
+
+        # Load tokenizer for decoding
+        tokenizer_path = resolve_path(data_cfg.get("tokenizer_path"))
+        tokenizer = None
+        if tokenizer_path and tokenizer_path.exists():
+            try:
+                from llama3.llama.tokenizer import Tokenizer
+                tokenizer = Tokenizer(model_path=str(tokenizer_path))
+                print(f"✓ Loaded tokenizer from {tokenizer_path}")
+            except Exception as e:
+                print(f"⚠ Could not load tokenizer: {e}")
+
+        # Sample a few batches
+        sample_count = 0
+        max_samples = 3
+
+        for batch_idx, batch in enumerate(train_loader):
+            if sample_count >= max_samples:
+                break
+
+            # Check if batch has follow-up data
+            has_followup = batch.get("has_followup")
+            if has_followup is None:
+                continue
+
+            fq_ids = batch.get("followup_question_ids")
+            fa_ids = batch.get("followup_answer_ids")
+
+            if fq_ids is None or fa_ids is None:
+                continue
+
+            # Print examples from this batch
+            batch_size = fq_ids.size(0)
+            for i in range(min(batch_size, max_samples - sample_count)):
+                if has_followup[i].item() == 0:
+                    continue
+
+                sample_count += 1
+                print(f"\n--- Sample {sample_count} ---")
+
+                # Print original text (description) that enters the Perceiver
+                if "texts" in batch and len(batch["texts"]) > i:
+                    original_text = batch["texts"][i]
+                    print(f"Original Description (Perceiver input):")
+                    print(f"  {original_text}")
+                    print()
+
+                # Decode question
+                q_tokens = fq_ids[i].cpu().tolist()
+                if tokenizer:
+                    # Remove padding (0s) and invalid tokens (negative values)
+                    q_tokens_clean = [t for t in q_tokens if t > 0]
+                    q_text = tokenizer.decode(q_tokens_clean)
+                else:
+                    q_text = f"Token IDs: {q_tokens[:20]}..."
+
+                print(f"Question: {q_text}")
+
+                # Decode answer
+                a_tokens = fa_ids[i].cpu().tolist()
+                if tokenizer:
+                    # Remove padding (0s) and invalid tokens (negative values)
+                    a_tokens_clean = [t for t in a_tokens if t > 0]
+                    a_text = tokenizer.decode(a_tokens_clean)
+                else:
+                    a_text = f"Token IDs: {a_tokens[:20]}..."
+
+                print(f"Answer: {a_text}")
+
+                # Detect followup type based on answer content
+                followup_type = "unknown"
+                if "dwarf" in a_text.lower() or "giant" in a_text.lower() or "supergiant" in a_text.lower():
+                    if len(a_text.split()) < 10:  # Short answer
+                        followup_type = "stellar_type"
+                    else:
+                        followup_type = "description"
+                elif "this star" in a_text.lower() or "consistent with" in a_text.lower():
+                    followup_type = "description"
+
+                print(f"Followup Type: {followup_type}")
+
+                # Print stellar data if available
+                if "stellar_data" in batch:
+                    stellar_info = batch["stellar_data"][i]
+                    print(f"Stellar Data: {stellar_info}")
+
+                if sample_count >= max_samples:
+                    break
+
+        if sample_count == 0:
+            print("⚠ No follow-up questions found in training data!")
+
+        print("="*80 + "\n")
+
     llm_args = build_llm_args(config.get("llm", {}), data_cfg)
     llm_model = _load_llm_model(llm_args)
     apply_precision(llm_model, config.get("llm", {}).get("llm_precision", "fp16"))
@@ -308,6 +419,15 @@ def main():
         save_full_every_epoch=training_cfg.get("save_full_every_epoch", True),
         log_loss_every=training_cfg.get("log_losses_every"),
     )
+
+    # Optional CE warmup schedule for cycle-fusion
+    ce_cfg = training_cfg.get("ce", {}) or {}
+    trainer.ce_schedule = {
+        "enable": bool(ce_cfg.get("enable", perceiver_config.get("enable_cycle_ce", False))),
+        "target_weight": float(ce_cfg.get("target_weight", 1.0)),
+        "warmup_epochs": int(ce_cfg.get("warmup_epochs", 0)),
+        "start_epoch": int(ce_cfg.get("start_epoch", 0)),
+    }
 
     resume_info = None
     if args.resume:

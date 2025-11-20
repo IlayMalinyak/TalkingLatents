@@ -9,6 +9,7 @@ import torch.nn.functional as F
 from nn.perceiver_decoder import SpectralDecoder
 from nn.perceiver_io import PerceiverEncoder
 from nn.DualFormer.dual_attention import DualFormerForJointEmbedding
+from llama3.llama.model import precompute_freqs_cis
 
 
 class LateFusionModel(nn.Module):
@@ -37,8 +38,10 @@ class LateFusionModel(nn.Module):
         self.spectral_target_dim = config.get("spectral_target_dim", config["spectral_feature_dim"])
         self.spectral_token_count = int(config.get("spectral_token_count", 1))
         self.loss_weights = config.get(
-            "loss_weights", {"reconstruction": 1.0, "contrastive": 1.0}
+            "loss_weights", {"reconstruction": 1.0, "contrastive": 1.0, "ce": 1.0}
         )
+        # Cycle-fusion CE branch enable flag
+        self.enable_cycle_ce = bool(config.get("enable_cycle_ce", False))
         self.modality_dropout_cfg = config.get(
             "modality_dropout",
             {"enabled": False, "drop_text_prob": 0.0, "drop_spectra_prob": 0.0},
@@ -134,7 +137,14 @@ class LateFusionModel(nn.Module):
             attn_dropout=config.get("attn_dropout", 0.0),
         )
 
-        self.llm_adapter = nn.Linear(self.d_model, self.d_llm)
+        self.llm_adapter = nn.Sequential(
+            nn.LayerNorm(self.d_model),
+            nn.Linear(self.d_model, self.d_model * 2),
+            nn.GELU(),
+            nn.Dropout(config.get("dropout", 0.1)),
+            nn.Linear(self.d_model * 2, self.d_llm),
+            nn.LayerNorm(self.d_llm),
+        )
         self.alignment_pool = nn.Sequential(
             nn.LayerNorm(self.d_model),
             nn.Linear(self.d_model, projector_hidden),
@@ -177,6 +187,94 @@ class LateFusionModel(nn.Module):
             self.contrastive_queue_filled = None
 
         self._ensure_perceiver_fp32()
+
+    def _llama_forward_from_embeds(self, inputs_embeds: torch.Tensor, attn_mask: Optional[torch.Tensor] = None) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Differentiable LLaMA forward from precomputed input embeddings.
+        Returns (hidden, logits)."""
+        base = getattr(self.llm_model, "base_model", self.llm_model)
+        hidden = inputs_embeds
+        seqlen = hidden.size(1)
+        device = hidden.device
+
+        # Causal mask
+        mask = None
+        if seqlen > 1:
+            mask = torch.full((seqlen, seqlen), float("-inf"), device=device)
+            mask = torch.triu(mask, diagonal=1).to(hidden.dtype)
+        # Rotary frequencies (ensure capacity)
+        start_pos = 0
+        if hasattr(base, 'params') and hasattr(base.params, 'dim') and hasattr(base.params, 'n_heads'):
+            head_dim = base.params.dim // base.params.n_heads
+        else:
+            # Fallback: infer from existing cache
+            head_dim = base.freqs_cis.shape[1]
+        if seqlen > base.freqs_cis.shape[0]:
+            new_len = max(seqlen, base.freqs_cis.shape[0] * 2)
+            base.freqs_cis = precompute_freqs_cis(head_dim, new_len, getattr(base.params, 'rope_theta', 10000.0)).to(base.freqs_cis.device)
+        base.freqs_cis = base.freqs_cis.to(device)
+        freqs_cis = base.freqs_cis[start_pos : start_pos + seqlen]
+        # Ensure KV-cache capacity matches (batch, seqlen)
+        bsz = hidden.size(0)
+        for layer in base.layers:
+            attn = getattr(layer, 'attention', None)
+            if attn is None:
+                continue
+            cache_k = getattr(attn, 'cache_k', None)
+            cache_v = getattr(attn, 'cache_v', None)
+            if cache_k is None or cache_v is None:
+                continue
+            need_b = bsz
+            need_t = seqlen
+            cur_b = cache_k.shape[0]
+            cur_t = cache_k.shape[1]
+            if need_b != cur_b or need_t != cur_t:
+                new_shape = (need_b, need_t, cache_k.shape[2], cache_k.shape[3])
+                new_k = cache_k.new_zeros(new_shape)
+                new_v = cache_v.new_zeros(new_shape)
+                # Copy overlap region if any
+                copy_b = min(cur_b, need_b)
+                copy_t = min(cur_t, need_t)
+                if copy_b > 0 and copy_t > 0:
+                    new_k[:copy_b, :copy_t] = cache_k[:copy_b, :copy_t]
+                    new_v[:copy_b, :copy_t] = cache_v[:copy_b, :copy_t]
+                attn.cache_k = new_k
+                attn.cache_v = new_v
+
+        # Transformer layers
+        for layer in base.layers:
+            hidden = layer(hidden, start_pos, freqs_cis, mask)
+        hidden = base.norm(hidden)
+        logits = base.output(hidden).float()
+        # Detach KV caches to avoid holding computation graphs across steps
+        for layer in base.layers:
+            attn = getattr(layer, 'attention', None)
+            if attn is None:
+                continue
+            if hasattr(attn, 'cache_k') and isinstance(attn.cache_k, torch.Tensor):
+                attn.cache_k = attn.cache_k.detach()
+            if hasattr(attn, 'cache_v') and isinstance(attn.cache_v, torch.Tensor):
+                attn.cache_v = attn.cache_v.detach()
+        return hidden, logits
+
+    def _hf_forward_from_embeds(self, inputs_embeds: torch.Tensor, attention_mask: Optional[torch.Tensor] = None) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Differentiable HF forward from embeddings; returns (hidden, logits)."""
+        model = getattr(self.llm_model, "base_model", self.llm_model)
+        kwargs = {
+            "inputs_embeds": inputs_embeds,
+            "use_cache": False,
+            "output_hidden_states": True,
+        }
+        if attention_mask is not None:
+            kwargs["attention_mask"] = attention_mask
+        outputs = model(**kwargs)
+        hidden = getattr(outputs, "last_hidden_state", outputs[0])
+        logits = getattr(outputs, "logits", None)
+        if logits is None:
+            lm_head = getattr(model, "lm_head", None)
+            if lm_head is None:
+                raise ValueError("HF model output lacks logits and no lm_head is available.")
+            logits = lm_head(hidden)
+        return hidden, logits.float()
 
     def _ensure_perceiver_fp32(self) -> None:
         """Keep Perceiver stack and adapters in float32 for stability."""
@@ -390,6 +488,9 @@ class LateFusionModel(nn.Module):
         g_text = g_text.detach()
         g_spec = g_spec.detach()
         batch_size = g_text.size(0)
+        # Always store detached copies to avoid holding autograd graphs across steps
+        g_text = g_text.detach()
+        g_spec = g_spec.detach()
         max_size = self.contrastive_queue_size
         ptr = int(self.contrastive_queue_ptr.item())
 
@@ -652,6 +753,71 @@ class LateFusionModel(nn.Module):
             outputs["contrastive_loss"] = clip_loss
 
             total_loss = total_loss + self.loss_weights.get("contrastive", 1.0) * clip_loss
+
+        # Optional: Cycle-fusion CE branch using follow-up QA
+        if self.enable_cycle_ce and ("followup_question_ids" in batch) and ("followup_answer_ids" in batch):
+            fq_ids = batch["followup_question_ids"].to(device)
+            fa_ids = batch["followup_answer_ids"].to(device)
+            if fq_ids.dim() == 1:
+                fq_ids = fq_ids.unsqueeze(0)
+            if fa_ids.dim() == 1:
+                fa_ids = fa_ids.unsqueeze(0)
+            prefix = outputs.get("prefix_embeddings", None)
+            if prefix is None:
+                # If not computed (e.g., alignment-only), derive from latents via llm_adapter when available
+                latents = outputs.get("latents")
+                if latents is not None:
+                    prefix = self._safe_tensor(self.llm_adapter(latents))
+            if prefix is not None:
+                # Build combined prompt+answer ids for teacher forcing
+                full_ids = torch.cat([fq_ids, fa_ids], dim=1)
+                # Token embeddings from LLM
+                base_llm = getattr(self.llm_model, "base_model", self.llm_model)
+                tok_embeds = base_llm.tok_embeddings(full_ids.to(device))
+                # Concatenate prefix embeddings; trim/pad to fit context window of token embeddings
+                inputs_embeds = torch.cat([prefix.to(device, dtype=tok_embeds.dtype), tok_embeds], dim=1)
+                # Build attention mask: 1s for prefix + non-pad for ids
+                pad_id = 0
+                attn_mask_ids = (full_ids != pad_id).long()
+                prefix_mask = torch.ones(prefix.size(0), prefix.size(1), device=device, dtype=torch.long)
+                attention_mask = torch.cat([prefix_mask, attn_mask_ids.to(device)], dim=1)
+                # Choose backend path
+                if hasattr(base_llm, "get_input_embeddings"):
+                    hidden2, logits2 = self._hf_forward_from_embeds(inputs_embeds, attention_mask)
+                else:
+                    hidden2, logits2 = self._llama_forward_from_embeds(inputs_embeds, attention_mask)
+                # Build labels: ignore prefix+question; supervise answer tokens only
+                B, Ltot, V = logits2.shape
+                prefix_len = prefix.size(1)
+                q_len = fq_ids.size(1)
+                a_len = fa_ids.size(1)
+                labels = torch.full((B, prefix_len + q_len + a_len), -100, device=device, dtype=torch.long)
+                ans_slice = slice(prefix_len + q_len, prefix_len + q_len + a_len)
+                labels[:, ans_slice] = fa_ids.to(device)
+                # Sanitize answer labels: mask invalid or padding ids to -100
+                # Resolve model vocab size and pad id if available
+                vocab_size = None
+                pad_id = 0
+                base_params = getattr(base_llm, 'params', None)
+                if base_params is not None:
+                    vocab_size = getattr(base_params, 'vocab_size', None)
+                if vocab_size is None and hasattr(base_llm, 'config'):
+                    vocab_size = getattr(base_llm.config, 'vocab_size', None)
+                    pad_id = getattr(base_llm.config, 'pad_token_id', pad_id)
+                if vocab_size is None:
+                    # Fallback to logits vocab dim
+                    vocab_size = V
+                ans_labels = labels[:, ans_slice]
+                invalid = (ans_labels < 0) | (ans_labels >= vocab_size)
+                if pad_id is not None:
+                    invalid = invalid | (ans_labels == pad_id)
+                labels[:, ans_slice][invalid] = -100
+                # Standard shifted CE
+                shift_logits = logits2[..., :-1, :].contiguous()
+                shift_labels = labels[..., 1:].contiguous()
+                ce_loss = F.cross_entropy(shift_logits.view(-1, V), shift_labels.view(-1), ignore_index=-100)
+                outputs["ce_loss"] = ce_loss
+                total_loss = total_loss + self.loss_weights.get("ce", 1.0) * ce_loss
 
         outputs["total_loss"] = total_loss
         outputs["dropped_modality"] = dropped_flag

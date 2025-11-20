@@ -1546,7 +1546,7 @@ class LLMTrainer(Trainer):
         return super().eval_epoch(device, epoch)
         
     def evaluate_validation_samples(self, device, epoch, num_samples=3,
-                                    max_new_tokens=50, temperature=0.2, top_p=0.8):
+                                    max_new_tokens=128, temperature=0.2, top_p=0.8):
         """
         Evaluate model on actual validation samples with both teacher-forcing and generation perplexity
         """
@@ -2555,12 +2555,12 @@ class LateFusionTrainer(Trainer):
     def _record_train_metrics(self, outputs: Dict[str, torch.Tensor]) -> None:
         self.train_aux_loss_1.append(self._loss_value(outputs, "reconstruction_loss"))
         self.train_aux_loss_2.append(self._loss_value(outputs, "contrastive_loss"))
-        self.train_aux_loss_3.append(0.0)
+        self.train_aux_loss_3.append(self._loss_value(outputs, "ce_loss"))
 
     def _record_val_metrics(self, outputs: Dict[str, torch.Tensor]) -> None:
         self.val_aux_loss_1.append(self._loss_value(outputs, "reconstruction_loss"))
         self.val_aux_loss_2.append(self._loss_value(outputs, "contrastive_loss"))
-        self.val_aux_loss_3.append(0.0)
+        self.val_aux_loss_3.append(self._loss_value(outputs, "ce_loss"))
 
     def _maybe_log_losses(self, outputs: Dict[str, torch.Tensor], batch_idx: int, split: str) -> None:
         if not self.log_loss_every or self.log_loss_every <= 0:
@@ -2571,13 +2571,41 @@ class LateFusionTrainer(Trainer):
             return
         recon = outputs.get("reconstruction_loss")
         contrast = outputs.get("contrastive_loss")
+        ce = outputs.get("ce_loss")
         recon_val = float(recon.detach().cpu().item()) if recon is not None else 0.0
         contrast_val = float(contrast.detach().cpu().item()) if contrast is not None else 0.0
+        ce_val = float(ce.detach().cpu().item()) if ce is not None else 0.0
         print(
             f"[{split} step {batch_idx+1}] reconstruction_loss={recon_val:.6f}, "
-            f"contrastive_loss={contrast_val:.6f}",
+            f"contrastive_loss={contrast_val:.6f}, ce_loss={ce_val:.6f}",
             flush=True,
         )
+
+    def train_epoch(self, device, epoch):
+        """Apply CE warmup schedule (if provided) before delegating to base epoch loop."""
+        try:
+            sched = getattr(self, 'ce_schedule', None)
+            model = self._unwrap_model()
+            if sched and getattr(model, 'enable_cycle_ce', False) and hasattr(model, 'loss_weights'):
+                enable = bool(sched.get('enable', True))
+                if enable:
+                    target = float(sched.get('target_weight', 1.0))
+                    warm = int(sched.get('warmup_epochs', 0))
+                    start = int(sched.get('start_epoch', 0))
+                    if epoch < start:
+                        w = 0.0
+                    elif warm > 0 and epoch < start + warm:
+                        w = target * float(epoch - start + 1) / float(warm)
+                    else:
+                        w = target
+                    prev = float(model.loss_weights.get('ce', 0.0))
+                    if abs(prev - w) > 1e-8:
+                        model.loss_weights['ce'] = w
+                        if (not torch.distributed.is_initialized()) or torch.distributed.get_rank() == 0:
+                            print(f"[LateFusionTrainer] Epoch {epoch}: set CE weight to {w:.4f}")
+        except Exception:
+            pass
+        return super().train_epoch(device, epoch)
 
     def train_batch(self, batch, batch_idx, device):
         batch = self._move_to_device(batch, device)

@@ -43,6 +43,45 @@ def _format_param_value(value: Optional[float], param: str) -> Optional[str]:
     return f"{value:.2f}"
 
 
+def _infer_stellar_type(params: Dict[str, Optional[float]]) -> str:
+    """Infer stellar type from Teff and logg."""
+    teff = params.get('Teff')
+    logg = params.get('logg')
+
+    if teff is None or math.isnan(teff):
+        return "Unknown type"
+    if logg is None or math.isnan(logg):
+        logg = 4.0  # Assume main sequence if unknown
+
+    # Determine spectral class from Teff
+    if teff >= 7500:
+        spectral = 'A'
+    elif teff >= 6000:
+        spectral = 'F'
+    elif teff >= 5200:
+        spectral = 'G'
+    elif teff >= 3700:
+        spectral = 'K'
+    else:
+        spectral = 'M'
+
+    # Determine luminosity class from logg
+    if logg < 1.0:
+        lum_class = 'I'
+        lum_name = 'supergiant'
+    elif logg < 3.0:
+        lum_class = 'III'
+        lum_name = 'giant'
+    elif logg < 4.0:
+        lum_class = 'IV'
+        lum_name = 'subgiant'
+    else:
+        lum_class = 'V'
+        lum_name = 'dwarf'
+
+    return f"{spectral}-type {lum_name}"
+
+
 def _describe_star(params: Dict[str, Optional[float]]) -> str:
     fragments: List[str] = []
     for param in ['Teff', 'logg', 'FeH']:
@@ -71,21 +110,20 @@ def _build_star_type_spec(params: Dict[str, Optional[float]],
                           include_answer: bool) -> Optional[Dict[str, str]]:
     if not params:
         return None
-    snippets = []
-    for param in ['Teff', 'logg', 'FeH']:
-        val = params.get(param)
-        if val is None or math.isnan(val):
-            continue
-        label = rng.choice(PARAM_SYNONYMS[param])
-        formatted = _format_param_value(val, param)
-        if formatted:
-            snippets.append(f"{label} ≈ {formatted}")
-    descriptor = "; ".join(snippets) if snippets else "the provided observational context"
-    openings = ["Given", "Considering", "With respect to", "Based on"]
-    question = f"{rng.choice(openings)} {descriptor}, what stellar classification best describes this object?"
+
+    # Simple questions without parameter values
+    question_templates = [
+        "What stellar classification best describes this object?",
+        "What stellar type best describes this object?",
+        "What is the stellar classification of this object?",
+        "What is the stellar type of this object?",
+    ]
+    question = rng.choice(question_templates)
+
     spec = {'type': 'star_type', 'question': question}
     if include_answer:
-        spec['answer'] = _describe_star(params)
+        # Short answer: just the stellar type
+        spec['answer'] = _infer_stellar_type(params)
     return spec
 
 

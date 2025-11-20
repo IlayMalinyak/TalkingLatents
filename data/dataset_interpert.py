@@ -33,19 +33,22 @@ class StellarQuestionsDataset(Dataset):
     """
     PyTorch Dataset for stellar descriptions and optional spectral features
     Now includes tokenization for LLaMA
-    
+
     Args:
         json_file (str): Path to the JSON file with stellar data
         features_array (Optional[np.ndarray]): Optional array of spectral features
         split (str): One of 'train', 'val', 'test'
         train_ratio (float): Proportion for training set
-        val_ratio (float): Proportion for validation set  
+        val_ratio (float): Proportion for validation set
         test_ratio (float): Proportion for test set (remaining after train/val)
         random_state (int): Random seed for reproducible splits
         filter_valid_descriptions (bool): Whether to filter out samples with no description
         cache_dir (Optional[str]): Directory to cache split indices for consistency
         tokenizer_path (Optional[str]): Path to SentencePiece tokenizer model
         max_length (int): Maximum sequence length for tokenization
+        enable_followup (bool): Whether to append follow-up questions
+        followup_json_file (Optional[str]): Path to second JSON for description-based follow-ups
+        followup_mode (str): "stellar_type", "description", or "mixed" (50/50 default)
     """
     
     def __init__(self, 
@@ -70,7 +73,10 @@ class StellarQuestionsDataset(Dataset):
                  enable_followup: bool = False,
                  followup_prob: float = 0.0,
                  max_followup_turns: int = 1,
-                 followup_seed: int = 42):
+                 followup_seed: int = 42,
+                 # Optional second JSON for follow-up Q&A
+                 followup_json_file: Optional[str] = None,
+                 followup_mode: str = "mixed"):
         
         assert split in ['train', 'val', 'test'], f"Split must be 'train', 'val', or 'test', got {split}"
         assert abs(train_ratio + val_ratio + test_ratio - 1.0) < 1e-6, "Ratios must sum to 1.0"
@@ -96,8 +102,22 @@ class StellarQuestionsDataset(Dataset):
         self.enable_followup = enable_followup
         self.followup_prob = followup_prob
         self.max_followup_turns = max_followup_turns
+        self.followup_json_file = followup_json_file
+        self.followup_mode = followup_mode
         seed_offset = followup_seed + hash((split, random_state))
         self.followup_rng = random.Random(seed_offset)
+
+        # Load follow-up JSON if provided
+        self.followup_data = None
+        if self.followup_json_file and self.enable_followup:
+            self._load_followup_json()
+
+        # Print follow-up mode info
+        if self.enable_followup:
+            if self.followup_data is not None:
+                print(f"Follow-up mode: {self.followup_mode} (with {len(self.followup_data)} description samples loaded)")
+            else:
+                print(f"Follow-up mode: stellar_type only (no followup_json_file provided)")
         
         self.numeric_bounds = {
             'Teff': (3000.0, 7500.0),
@@ -119,6 +139,37 @@ class StellarQuestionsDataset(Dataset):
         self._create_splits(train_ratio, val_ratio, test_ratio, cache_dir)
         self._initialize_feature_normalizer(feature_stats)
         
+    def _load_followup_json(self):
+        """Load the follow-up JSON file for Q&A pairs."""
+        try:
+            with open(self.followup_json_file, 'r') as f:
+                self.followup_data = json.load(f)
+            print(f"Loaded {len(self.followup_data)} follow-up samples from {self.followup_json_file}")
+        except Exception as e:
+            print(f"Warning: Could not load follow-up JSON {self.followup_json_file}: {e}")
+            self.followup_data = None
+
+    def _get_followup_from_description(self, sample_idx: int) -> Optional[Tuple[str, str]]:
+        """Extract question and answer from the follow-up JSON file."""
+        if self.followup_data is None or sample_idx >= len(self.followup_data):
+            return None
+
+        followup_sample = self.followup_data[sample_idx]
+        description = followup_sample.get("description", "")
+
+        if not description:
+            return None
+
+        # Parse the description to get question and answer
+        parsed = self.parse_description_text(description)
+        question = parsed.get("question", "")
+        answer = parsed.get("answer", "")
+
+        if not question or not answer:
+            return None
+
+        return question, answer
+
     def _load_tokenizer(self):
         """Load SentencePiece tokenizer if available"""
         if self.tokenizer_path and os.path.exists(self.tokenizer_path):
@@ -224,17 +275,40 @@ class StellarQuestionsDataset(Dataset):
     def _append_followup_turns(self,
                                full_tokens: List[int],
                                target_tokens: List[int],
-                               stellar_params: Dict[str, Optional[float]]) -> None:
+                               stellar_params: Dict[str, Optional[float]],
+                               sample_idx: int = -1) -> None:
         if not self.enable_followup or self.followup_prob <= 0.0:
             return
         if self.followup_rng.random() > self.followup_prob:
             return
-        followups = create_follow_up_specs(
-            stellar_params,
-            self.followup_rng,
-            max_pairs=self.max_followup_turns,
-            include_answers=True,
-        )
+
+        # Decide which mode to use based on followup_mode
+        use_description = False
+        if self.followup_mode == "description" and self.followup_data is not None:
+            use_description = True
+        elif self.followup_mode == "mixed" and self.followup_data is not None:
+            # 50% probability for description, 50% for stellar type
+            use_description = self.followup_rng.random() < 0.5
+
+        followups = []
+
+        # Try to use description from follow-up JSON file
+        if use_description and sample_idx >= 0:
+            qa_pair = self._get_followup_from_description(sample_idx)
+            if qa_pair is not None:
+                question, answer = qa_pair
+                # Format as a followup spec for consistent processing
+                followups.append({'question': question, 'answer': answer})
+
+        # Generate stellar type questions from templates (if not using description or as fallback)
+        if not followups:
+            followups = create_follow_up_specs(
+                stellar_params,
+                self.followup_rng,
+                max_pairs=self.max_followup_turns,
+                include_answers=True,
+            )
+
         for spec in followups:
             question_text = f"\nFollow-up question: {spec['question']}\nAnswer:"
             q_tokens, _ = self._tokenize_text_no_pad(question_text, bos=False)
@@ -601,7 +675,7 @@ class StellarQuestionsDataset(Dataset):
         stellar_data = sample.get('stellar_data', {})
         stellar_params = self._extract_physical_params(stellar_data)
         if self.enable_followup:
-            self._append_followup_turns(full_sequence, target_sequence, stellar_params)
+            self._append_followup_turns(full_sequence, target_sequence, stellar_params, sample_idx)
 
         # Pad remaining space with -100 placeholders
         remaining_space = self.max_length - len(full_sequence)

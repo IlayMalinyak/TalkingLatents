@@ -19,12 +19,12 @@
   "freeze_spectral": true,
 
   "use_joint_encode": true,
-  "enable_alignment": false,
+  "enable_alignment": true,
   "contrastive_alignment_point": "pre",  
-  "w_clip_pre": 0.2,
+  "w_clip_pre": 1.0,
   "w_clip_post": 1.0,
   "contrastive": {
-    "loss_type": "dualformer",
+    "loss_type": "clip",
     "queue_size": 2048,
     "stop_gradient_branch": "none",
     "projection_hidden_dim": 1024,
