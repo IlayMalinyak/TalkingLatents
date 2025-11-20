@@ -28,10 +28,10 @@ srun --ntasks=$SLURM_NNODES --ntasks-per-node=1 \
      --output=/home/ilay.kamai/athena/logs/%x_%j_%N_%t.out \
      --error=/home/ilay.kamai/athena/logs/%x_%j_%N_%t.err \
      --container=/rg/perets_prj/ilay.kamai/containers/torch2.7-tf2.20-cu128.sif \
-     torchrun \
+     python -m torch.distributed.run \
        --nnodes=${SLURM_NNODES:-1} \
        --nproc_per_node=${SLURM_GPUS_ON_NODE:-4} \
        --node_rank=${SLURM_NODEID:-0} \
        --master_addr=${MASTER_ADDR} \
        --master_port=${MASTER_PORT} \
-        /data/TalkingLatents/src/late_fusion.py
+       /data/TalkingLatents/src/late_fusion.py

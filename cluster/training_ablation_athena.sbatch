@@ -14,7 +14,7 @@ set -euo pipefail
 export MASTER_ADDR=$(scontrol show hostnames "$SLURM_NODELIST" | head -n1)
 export MASTER_PORT=$((29500 + ${SLURM_JOB_ID} % 1000))
 
-export APPTAINER_BIND="$PRJ_WORKSPACE,work:/data"
+export APPTAINER_BIND="$PRJ_WORKSPACE:/data"
 
 # NCCL timeout settings to prevent hanging
 export NCCL_ASYNC_ERROR_HANDLING=1
@@ -28,10 +28,4 @@ srun --ntasks=$SLURM_NNODES --ntasks-per-node=1 \
      --output=/home/ilay.kamai/athena/logs/%x_%j_%N_%t.out \
      --error=/home/ilay.kamai/athena/logs/%x_%j_%N_%t.err \
      --container=/rg/perets_prj/ilay.kamai/containers/torch2.7-tf2.20-cu128.sif \
-     torchrun \
-       --nnodes=${SLURM_NNODES:-1} \
-       --nproc_per_node=${SLURM_GPUS_ON_NODE:-4} \
-       --node_rank=${SLURM_NODEID:-0} \
-       --master_addr=${MASTER_ADDR} \
-       --master_port=${MASTER_PORT} \
-        /data/TalkingLatents/src/training_ablation.py
+     python  /data/TalkingLatents/src/training_ablation.py

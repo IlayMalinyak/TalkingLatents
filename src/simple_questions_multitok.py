@@ -99,6 +99,7 @@ def parse_args(argv=None):
     
     # Data paths - use the same defaults from simple_questions.py
     JSON_PATH = '/data/TalkingLatents/data/dataset/stellar_descriptions_questions_short.json'
+    JSON_PATH_LONG = '/data/TalkingLatents/data/dataset/stellar_descriptions_questions.json'
     ADVANCED_JSON_PATH = '/data/TalkingLatents/data/dataset/caption_advanced_100k.json'
     FEATURES_PATH = '/data/TalkingLatents/logs/2025-07-29/features.npy'  # Optional, can be None to load all features on-the-fly
     
@@ -120,6 +121,9 @@ def parse_args(argv=None):
                         help='Probability of augmenting a sample with follow-up QA')
     parser.add_argument('--max_followup_turns', type=int, default=1,
                         help='Maximum number of follow-up QA turns to append per sample')
+    parser.add_argument('--followup_json_file', type=str, default=JSON_PATH_LONG,
+                        help='json file for followup questions')
+                        
     
     # Model configuration
     parser.add_argument('--llm_backend', type=str, choices=['llama', 'hf', 'qwen'],
@@ -558,6 +562,7 @@ def create_datasets_and_loaders(args, device, backend_config: LLMBackendConfig |
         followup_prob=getattr(args, 'followup_prob', 0.0),
         max_followup_turns=getattr(args, 'max_followup_turns', 1),
         followup_seed=getattr(args, 'random_seed', 42),
+        followup_json_file=getattr(args, 'followup_json_file', None)
     )
 
     # # Synchronize before proceeding
@@ -618,6 +623,9 @@ def create_datasets_and_loaders(args, device, backend_config: LLMBackendConfig |
             followup_prob=followup_kwargs['followup_prob'],
             max_followup_turns=followup_kwargs['max_followup_turns'],
             followup_seed=followup_kwargs['followup_seed'],
+            followup_json_file=followup_kwargs['followup_json_file']
+
+            
         )
     else:
     
@@ -644,64 +652,65 @@ def create_datasets_and_loaders(args, device, backend_config: LLMBackendConfig |
             )
             
         elif args.mode == "combined":
-            if rank == 0:
-                print(f"Creating mixed dataset ({dataset_type}) from {single_json_file} and {args.comparative_json_file}...")
-                print(f"Single-sample probability: {args.single_sample_prob}")
+            raise NotImplementedError('combined dataset no longer implemented!')
+        #     if rank == 0:
+        #         print(f"Creating mixed dataset ({dataset_type}) from {single_json_file} and {args.comparative_json_file}...")
+        #         print(f"Single-sample probability: {args.single_sample_prob}")
 
-            single_kwargs = dict(
-                json_file=single_json_file,
-                features_array=spectral_features,
-                spectral_transforms=transf,
-                train_ratio=args.train_ratio,
-                val_ratio=args.val_ratio,
-                test_ratio=args.test_ratio,
-                random_state=args.random_seed,
-                num_spectral_features=args.num_spectral_features,
-                cache_dir=cache_dir + "_single",
-                tokenizer_path=tokenizer_path,
-                tokenizer=tokenizer_adapter,
-                tokenizer_backend=tokenizer_backend,
-                max_length=args.max_seq_length,
-                enable_followup=followup_kwargs['enable_followup'],
-                followup_prob=followup_kwargs['followup_prob'],
-                max_followup_turns=followup_kwargs['max_followup_turns'],
-                followup_seed=followup_kwargs['followup_seed'],
-            )
+        #     single_kwargs = dict(
+        #         json_file=single_json_file,
+        #         features_array=spectral_features,
+        #         spectral_transforms=transf,
+        #         train_ratio=args.train_ratio,
+        #         val_ratio=args.val_ratio,
+        #         test_ratio=args.test_ratio,
+        #         random_state=args.random_seed,
+        #         num_spectral_features=args.num_spectral_features,
+        #         cache_dir=cache_dir + "_single",
+        #         tokenizer_path=tokenizer_path,
+        #         tokenizer=tokenizer_adapter,
+        #         tokenizer_backend=tokenizer_backend,
+        #         max_length=args.max_seq_length,
+        #         enable_followup=followup_kwargs['enable_followup'],
+        #         followup_prob=followup_kwargs['followup_prob'],
+        #         max_followup_turns=followup_kwargs['max_followup_turns'],
+        #         followup_seed=followup_kwargs['followup_seed'],
+        #     )
 
-            comparative_kwargs = None
-            if args.comparative_json_file:
-                comparative_kwargs = dict(
-                    json_file=args.comparative_json_file,
-                    features_array=spectral_features,
-                    train_ratio=args.train_ratio,
-                    val_ratio=args.val_ratio,
-                    test_ratio=args.test_ratio,
-                    random_state=args.random_seed,
-                    cache_dir=cache_dir + "_two",
-                    tokenizer_path=tokenizer_path,
-                    tokenizer=tokenizer_adapter,
-                    tokenizer_backend=tokenizer_backend,
-                    max_length=args.max_seq_length,
-                    num_spectral_features=args.num_spectral_features,
-                    spectral_transforms=transf,
-                )
+        #     comparative_kwargs = None
+        #     if args.comparative_json_file:
+        #         comparative_kwargs = dict(
+        #             json_file=args.comparative_json_file,
+        #             features_array=spectral_features,
+        #             train_ratio=args.train_ratio,
+        #             val_ratio=args.val_ratio,
+        #             test_ratio=args.test_ratio,
+        #             random_state=args.random_seed,
+        #             cache_dir=cache_dir + "_two",
+        #             tokenizer_path=tokenizer_path,
+        #             tokenizer=tokenizer_adapter,
+        #             tokenizer_backend=tokenizer_backend,
+        #             max_length=args.max_seq_length,
+        #             num_spectral_features=args.num_spectral_features,
+        #             spectral_transforms=transf,
+        #         )
 
-            num_workers_per_rank = args.num_workers // world_size if world_size > 1 else args.num_workers
-            train_loader, val_loader, test_loader = create_mixed_dataloaders(
-                single_kwargs=single_kwargs,
-                comparative_kwargs=comparative_kwargs,
-                batch_size=args.batch_size,
-                single_sample_prob=args.single_sample_prob,
-                seed=args.random_seed,
-                length_strategy='max',
-                num_workers=num_workers_per_rank,
-                persistent_workers=num_workers_per_rank > 0,
-                pin_memory=torch.cuda.is_available(),
-                numeric_keys=('Teff', 'logg', 'FeH'),
-                world_size=world_size,
-                device=str(device),
-                single_dataset_cls=single_dataset_cls,
-            )
+        #     num_workers_per_rank = args.num_workers // world_size if world_size > 1 else args.num_workers
+        #     train_loader, val_loader, test_loader = create_mixed_dataloaders(
+        #         single_kwargs=single_kwargs,
+        #         comparative_kwargs=comparative_kwargs,
+        #         batch_size=args.batch_size,
+        #         single_sample_prob=args.single_sample_prob,
+        #         seed=args.random_seed,
+        #         length_strategy='max',
+        #         num_workers=num_workers_per_rank,
+        #         persistent_workers=num_workers_per_rank > 0,
+        #         pin_memory=torch.cuda.is_available(),
+        #         numeric_keys=('Teff', 'logg', 'FeH'),
+        #         world_size=world_size,
+        #         device=str(device),
+        #         single_dataset_cls=single_dataset_cls,
+        #     )
             
         else:
             # Check if we should create feature prediction dataloaders
@@ -732,6 +741,7 @@ def create_datasets_and_loaders(args, device, backend_config: LLMBackendConfig |
                 followup_prob=followup_kwargs['followup_prob'],
                 max_followup_turns=followup_kwargs['max_followup_turns'],
                 followup_seed=followup_kwargs['followup_seed'],
+                followup_json_file=followup_kwargs['followup_json_file']
                 )
 
     # # Synchronize all processes after dataset creation

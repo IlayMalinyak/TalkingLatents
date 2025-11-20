@@ -221,7 +221,7 @@ def compare_followup_responses(
     ablation_dir: Path,
     experiments: Optional[List[str]] = None,
     config_path: Optional[str] = None,
-    max_samples: int = 50,
+    max_samples: int = 5,
     num_followups: int = 2,
     max_new_tokens: int = 100,
     temperature: float = 0.7,
@@ -286,12 +286,65 @@ def compare_followup_responses(
         "ablation_s_fup1_pred_pair_nn": AblationConfig("short-fup1-pred_pair_nn", "short", True, "pred_pair_nn"),
     }
 
+    # Load followup JSON file for description-based followups
+    followup_data = None
+    followup_json_path = '/data/TalkingLatents/data/dataset/stellar_descriptions_questions.json'
+    if os.path.exists(followup_json_path):
+        with open(followup_json_path, 'r') as f:
+            followup_data = json.load(f)
+        print(f"Loaded {len(followup_data)} samples from followup JSON: {followup_json_path}")
+    else:
+        print(f"Warning: Followup JSON not found at {followup_json_path}, will only use stellar type questions")
+
     # Setup device
     device, _, _ = setup()
     print(f"Using device: {device}")
 
     # Create base args (we'll modify for each experiment)
     base_args = make_base_args(output_dir=str(ablation_dir))
+
+    # Helper function to parse description text
+    def parse_description_text(description: str) -> dict:
+        """Parse description text to extract question and answer"""
+        result = {"question": "", "answer": ""}
+        if not description:
+            return result
+
+        # Try to split on common delimiters
+        for delimiter in ['\nAnswer:', '\nA:', 'Answer:', 'A:']:
+            if delimiter in description:
+                parts = description.split(delimiter, 1)
+                if len(parts) == 2:
+                    question = parts[0].replace('Question:', '').replace('Q:', '').strip()
+                    answer = parts[1].strip()
+                    result["question"] = question
+                    result["answer"] = answer
+                    return result
+
+        # If no delimiter found, assume entire text is the answer
+        result["answer"] = description.strip()
+        return result
+
+    # Helper function to get followup from long JSON
+    def get_followup_from_json(sample_idx: int) -> Optional[Tuple[str, str]]:
+        """Get followup Q&A from long JSON file at the same index"""
+        if followup_data is None or sample_idx >= len(followup_data):
+            return None
+
+        followup_sample = followup_data[sample_idx]
+        description = followup_sample.get("description", "")
+
+        if not description:
+            return None
+
+        parsed = parse_description_text(description)
+        question = parsed.get("question", "")
+        answer = parsed.get("answer", "")
+
+        if not question or not answer:
+            return None
+
+        return question, answer
 
     # Results storage
     all_results = []
@@ -374,7 +427,8 @@ def compare_followup_responses(
         }
 
         samples_processed = 0
-        for batch in tqdm(test_loader, desc=f"Generating for {exp_name}", total=min(max_samples, len(test_loader))):
+        print("max sampes: ", max_samples)
+        for batch in tqdm(test_loader, desc=f"Generating for {exp_name}", total=len(test_loader)):
             if samples_processed >= max_samples:
                 break
 
@@ -393,8 +447,14 @@ def compare_followup_responses(
                 sample_data = {}
 
                 # Get stellar parameters for followup question generation
+                # First try to use pre-extracted params (from feature prediction datasets)
                 stellar_params = {}
-                if 'stellar_data' in batch and isinstance(batch['stellar_data'], list):
+                if 'stellar_params_star2' in batch and isinstance(batch['stellar_params_star2'], list):
+                    # Feature prediction dataset - use target star params
+                    if sample_idx < len(batch['stellar_params_star2']):
+                        stellar_params = batch['stellar_params_star2'][sample_idx] or {}
+                elif 'stellar_data' in batch and isinstance(batch['stellar_data'], list):
+                    # Regular dataset - extract from stellar_data
                     if sample_idx < len(batch['stellar_data']):
                         raw_params = batch['stellar_data'][sample_idx] or {}
                         for canonical, aliases in PARAM_KEY_ALIASES.items():
@@ -412,67 +472,145 @@ def compare_followup_responses(
                 sample_data['sample_idx'] = samples_processed
 
                 # Get original question and target
+                # Handle both singular and plural field names (different datasets use different conventions)
                 if 'input_texts' in batch and isinstance(batch['input_texts'], list):
                     if sample_idx < len(batch['input_texts']):
                         sample_data['original_question'] = batch['input_texts'][sample_idx]
+                elif 'input_text' in batch and isinstance(batch['input_text'], list):
+                    if sample_idx < len(batch['input_text']):
+                        sample_data['original_question'] = batch['input_text'][sample_idx]
+
                 if 'target_texts' in batch and isinstance(batch['target_texts'], list):
                     if sample_idx < len(batch['target_texts']):
                         sample_data['target_answer'] = batch['target_texts'][sample_idx]
+                elif 'target_text' in batch and isinstance(batch['target_text'], list):
+                    if sample_idx < len(batch['target_text']):
+                        sample_data['target_answer'] = batch['target_text'][sample_idx]
 
                 # Generate response for original description question
-                try:
-                    response, _, _, _ = model.generate_response_from_batch(
-                        batch_data=batch,
-                        batch_idx=sample_idx,
+                response, _, _, _ = model.generate_response_from_batch(
+                    batch_data=batch,
+                    batch_idx=sample_idx,
+                    tokenizer=tokenizer,
+                    max_new_tokens=max_new_tokens,
+                    temperature=temperature,
+                    top_p=top_p,
+                )
+                sample_data['description_response'] = response
+
+                # Generate followup questions and responses
+                sample_data['followup_qa'] = []
+
+                # Get the original sample index from the dataset
+                original_idx = samples_processed  # This maps to the same index in the long JSON
+
+                # Try to get followup from long JSON first
+                followup_specs = []
+                qa_pair = get_followup_from_json(original_idx)
+                if qa_pair is not None:
+                    question, answer = qa_pair
+                    followup_specs.append({
+                        'question': question,
+                        'expected_answer': answer,
+                        'type': 'description_from_long_json'
+                    })
+
+                # Fall back to stellar type questions if we don't have enough followups
+                if len(followup_specs) < num_followups and stellar_params:
+                    stellar_followups = create_follow_up_specs(
+                        stellar_params,
+                        random.Random(seed + samples_processed),
+                        max_pairs=num_followups - len(followup_specs),
+                        include_answers=True
+                    )
+                    for spec in stellar_followups:
+                        followup_specs.append({
+                            'question': spec.get('question', ''),
+                            'expected_answer': spec.get('answer', ''),
+                            'type': spec.get('type', 'stellar_parameter')
+                        })
+
+                # Generate responses for each followup
+                for spec in followup_specs[:num_followups]:
+                    followup_q = spec.get('question', '')
+                    if not followup_q:
+                        continue
+
+                    # Get the original input text (question)
+                    original_question = sample_data.get('original_question', '')
+
+                    # Build conversation: original Q + generated A + followup Q
+                    conversation_text = f"{original_question}\n{response}\n\nFollow-up question: {followup_q}\nAnswer:"
+
+                    # Tokenize the conversation
+                    conv_tokens = tokenizer.encode(conversation_text, bos=True, eos=False)
+
+                    # The answer starts right after the conversation (at the end of conv_tokens)
+                    # Since we end with "Answer:", the model should generate after that
+                    answer_start_idx = len(conv_tokens)
+
+                    # Create modified batch with conversation context
+                    followup_batch = {
+                        'input_ids': torch.tensor([conv_tokens], dtype=torch.long).to(device),
+                        'input_texts': [conversation_text],
+                        'answer_start_indices': [answer_start_idx],
+                    }
+
+                    # Copy all feature-related fields from the original batch
+                    # These are required by generate_response_from_batch
+
+                    # Single-star mode fields
+                    if 'masked_spectra' in batch:
+                        followup_batch['masked_spectra'] = batch['masked_spectra'][sample_idx:sample_idx+1].to(device)
+                    elif 'features' in batch:
+                        # Use 'features' as 'masked_spectra' if that's what the batch has
+                        followup_batch['masked_spectra'] = batch['features'][sample_idx:sample_idx+1].to(device)
+
+                    if 'feature_start_indices' in batch:
+                        followup_batch['feature_start_indices'] = batch['feature_start_indices'][sample_idx:sample_idx+1]
+
+                    # Two-star mode fields (if they exist)
+                    if 'masked_spectra_a' in batch:
+                        followup_batch['masked_spectra_a'] = batch['masked_spectra_a'][sample_idx:sample_idx+1].to(device)
+                    if 'masked_spectra_b' in batch:
+                        followup_batch['masked_spectra_b'] = batch['masked_spectra_b'][sample_idx:sample_idx+1].to(device)
+                    if 'star_a_feature_indices' in batch:
+                        followup_batch['star_a_feature_indices'] = batch['star_a_feature_indices'][sample_idx:sample_idx+1].to(device)
+                    if 'star_b_feature_indices' in batch:
+                        followup_batch['star_b_feature_indices'] = batch['star_b_feature_indices'][sample_idx:sample_idx+1].to(device)
+
+                    # Mode information
+                    if 'mode' in batch:
+                        followup_batch['mode'] = [batch['mode'][sample_idx]] if isinstance(batch['mode'], list) else batch['mode'][sample_idx:sample_idx+1]
+                    if 'mode_mask_comparative' in batch:
+                        followup_batch['mode_mask_comparative'] = batch['mode_mask_comparative'][sample_idx:sample_idx+1]
+
+                    # Attention mask
+                    if 'attention_mask' in batch:
+                        # Create attention mask for the conversation
+                        followup_batch['attention_mask'] = torch.ones(1, len(conv_tokens), dtype=torch.long).to(device)
+
+                    # Generate followup response
+                    followup_response, _, _, _ = model.generate_response_from_batch(
+                        batch_data=followup_batch,
+                        batch_idx=0,  # We've already sliced to a single sample
                         tokenizer=tokenizer,
                         max_new_tokens=max_new_tokens,
                         temperature=temperature,
                         top_p=top_p,
                     )
-                    sample_data['description_response'] = response
-                except Exception as e:
-                    print(f"Error generating description response: {e}")
-                    sample_data['description_response'] = f"ERROR: {str(e)}"
 
-                # Generate followup questions and responses
-                sample_data['followup_qa'] = []
-                if stellar_params:
-                    try:
-                        followup_specs = create_follow_up_specs(
-                            stellar_params,
-                            random.Random(seed + samples_processed),
-                            max_pairs=num_followups,
-                            include_answers=False
-                        )
-
-                        for spec in followup_specs[:num_followups]:
-                            followup_q = spec.get('question', '')
-                            if not followup_q:
-                                continue
-
-                            # Generate response for this followup question
-                            # We'll append the followup question to the conversation
-                            try:
-                                # Create a modified batch with the followup question
-                                # For simplicity, we'll just record the question and note that
-                                # full conversational generation would require modifying the batch
-                                sample_data['followup_qa'].append({
-                                    'question': followup_q,
-                                    'type': spec.get('type', 'unknown'),
-                                    'response': 'FOLLOWUP_GENERATION_TODO'  # Placeholder for now
-                                })
-                            except Exception as e:
-                                print(f"Error generating followup response: {e}")
-                                sample_data['followup_qa'].append({
-                                    'question': followup_q,
-                                    'type': spec.get('type', 'unknown'),
-                                    'response': f"ERROR: {str(e)}"
-                                })
-                    except Exception as e:
-                        print(f"Error creating followup specs: {e}")
+                    sample_data['followup_qa'].append({
+                        'question': followup_q,
+                        'type': spec.get('type', 'unknown'),
+                        'expected_answer': spec.get('expected_answer', ''),
+                        'generated_response': followup_response,
+                        'source': 'long_json' if spec['type'] == 'description_from_long_json' else 'stellar_template'
+                    })
 
                 exp_results['samples'].append(sample_data)
                 samples_processed += 1
+                print("samples processed: ", samples_processed)
 
         all_results.append(exp_results)
 
@@ -518,8 +656,9 @@ def main():
     parser = argparse.ArgumentParser(description="Postprocess ablation study results")
     parser.add_argument("--ablation_dir", type=str, required=True,
                        help="Directory containing ablation results")
-    parser.add_argument("--mode", type=str, choices=["loss", "followup", "both"], default="loss",
-                       help="Analysis mode: 'loss' for loss plots, 'followup' for followup comparison, 'both' for both")
+    parser.add_argument("--mode", type=str, choices=["loss", "followup", "both", "analyze"], default="loss",
+                       help="Analysis mode: 'loss' for loss plots, 'followup' for followup comparison, "
+                            "'analyze' to analyze existing followup JSON, 'both' for loss+followup")
 
     # Loss plotting args
     parser.add_argument("--train_window", type=int, default=50,
@@ -530,7 +669,7 @@ def main():
                        help="Optional suffix for output filenames")
 
     # Followup comparison args
-    parser.add_argument("--max_samples", type=int, default=50,
+    parser.add_argument("--max_samples", type=int, default=5,
                        help="Maximum number of test samples for followup comparison (default: 50)")
     parser.add_argument("--num_followups", type=int, default=2,
                        help="Number of followup questions per sample (default: 2)")
@@ -544,6 +683,12 @@ def main():
                        help="Random seed for reproducibility (default: 42)")
     parser.add_argument("--followup_output", type=str, default="followup_comparison.json",
                        help="Output filename for followup comparison (default: followup_comparison.json)")
+
+    # Analysis args
+    parser.add_argument("--analysis_input", type=str, default="followup_comparison.json",
+                       help="Input JSON file for analysis mode (default: followup_comparison.json)")
+    parser.add_argument("--analysis_output_dir", type=str, default=None,
+                       help="Output directory for analysis plots (default: same as ablation_dir)")
 
     args = parser.parse_args()
 
@@ -577,6 +722,40 @@ def main():
             seed=args.seed,
             output_filename=args.followup_output,
         )
+
+    if args.mode == "analyze":
+        print("\n" + "="*80)
+        print("ANALYZING GENERATION RESULTS")
+        print("="*80)
+
+        # Import analysis module
+        from src.analyze_generation_results import analyze_generation_results
+
+        # Construct full path to JSON file
+        json_path = ablation_dir / args.analysis_input
+        if not json_path.exists():
+            print(f"Error: Analysis input file not found: {json_path}")
+            print(f"Please run with --mode followup first to generate the comparison JSON")
+            return
+
+        # Determine output directory
+        output_dir = args.analysis_output_dir
+        if output_dir is None:
+            output_dir = ablation_dir / "analysis_plots"
+
+        print(f"Input JSON: {json_path}")
+        print(f"Output directory: {output_dir}")
+        print()
+
+        # Run analysis
+        stats = analyze_generation_results(
+            json_path=str(json_path),
+            output_dir=str(output_dir),
+        )
+
+        print(f"\n{'='*80}")
+        print("ANALYSIS COMPLETE")
+        print(f"{'='*80}")
 
 
 if __name__ == "__main__":

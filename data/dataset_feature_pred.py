@@ -65,6 +65,12 @@ class StellarFeaturePredictionDataset(Dataset):
         condition_on_star1 (bool): If True, condition on star1 parameters (default mode).
                                    If False, only ask to describe star2 without star1 context.
         random_pairing (bool): If True, pair stars randomly. If False, pair with most similar stars (default: False).
+        enable_followup (bool): Whether to append follow-up questions
+        followup_prob (float): Probability of adding follow-up questions to a sample
+        max_followup_turns (int): Maximum number of follow-up turns to add
+        followup_seed (int): Random seed for follow-up question generation
+        followup_json_file (Optional[str]): Path to second JSON for description-based follow-ups
+        followup_mode (str): "stellar_type", "description", or "mixed" (50/50 default)
     """
 
     def __init__(self,
@@ -91,7 +97,10 @@ class StellarFeaturePredictionDataset(Dataset):
                  enable_followup: bool = False,
                  followup_prob: float = 0.0,
                  max_followup_turns: int = 1,
-                 followup_seed: int = 42):
+                 followup_seed: int = 42,
+                 # Optional second JSON for follow-up Q&A
+                 followup_json_file: Optional[str] = None,
+                 followup_mode: str = "mixed"):
 
         assert split in ['train', 'val', 'test'], f"Split must be 'train', 'val', or 'test', got {split}"
         assert abs(train_ratio + val_ratio + test_ratio - 1.0) < 1e-6, "Ratios must sum to 1.0"
@@ -119,8 +128,22 @@ class StellarFeaturePredictionDataset(Dataset):
         self.enable_followup = enable_followup
         self.followup_prob = followup_prob
         self.max_followup_turns = max_followup_turns
+        self.followup_json_file = followup_json_file
+        self.followup_mode = followup_mode
         seed_offset = followup_seed + hash((split, random_state))
         self._followup_rng = random.Random(seed_offset)
+
+        # Load follow-up JSON if provided
+        self.followup_data = None
+        if self.followup_json_file and self.enable_followup:
+            self._load_followup_json()
+
+        # Print follow-up mode info
+        if self.enable_followup:
+            if self.followup_data is not None:
+                print(f"Follow-up mode: {self.followup_mode} (with {len(self.followup_data)} description samples loaded)")
+            else:
+                print(f"Follow-up mode: stellar_type only (no followup_json_file provided)")
 
         self.numeric_bounds = {
             'Teff': (3000.0, 7500.0),
@@ -169,6 +192,37 @@ class StellarFeaturePredictionDataset(Dataset):
             print(f"Tokenizer path not found: {self.tokenizer_path}")
             self.tokenizer = None
 
+    def _load_followup_json(self):
+        """Load the follow-up JSON file for Q&A pairs."""
+        try:
+            with open(self.followup_json_file, 'r') as f:
+                self.followup_data = json.load(f)
+            print(f"Loaded {len(self.followup_data)} follow-up samples from {self.followup_json_file}")
+        except Exception as e:
+            print(f"Warning: Could not load follow-up JSON {self.followup_json_file}: {e}")
+            self.followup_data = None
+
+    def _get_followup_from_description(self, sample_idx: int) -> Optional[Tuple[str, str]]:
+        """Extract question and answer from the follow-up JSON file."""
+        if self.followup_data is None or sample_idx >= len(self.followup_data):
+            return None
+
+        followup_sample = self.followup_data[sample_idx]
+        description = followup_sample.get("description", "")
+
+        if not description:
+            return None
+
+        # Parse the description to get question and answer
+        parsed = self.parse_description_text(description)
+        question = parsed.get("question", "")
+        answer = parsed.get("answer", "")
+
+        if not question or not answer:
+            return None
+
+        return question, answer
+
     def _tokenize_text_no_pad(self, text: str, bos=True) -> Tuple[List[int], int]:
         """Tokenize text without padding - return raw token list"""
         if self.tokenizer is not None:
@@ -205,17 +259,40 @@ class StellarFeaturePredictionDataset(Dataset):
     def _append_followup_turns(self,
                                full_tokens: List[int],
                                target_tokens: List[int],
-                               params: Dict[str, Optional[float]]) -> None:
+                               params: Dict[str, Optional[float]],
+                               sample_idx: int = -1) -> None:
         if not self.enable_followup or self.followup_prob <= 0.0:
             return
         if self._followup_rng.random() > self.followup_prob:
             return
-        followups = create_follow_up_specs(
-            params,
-            self._followup_rng,
-            max_pairs=self.max_followup_turns,
-            include_answers=True,
-        )
+
+        # Decide which mode to use based on followup_mode
+        use_description = False
+        if self.followup_mode == "description" and self.followup_data is not None:
+            use_description = True
+        elif self.followup_mode == "mixed" and self.followup_data is not None:
+            # 50% probability for description, 50% for stellar type
+            use_description = self._followup_rng.random() < 0.5
+
+        followups = []
+
+        # Try to use description from follow-up JSON file
+        if use_description and sample_idx >= 0:
+            qa_pair = self._get_followup_from_description(sample_idx)
+            if qa_pair is not None:
+                question, answer = qa_pair
+                # Format as a followup spec for consistent processing
+                followups.append({'question': question, 'answer': answer})
+
+        # Generate stellar type questions from templates (if not using description or as fallback)
+        if not followups:
+            followups = create_follow_up_specs(
+                params,
+                self._followup_rng,
+                max_pairs=self.max_followup_turns,
+                include_answers=True,
+            )
+
         for spec in followups:
             question_text = f"\nFollow-up question: {spec['question']}\nAnswer:"
             q_tokens, _ = self._tokenize_text_no_pad(question_text, bos=False)
@@ -331,12 +408,12 @@ class StellarFeaturePredictionDataset(Dataset):
 
         # Fix common problematic escapes
         escape_fixes = [
-            (r'\[', '['),
-            (r'\]', ']'),
-            (r'\(', '('),
-            (r'\)', ')'),
-            (r'\ ', ' '),
-            (r'\/', '/'),
+            (r'\[', '['),      # \[ -> [
+            (r'\]', ']'),      # \] -> ]
+            (r'\(', '('),      # \( -> (
+            (r'\)', ')'),      # \) -> )
+            (r'\ ', ' '),      # \ -> space
+            (r'\/', '/'),      # \/ -> /
         ]
 
         for old, new in escape_fixes:
@@ -346,34 +423,82 @@ class StellarFeaturePredictionDataset(Dataset):
             # First try to parse the cleaned string as JSON
             desc_json = json.loads(cleaned_text)
 
-            # Extract description/answer (we'll create our own question)
+            # Extract question and description/answer
+            question = desc_json.get('Question', '').strip()
             answer = desc_json.get('Description', '').strip()
 
             return {
-                'question': '',  # Will be generated from stellar params
+                'question': question,
                 'answer': answer
             }
 
         except json.JSONDecodeError as e:
-            # Fallback: try to extract Description using regex
+            # If that fails, try to find JSON object boundaries
             try:
-                desc_match = re.search(r'"Description"\s*:\s*"([^"]*)"', cleaned_text, re.DOTALL)
-                answer = desc_match.group(1) if desc_match else ''
+                # Look for the first '{' and try to find the matching '}'
+                start_idx = cleaned_text.find('{')
+                if start_idx == -1:
+                    raise ValueError("No JSON object found")
+
+                # Find the matching closing brace by counting braces
+                brace_count = 0
+                end_idx = -1
+
+                for i, char in enumerate(cleaned_text[start_idx:], start_idx):
+                    if char == '{':
+                        brace_count += 1
+                    elif char == '}':
+                        brace_count -= 1
+                        if brace_count == 0:
+                            end_idx = i + 1
+                            break
+
+                if end_idx == -1:
+                    raise ValueError("No matching closing brace found")
+
+                # Extract just the JSON part
+                json_part = cleaned_text[start_idx:end_idx]
+                desc_json = json.loads(json_part)
+
+                # Extract question and description/answer
+                question = desc_json.get('Question', '').strip()
+                answer = desc_json.get('Description', '').strip()
 
                 return {
-                    'question': '',
-                    'answer': answer.strip()
+                    'question': question,
+                    'answer': answer
                 }
 
-            except Exception as e2:
-                print(f"Error parsing description JSON: {e}")
-                print(f"Problematic text (first 200 chars): {cleaned_text[:200]}")
+            except (json.JSONDecodeError, ValueError) as e2:
+                # Final fallback: try to extract using regex patterns
+                try:
 
-                # Return empty if all parsing fails
-                return {
-                    'question': '',
-                    'answer': ''
-                }
+                    # Extract Question and Description using regex
+                    question_match = re.search(r'"Question"\s*:\s*"([^"]*)"', cleaned_text)
+                    desc_match = re.search(r'"Description"\s*:\s*"([^"]*)"', cleaned_text, re.DOTALL)
+
+                    question = question_match.group(1) if question_match else ''
+                    answer = desc_match.group(1) if desc_match else ''
+
+                    if question or answer:
+                        return {
+                            'question': question.strip(),
+                            'answer': answer.strip()
+                        }
+                    else:
+                        raise ValueError("No patterns matched")
+
+                except Exception as e3:
+                    print(f"Error parsing description JSON (attempt 3): {e3}")
+                    print(f"Attempt 2 error: {e2}")
+                    print(f"Original error: {e}")
+                    print(f"Problematic text (first 200 chars): {cleaned_text[:200]}")
+
+                    # Return the original text as answer if all parsing fails
+                    return {
+                        'question': '',
+                        'answer': description_text.strip()
+                    }
 
     def _create_splits(self, train_ratio: float, val_ratio: float, test_ratio: float, cache_dir: Optional[str] = None):
         """Create train/val/test splits with caching for consistency"""
@@ -769,7 +894,7 @@ class StellarFeaturePredictionDataset(Dataset):
 
         # Optionally add synthesized follow-up QA turns
         if self.enable_followup:
-            self._append_followup_turns(full_sequence, target_sequence, params2)
+            self._append_followup_turns(full_sequence, target_sequence, params2, sample_idx2)
 
         # Pad remaining space with -100 placeholders
         remaining_space = self.max_length - len(full_sequence)
@@ -806,6 +931,7 @@ class StellarFeaturePredictionDataset(Dataset):
             'stellar_params_star2': params2,           # Star 2 params (Teff, logg, FeH)
             'stellar_data_star1': stellar_data1,       # Full stellar data for star 1
             'stellar_data_star2': stellar_data2,       # Full stellar data for star 2
+            'stellar_data': stellar_data2,             # Alias for compatibility (points to target star)
             'obsid_star1': sample1.get('obsid', None),
             'obsid_star2': sample2.get('obsid', None),
             'df_index_star1': df_index1,
