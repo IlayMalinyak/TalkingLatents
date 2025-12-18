@@ -53,9 +53,14 @@ class HuggingFaceMultimodalModel(MultimodalBackboneBase):
 
         if torch.is_tensor(input_ids):
             input_ids = input_ids.clone()
+            # Ensure input_ids are on the same device as the embedding layer
+            input_ids = input_ids.to(embed_module.weight.device)
             neg_mask = input_ids < 0
             if torch.any(neg_mask):
                 input_ids[neg_mask] = int(pad_id)
+        else:
+             # If it's not a tensor (e.g. list), convert to tensor on correct device
+             input_ids = torch.tensor(input_ids, device=embed_module.weight.device)
 
         token_embeddings = embed_module(input_ids)
         token_embeddings = token_embeddings.clone()
@@ -326,7 +331,13 @@ class HuggingFaceMultimodalModel(MultimodalBackboneBase):
         }
         sequences = self.base_model.generate(**gen_kwargs)
         prompt_len = token_embeddings.shape[1]
-        generated_ids = sequences[:, prompt_len:]
+        
+        # Check if sequences includes prompt (standard HF generate behavior vs inputs_embeds behavior)
+        if sequences.shape[1] > prompt_len:
+             generated_ids = sequences[:, prompt_len:]
+        else:
+             generated_ids = sequences
+
         if tokenizer is not None and generated_ids.numel() > 0:
             generated_text = tokenizer.decode(generated_ids[0].tolist())
         else:

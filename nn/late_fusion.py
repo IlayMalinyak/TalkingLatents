@@ -1,13 +1,14 @@
 import json
 from pathlib import Path
-from typing import Any, Dict, Optional, Union, Tuple
+from typing import Any, Dict, List, Optional, Union, Tuple
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
 from nn.perceiver_decoder import SpectralDecoder
-from nn.perceiver_io import PerceiverEncoder
+from nn.perceiver_io import PerceiverEncoder, CrossAttentionBlock
+from nn.positional_encodings import build_position_indices
 from nn.DualFormer.dual_attention import DualFormerForJointEmbedding
 from llama3.llama.model import precompute_freqs_cis
 
@@ -28,6 +29,22 @@ class LateFusionModel(nn.Module):
     def __init__(self, llm_model, spectral_model, config: Dict[str, Any]):
         super().__init__()
         self.llm_model = llm_model
+        
+        # Explicitly enable gradient checkpointing if requested
+        if config.get("gradient_checkpointing", True):
+            # Try HF method
+            if hasattr(self.llm_model, "gradient_checkpointing_enable"):
+                self.llm_model.gradient_checkpointing_enable(gradient_checkpointing_kwargs={"use_reentrant": False})
+                if hasattr(self.llm_model, "config"):
+                    self.llm_model.config.use_cache = False
+            
+            # If wrapped in DDP or other wrappers, try to access base model
+            elif hasattr(self.llm_model, "module"):
+                if hasattr(self.llm_model.module, "gradient_checkpointing_enable"):
+                    self.llm_model.module.gradient_checkpointing_enable(gradient_checkpointing_kwargs={"use_reentrant": False})
+                    if hasattr(self.llm_model.module, "config"):
+                         self.llm_model.module.config.use_cache = False
+
         self.spectral_model = spectral_model
         self.config = config
 
@@ -37,6 +54,7 @@ class LateFusionModel(nn.Module):
         self.num_latents = config["M_latent"]
         self.spectral_target_dim = config.get("spectral_target_dim", config["spectral_feature_dim"])
         self.spectral_token_count = int(config.get("spectral_token_count", 1))
+        self.llm_prefix_len = int(config.get("llm_prefix_len", 0)) # 0 means use all latents
         self.loss_weights = config.get(
             "loss_weights", {"reconstruction": 1.0, "contrastive": 1.0, "ce": 1.0}
         )
@@ -128,16 +146,39 @@ class LateFusionModel(nn.Module):
             rope_theta=config.get("rope_theta", 10000.0),
         )
 
-        self.spectral_decoder = SpectralDecoder(
-            mode=config.get("spectral_decode_mode", "film_1d"),
-            d_model=self.d_model,
-            spectral_length=self.spectral_target_dim,
+        # Unified Perceiver Decoder (Cross-Attention)
+        self.perceiver_decoder = CrossAttentionBlock(
+            dim=self.d_model,
             num_heads=config.get("num_heads", 8),
+            ffn_mult=config.get("ffn_mult", 4),
             dropout=config.get("dropout", 0.1),
             attn_dropout=config.get("attn_dropout", 0.0),
+            rope_theta=config.get("rope_theta", 10000.0),
         )
 
-        self.llm_adapter = nn.Sequential(
+        # Learnable Queries
+        self.spectral_queries = nn.Parameter(torch.randn(1, self.spectral_target_dim, self.d_model))
+        self.prefix_queries = nn.Parameter(torch.randn(1, self.llm_prefix_len, self.d_model))
+        
+        # Positional Indices for queries (fixed/cached)
+        total_queries = self.spectral_target_dim + self.llm_prefix_len
+        self.decoder_query_positions = nn.Parameter(
+            build_position_indices(total_queries), requires_grad=False
+        )
+
+        # Output Heads
+        # Spectrum: d_model -> 1 (or 1D target length if queries handle spatial)
+        # We assume queries correspond to wavelength bins, so 1 scalar per query
+        self.spectrum_output_head = nn.Sequential(
+            nn.LayerNorm(self.d_model),
+            nn.Linear(self.d_model, self.d_model),
+            nn.GELU(),
+            nn.Dropout(config.get("dropout", 0.1)),
+            nn.Linear(self.d_model, 1)
+        )
+        
+        # LLM Prefix: d_model -> d_llm
+        self.llm_output_head = nn.Sequential(
             nn.LayerNorm(self.d_model),
             nn.Linear(self.d_model, self.d_model * 2),
             nn.GELU(),
@@ -145,6 +186,23 @@ class LateFusionModel(nn.Module):
             nn.Linear(self.d_model * 2, self.d_llm),
             nn.LayerNorm(self.d_llm),
         )
+
+        # Stellar parameter regression & injection
+        num_stellar_params = config.get("num_stellar_params", 3)
+        self.stellar_regressor = nn.Sequential(
+            nn.LayerNorm(self.d_model),
+            nn.Linear(self.d_model, self.d_model // 2),
+            nn.GELU(),
+            nn.Dropout(config.get("dropout", 0.1)),
+            nn.Linear(self.d_model // 2, num_stellar_params),
+        )
+        
+        # Project predicted params back to d_model space
+        self.param_projector = nn.Sequential(
+            nn.Linear(num_stellar_params, self.d_model),
+            nn.LayerNorm(self.d_model)
+        )
+        
         self.alignment_pool = nn.Sequential(
             nn.LayerNorm(self.d_model),
             nn.Linear(self.d_model, projector_hidden),
@@ -201,6 +259,22 @@ class LateFusionModel(nn.Module):
         if seqlen > 1:
             mask = torch.full((seqlen, seqlen), float("-inf"), device=device)
             mask = torch.triu(mask, diagonal=1).to(hidden.dtype)
+
+        # Combine with padding mask if provided
+        if attn_mask is not None:
+            # attn_mask is (B, T) with 1=valid, 0=pad
+            # We want 0 for valid, -inf for pad
+            pad_mask = torch.zeros_like(attn_mask, dtype=hidden.dtype)
+            pad_mask.masked_fill_(attn_mask == 0, float("-inf"))
+            # Reshape to (B, 1, 1, T) to broadcast over heads and query positions
+            pad_mask = pad_mask.unsqueeze(1).unsqueeze(1)
+            
+            if mask is None:
+                mask = pad_mask
+            else:
+                # Combine causal (T, T) and padding (B, 1, 1, T)
+                # Result: (B, 1, T, T)
+                mask = mask.unsqueeze(0).unsqueeze(0) + pad_mask
         # Rotary frequencies (ensure capacity)
         start_pos = 0
         if hasattr(base, 'params') and hasattr(base.params, 'dim') and hasattr(base.params, 'n_heads'):
@@ -283,8 +357,11 @@ class LateFusionModel(nn.Module):
             self.spectral_adapter,
             self.spectral_token_proj,
             self.perceiver,
-            self.spectral_decoder,
-            self.llm_adapter,
+            self.perceiver_decoder,
+            self.spectrum_output_head,
+            self.llm_output_head,
+            self.stellar_regressor,
+            self.param_projector,
             self.alignment_pool,
             self.alignment_head,
             self.dualformer_head,
@@ -373,9 +450,54 @@ class LateFusionModel(nn.Module):
                 mask = torch.full((seqlen, seqlen), float("-inf"), device=input_ids.device)
                 mask = torch.triu(mask, diagonal=1).to(hidden.dtype)
 
+            # Ensure KV-cache capacity matches (batch, seqlen)
+            # This is critical because LLaMA's forward pass writes to cache
+            bsz = input_ids.size(0)
+            if hasattr(model, 'layers'):
+                for layer in model.layers:
+                    attn = getattr(layer, 'attention', None)
+                    if attn is None:
+                        continue
+                    cache_k = getattr(attn, 'cache_k', None)
+                    cache_v = getattr(attn, 'cache_v', None)
+                    if cache_k is None or cache_v is None:
+                        continue
+                    
+                    need_b = bsz
+                    need_t = seqlen
+                    cur_b = cache_k.shape[0]
+                    cur_t = cache_k.shape[1]
+                    
+                    if need_b > cur_b or need_t > cur_t:
+                        # Resize if needed (expand dimensions)
+                        new_b = max(need_b, cur_b)
+                        new_t = max(need_t, cur_t)
+                        new_shape = (new_b, new_t, cache_k.shape[2], cache_k.shape[3])
+                        
+                        new_k = cache_k.new_zeros(new_shape)
+                        new_v = cache_v.new_zeros(new_shape)
+                        
+                        # Copy existing content
+                        if cur_b > 0 and cur_t > 0:
+                            new_k[:cur_b, :cur_t] = cache_k
+                            new_v[:cur_b, :cur_t] = cache_v
+                            
+                        attn.cache_k = new_k
+                        attn.cache_v = new_v
+
             for layer in model.layers:
                 hidden = layer(hidden, start_pos, freqs_cis, mask)
             hidden = model.norm(hidden)
+
+            # Detach KV caches to avoid holding computation graphs across steps
+            for layer in model.layers:
+                attn = getattr(layer, 'attention', None)
+                if attn is None:
+                    continue
+                if hasattr(attn, 'cache_k') and isinstance(attn.cache_k, torch.Tensor):
+                    attn.cache_k = attn.cache_k.detach()
+                if hasattr(attn, 'cache_v') and isinstance(attn.cache_v, torch.Tensor):
+                    attn.cache_v = attn.cache_v.detach()
         return hidden
 
     def _get_spectral_input(self, batch: Dict[str, torch.Tensor]) -> torch.Tensor:
@@ -638,6 +760,113 @@ class LateFusionModel(nn.Module):
         loss_s2t = F.cross_entropy(logits_s2t, labels)
         return 0.5 * (loss_t2s + loss_s2t)
 
+    def _extract_stellar_params(self, batch: Dict[str, torch.Tensor]) -> Optional[torch.Tensor]:
+        """Extract [Teff, logg, Fe_H] from batch stellar_data."""
+        if "stellar_data" not in batch:
+            return None
+        
+        from src.follow_up_templates import PARAM_KEY_ALIASES
+        
+        stellar_data_list = batch["stellar_data"]
+        param_tensors = []
+        
+        for stellar_data in stellar_data_list:
+            if not isinstance(stellar_data, dict):
+                continue
+                
+            # Extract params using aliases
+            params = {}
+            for param, aliases in PARAM_KEY_ALIASES.items():
+                for key in aliases:
+                    if key in stellar_data and stellar_data[key] is not None:
+                        try:
+                            params[param] = float(stellar_data[key])
+                            break
+                        except (TypeError, ValueError):
+                            pass
+            
+            param_values = [
+                params.get("Teff", 0.0) or 0.0,
+                params.get("logg", 0.0) or 0.0,
+                params.get("Fe_H", 0.0) or 0.0,
+            ]
+            param_values[0] /= 5700 # same nomalization as in spectra model
+            param_tensors.append(torch.tensor(param_values, dtype=torch.float))
+            
+        
+        if not param_tensors:
+            return None
+        return torch.stack(param_tensors)
+
+    def _compute_cycle_ce_loss(
+        self,
+        batch: Dict[str, torch.Tensor],
+        outputs: Dict[str, torch.Tensor],
+        device: torch.device,
+    ) -> torch.Tensor:
+        """Compute cycle-consistency cross-entropy loss."""
+        if not (self.enable_cycle_ce and ("followup_input_ids" in batch) and ("followup_labels" in batch)):
+            return torch.tensor(0.0, device=device)
+
+        full_ids = batch["followup_input_ids"].to(device)
+        full_labels = batch["followup_labels"].to(device)
+        
+        prefix = outputs.get("prefix_embeddings", None)
+        if prefix is None:
+            return torch.tensor(0.0, device=device)
+        
+        # Token embeddings from LLM
+        base_llm = getattr(self.llm_model, "base_model", self.llm_model)
+        tok_embeds = base_llm.tok_embeddings(full_ids)
+        
+        # Concatenate prefix embeddings
+        inputs_embeds = torch.cat([prefix.to(device, dtype=tok_embeds.dtype), tok_embeds], dim=1)
+        
+        # Build attention mask: 1s for prefix + non-pad for ids
+        pad_id = 0
+        if hasattr(base_llm, 'config') and hasattr(base_llm.config, 'pad_token_id') and base_llm.config.pad_token_id is not None:
+            pad_id = base_llm.config.pad_token_id
+        
+        attn_mask_ids = (full_ids != pad_id).long()
+        prefix_mask = torch.ones(prefix.size(0), prefix.size(1), device=device, dtype=torch.long)
+        attention_mask = torch.cat([prefix_mask, attn_mask_ids], dim=1)
+        
+        # Choose backend path
+        if hasattr(base_llm, "get_input_embeddings"):
+            hidden2, logits2 = self._hf_forward_from_embeds(inputs_embeds, attention_mask)
+        else:
+            hidden2, logits2 = self._llama_forward_from_embeds(inputs_embeds, attention_mask)
+        
+        # Build labels: prepend -100 for prefix
+        B, Ltot, V = logits2.shape
+        prefix_len = prefix.size(1)
+        
+        # Prepend -100s for prefix to the labels
+        prefix_labels = torch.full((B, prefix_len), -100, device=device, dtype=torch.long)
+        labels = torch.cat([prefix_labels, full_labels], dim=1)
+        
+        # Sanitize labels: mask invalid or padding ids to -100
+        # Resolve model vocab size
+        vocab_size = None
+        base_params = getattr(base_llm, 'params', None)
+        if base_params is not None:
+            vocab_size = getattr(base_params, 'vocab_size', None)
+        if vocab_size is None and hasattr(base_llm, 'config'):
+            vocab_size = getattr(base_llm.config, 'vocab_size', None)
+        if vocab_size is None:
+            vocab_size = V
+            
+        invalid = (labels < 0) | (labels >= vocab_size)
+        if pad_id is not None:
+            invalid = invalid | (labels == pad_id)
+        labels[invalid] = -100
+        
+        # Standard shifted CE
+        shift_logits = logits2[..., :-1, :].contiguous()
+        shift_labels = labels[..., 1:].contiguous()
+        ce_loss = F.cross_entropy(shift_logits.view(-1, V), shift_labels.view(-1), ignore_index=-100)
+        return ce_loss
+
     def forward(self, batch: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
         device = next(self.parameters()).device
         input_ids = batch["input_ids"].to(device)
@@ -671,7 +900,7 @@ class LateFusionModel(nn.Module):
             dtype=torch.bool,
         )
 
-        spectral_targets = self._safe_tensor(self._prepare_spectral_targets(spectral_features))
+        spectral_targets = spectral_features.float() 
 
         outputs: Dict[str, torch.Tensor] = {}
         total_loss = torch.zeros(1, device=device)
@@ -682,6 +911,7 @@ class LateFusionModel(nn.Module):
             fusion_text_mask = text_mask
             fusion_spec = spectral_embeddings
             fusion_spec_mask = spectral_mask
+
             (
                 fusion_text,
                 fusion_text_mask,
@@ -694,134 +924,342 @@ class LateFusionModel(nn.Module):
             fusion_inputs, fusion_mask, fusion_positions = self._build_joint_sequence(
                 fusion_text, fusion_spec, fusion_text_mask, fusion_spec_mask
             )
+            
+            # 1. ENCODE
             latents = self.perceiver(fusion_inputs, fusion_mask, fusion_positions)
             latents = self._safe_tensor(latents)
             outputs["latents"] = latents
 
-            spectral_pred = self._safe_tensor(self.spectral_decoder(latents))
-            recon_loss = F.mse_loss(spectral_pred, spectral_targets, reduction="mean")
+            # 2. REGRESS (The "Side Quest")
+            # Use the first latent as the regression token (similar to [CLS])
+            latents_reg = latents[:, 0]  # [B, d_model]
+            stellar_pred = self.stellar_regressor(latents_reg)  # [B, 3]
+            outputs["stellar_prediction"] = stellar_pred
+
+            # 3. CONDITION (The Injection)
+            # Project predicted params back to d_model space
+            param_emb = self.param_projector(stellar_pred).unsqueeze(1) # [B, 1, d_model]
+            
+            # Concatenate to latents: [B, M, D] + [B, 1, D] -> [B, M+1, D]
+            # These are the Keys/Values for the decoder
+            cond_latents = torch.cat([latents, param_emb], dim=1)
+            
+            # Position indices for the condition tokens (latents + 1 param token)
+            # We already have latent_positions associated with 'latents' inside the encoder,
+            # but CrossAttentionBlock expects kv_positions matching cond_latents.
+            # Encoder latents have positions 0..M-1. Param token gets position M.
+            bsz = latents.size(0)
+            M = latents.size(1)
+            # M+1 positions: 0 to M
+            cond_positions = torch.arange(M + 1, device=device, dtype=torch.long)
+            
+            # 4. DECODE
+            # Prepare Queries: [B, N+K, D]
+            # Spectral queries (N) + Prefix queries (K)
+            full_queries = torch.cat([
+                self.spectral_queries,
+                self.prefix_queries
+            ], dim=1).expand(bsz, -1, -1)
+            
+            # Query positions (cached)
+            query_positions = self.decoder_query_positions.to(device)
+
+            # Cross-Attend: Queries attend to Conditioned Latents
+            # full_queries is Q, cond_latents is K/V
+            # input_mask for cond_latents is all True (all ones)
+            cond_mask = torch.ones(bsz, M + 1, device=device, dtype=torch.bool)
+            
+            decoder_out = self.perceiver_decoder(
+                latents=full_queries,     # Q
+                inputs=cond_latents,      # K, V
+                input_mask=cond_mask,
+                latent_positions=query_positions,   # Pos for Q
+                input_positions=cond_positions      # Pos for K, V
+            )
+            decoder_out = self._safe_tensor(decoder_out)
+
+            # 5. SPLIT OUTPUTS
+            spectral_len = self.spectral_queries.size(1)
+            
+            # Part 1: Spectrum
+            spec_out_emb = decoder_out[:, :spectral_len, :]
+            spectral_pred = self.spectrum_output_head(spec_out_emb).squeeze(-1) # [B, N]
+            
+            recon_loss = F.mse_loss(spectral_pred, spectral_targets.view_as(spectral_pred), reduction="mean")
             outputs["spectral_reconstruction"] = spectral_pred
             outputs["spectral_targets"] = spectral_targets
             outputs["reconstruction_loss"] = recon_loss
 
-            prefix_embeddings = self._safe_tensor(self.llm_adapter(latents))
+            # Part 2: LLM Prefix
+            prefix_out_emb = decoder_out[:, spectral_len:, :]
+            prefix_embeddings = self.llm_output_head(prefix_out_emb)
             outputs["prefix_embeddings"] = prefix_embeddings
 
-            total_loss = total_loss + self.loss_weights.get("reconstruction", 1.0) * recon_loss
+            # Stellar parameter loss
+            stellar_params_true = self._extract_stellar_params(batch)
+            param_loss = torch.tensor(0.0, device=device)
+            if stellar_params_true is not None:
+                stellar_params_true = stellar_params_true.to(device)
+                # Clamp predictions to prevent extreme values before loss computation
+                stellar_pred_clamped = torch.clamp(stellar_pred, min=-10.0, max=10.0)
+                param_loss = F.mse_loss(stellar_pred_clamped, stellar_params_true, reduction="mean")
+                # Check for NaN in param_loss before adding to total
+                if torch.isnan(param_loss) or torch.isinf(param_loss):
+                    param_loss = torch.tensor(0.0, device=device)
+                outputs["stellar_targets"] = stellar_params_true
+                outputs["param_loss"] = param_loss
 
-        if self.config.get("enable_alignment", True):
-            if self.contrastive_loss_type == "dualformer":
-                if self.dualformer_head is None:
-                    raise ValueError("DualFormer loss selected but dualformer_head is not initialized.")
-                padding_text = text_mask.float() if text_mask is not None else None
-                padding_spec = spectral_mask.float() if spectral_mask is not None else None
-                df_emb_text, df_emb_spec, df_proj_text, df_proj_spec = self._dualformer_encode(
-                    text_embeddings,
-                    spectral_embeddings,
-                    padding_text,
-                    padding_spec,
-                )
-                df_emb_text = self._safe_tensor(df_emb_text)
-                df_emb_spec = self._safe_tensor(df_emb_spec)
-                df_proj_text = self._safe_tensor(df_proj_text)
-                df_proj_spec = self._safe_tensor(df_proj_spec)
-                clip_loss = self._dualformer_loss(df_proj_text, df_proj_spec, df_emb_text, df_emb_spec)
-                outputs["dualformer_text_emb"] = df_emb_text
-                outputs["dualformer_spec_emb"] = df_emb_spec
-                outputs["dualformer_text_proj"] = df_proj_text
-                outputs["dualformer_spec_proj"] = df_proj_spec
-            else:
-                seq_text = text_embeddings.size(1)
-                seq_spec = spectral_embeddings.size(1)
-                text_positions = torch.arange(seq_text, device=device, dtype=torch.long)
-                spec_positions = torch.arange(seq_spec, device=device, dtype=torch.long)
+            # Check reconstruction loss for NaN/Inf
+            if torch.isnan(recon_loss) or torch.isinf(recon_loss):
+                recon_loss = torch.tensor(0.0, device=device)
 
-                text_latents = self._safe_tensor(
-                    self.perceiver(text_embeddings, text_mask, text_positions)
-                )
-                spec_latents = self._safe_tensor(
-                    self.perceiver(spectral_embeddings, spectral_mask, spec_positions)
-                )
-                g_text = self._pool_alignment(text_latents, branch="text")
-                g_spec = self._pool_alignment(spec_latents, branch="spectra")
+            total_loss = (
+                total_loss 
+                + self.loss_weights.get("reconstruction", 1.0) * recon_loss
+                + self.loss_weights.get("param_regression", 1.0) * param_loss
+            )
+            # print("total loss: ", total_loss.item(), " reconstruction: ", recon_loss.item(), " params: ", param_loss.item())
 
-                clip_loss = self._alignment_loss(g_text, g_spec)
-                if self.training and self.contrastive_loss_type == "info_nce":
-                    self._update_contrastive_queue(g_text, g_spec)
-                outputs["g_text"] = g_text
-                outputs["g_spec"] = g_spec
-            outputs["contrastive_loss"] = clip_loss
-
-            total_loss = total_loss + self.loss_weights.get("contrastive", 1.0) * clip_loss
 
         # Optional: Cycle-fusion CE branch using follow-up QA
-        if self.enable_cycle_ce and ("followup_question_ids" in batch) and ("followup_answer_ids" in batch):
-            fq_ids = batch["followup_question_ids"].to(device)
-            fa_ids = batch["followup_answer_ids"].to(device)
-            if fq_ids.dim() == 1:
-                fq_ids = fq_ids.unsqueeze(0)
-            if fa_ids.dim() == 1:
-                fa_ids = fa_ids.unsqueeze(0)
-            prefix = outputs.get("prefix_embeddings", None)
-            if prefix is None:
-                # If not computed (e.g., alignment-only), derive from latents via llm_adapter when available
-                latents = outputs.get("latents")
-                if latents is not None:
-                    prefix = self._safe_tensor(self.llm_adapter(latents))
-            if prefix is not None:
-                # Build combined prompt+answer ids for teacher forcing
-                full_ids = torch.cat([fq_ids, fa_ids], dim=1)
-                # Token embeddings from LLM
-                base_llm = getattr(self.llm_model, "base_model", self.llm_model)
-                tok_embeds = base_llm.tok_embeddings(full_ids.to(device))
-                # Concatenate prefix embeddings; trim/pad to fit context window of token embeddings
-                inputs_embeds = torch.cat([prefix.to(device, dtype=tok_embeds.dtype), tok_embeds], dim=1)
-                # Build attention mask: 1s for prefix + non-pad for ids
-                pad_id = 0
-                attn_mask_ids = (full_ids != pad_id).long()
-                prefix_mask = torch.ones(prefix.size(0), prefix.size(1), device=device, dtype=torch.long)
-                attention_mask = torch.cat([prefix_mask, attn_mask_ids.to(device)], dim=1)
-                # Choose backend path
-                if hasattr(base_llm, "get_input_embeddings"):
-                    hidden2, logits2 = self._hf_forward_from_embeds(inputs_embeds, attention_mask)
-                else:
-                    hidden2, logits2 = self._llama_forward_from_embeds(inputs_embeds, attention_mask)
-                # Build labels: ignore prefix+question; supervise answer tokens only
-                B, Ltot, V = logits2.shape
-                prefix_len = prefix.size(1)
-                q_len = fq_ids.size(1)
-                a_len = fa_ids.size(1)
-                labels = torch.full((B, prefix_len + q_len + a_len), -100, device=device, dtype=torch.long)
-                ans_slice = slice(prefix_len + q_len, prefix_len + q_len + a_len)
-                labels[:, ans_slice] = fa_ids.to(device)
-                # Sanitize answer labels: mask invalid or padding ids to -100
-                # Resolve model vocab size and pad id if available
-                vocab_size = None
-                pad_id = 0
-                base_params = getattr(base_llm, 'params', None)
-                if base_params is not None:
-                    vocab_size = getattr(base_params, 'vocab_size', None)
-                if vocab_size is None and hasattr(base_llm, 'config'):
-                    vocab_size = getattr(base_llm.config, 'vocab_size', None)
-                    pad_id = getattr(base_llm.config, 'pad_token_id', pad_id)
-                if vocab_size is None:
-                    # Fallback to logits vocab dim
-                    vocab_size = V
-                ans_labels = labels[:, ans_slice]
-                invalid = (ans_labels < 0) | (ans_labels >= vocab_size)
-                if pad_id is not None:
-                    invalid = invalid | (ans_labels == pad_id)
-                labels[:, ans_slice][invalid] = -100
-                # Standard shifted CE
-                shift_logits = logits2[..., :-1, :].contiguous()
-                shift_labels = labels[..., 1:].contiguous()
-                ce_loss = F.cross_entropy(shift_logits.view(-1, V), shift_labels.view(-1), ignore_index=-100)
-                outputs["ce_loss"] = ce_loss
-                total_loss = total_loss + self.loss_weights.get("ce", 1.0) * ce_loss
+        ce_loss = self._compute_cycle_ce_loss(batch, outputs, device)
+        if ce_loss > 0:
+            outputs["ce_loss"] = ce_loss
+            total_loss = total_loss + self.loss_weights.get("ce", 1.0) * ce_loss
 
         outputs["total_loss"] = total_loss
         outputs["dropped_modality"] = dropped_flag
         return outputs
+
+    @torch.no_grad()
+    def generate_response_from_batch(
+        self,
+        batch_data: Dict[str, Any],
+        batch_idx: int = 0,
+        tokenizer=None,
+        max_new_tokens: int = 100,
+        temperature: float = 0.7,
+        top_p: float = 0.9,
+    ) -> Tuple[str, str, str, List[float]]:
+        """
+        Generate text response for a single sample in the batch.
+        Returns: (generated_text, input_text, target_text, generation_log_probs)
+        """
+        self.eval()
+        device = next(self.parameters()).device
+        
+        # 1. Extract inputs for this sample
+        # We need to reconstruct a mini-batch of size 1 for the forward pass components
+        mini_batch = {}
+        for k, v in batch_data.items():
+            if isinstance(v, torch.Tensor):
+                mini_batch[k] = v[batch_idx : batch_idx + 1].to(device)
+            elif isinstance(v, list):
+                mini_batch[k] = [v[batch_idx]]
+            else:
+                mini_batch[k] = v
+                
+        # 2. Get Prefix Embeddings
+        # We can reuse the forward logic to get latents and then prefix
+        input_ids = mini_batch["input_ids"]
+        attention_mask = mini_batch.get("attention_mask", torch.ones_like(input_ids))
+        text_mask = attention_mask.bool()
+
+        text_embeddings = self._encode_text_inputs(input_ids)
+        text_embeddings = self.text_adapter(text_embeddings)
+        text_embeddings = text_embeddings + self.modality_embeddings[0].view(1, 1, -1)
+
+        spectral_input = self._get_spectral_input(mini_batch).to(device)
+        spectral_features = self.extract_spectral_features(spectral_input)
+        spectral_tokens = self._expand_spectral_tokens(spectral_features)
+        spectral_embeddings = self.spectral_adapter(spectral_tokens)
+        spectral_embeddings = spectral_embeddings + self.modality_embeddings[1].view(1, 1, -1)
+        
+        spectral_mask = torch.ones(
+            spectral_embeddings.size(0),
+            spectral_embeddings.size(1),
+            device=device,
+            dtype=torch.bool,
+        )
+
+        # Joint sequence
+        fusion_inputs, fusion_mask, fusion_positions = self._build_joint_sequence(
+            text_embeddings, spectral_embeddings, text_mask, spectral_mask
+        )
+        
+        # 3. Prepare Prompt (Follow-up Question)
+        latents = self.perceiver(fusion_inputs, fusion_mask, fusion_positions)
+        
+        # Regress
+        latents_reg = latents[:, 0]
+        stellar_pred = self.stellar_regressor(latents_reg)
+        
+        # Inject
+        param_emb = self.param_projector(stellar_pred).unsqueeze(1)
+        cond_latents = torch.cat([latents, param_emb], dim=1)
+        bsz = latents.size(0)
+        M = latents.size(1)
+        cond_positions = torch.arange(M + 1, device=device, dtype=torch.long)
+        
+        # Decode
+        full_queries = torch.cat([
+            self.spectral_queries,
+            self.prefix_queries
+        ], dim=1).expand(bsz, -1, -1)
+        query_positions = self.decoder_query_positions.to(device)
+        cond_mask = torch.ones(bsz, M + 1, device=device, dtype=torch.bool)
+        
+        decoder_out = self.perceiver_decoder(
+            latents=full_queries,
+            inputs=cond_latents,
+            input_mask=cond_mask,
+            latent_positions=query_positions,
+            input_positions=cond_positions
+        )
+        
+        # Split -> Prefix
+        spectral_len = self.spectral_queries.size(1)
+        prefix_out_emb = decoder_out[:, spectral_len:, :]
+        prefix_embeddings = self.llm_output_head(prefix_out_emb)
+
+
+        
+        # 3. Prepare Prompt (Follow-up Question)
+        # Check if we have followup data
+        if "followup_input_ids" in mini_batch:
+            f_ids = mini_batch["followup_input_ids"][0] # (L,)
+            f_labels = mini_batch["followup_labels"][0] # (L,)
+            
+            # Find start of answer (first non-negative label)
+            # If all are -100, it might be test mode (no answer), so use full sequence as prompt
+            answer_starts = (f_labels != -100).nonzero()
+            if answer_starts.numel() > 0:
+                answer_start_idx = answer_starts[0].item()
+                prompt_ids = f_ids[:answer_start_idx]
+                target_ids = f_ids[answer_start_idx:]
+            else:
+                # No answer labels, assume full sequence is prompt (or check for padding)
+                # Strip padding from the end
+                pad_id = 0
+                if tokenizer:
+                    pad_id = getattr(tokenizer, 'pad_id', 0)
+                
+                non_pad = (f_ids != pad_id).nonzero()
+                if non_pad.numel() > 0:
+                    last_idx = non_pad[-1].item()
+                    prompt_ids = f_ids[:last_idx+1]
+                else:
+                    prompt_ids = f_ids # All padding?
+                target_ids = torch.tensor([], device=device, dtype=torch.long)
+        else:
+            # Fallback to main input_ids if no followups (unlikely for this task)
+            prompt_ids = input_ids[0]
+            target_ids = torch.tensor([], device=device, dtype=torch.long)
+
+        # 4. Generation Loop with Hard Textual Injection
+        
+        # Format predicted parameters as text
+        # Denormalize: Teff * 5700
+        pred_teff = stellar_pred[0, 0].item() * 5700.0
+        pred_logg = stellar_pred[0, 1].item()
+        pred_feh = stellar_pred[0, 2].item()
+        
+        pred_text_prefix = f"Predicted Params: Teff {pred_teff:.0f} K, logg {pred_logg:.2f}, [Fe/H] {pred_feh:.2f}. "
+        
+        # Prepare tokens for the injection
+        if tokenizer:
+            prefix_ids_list = tokenizer.encode(pred_text_prefix, bos=False, eos=False)
+            # Depending on tokenizer, it might add bos. Strip it if we are mid-sentence or appending.
+            # Llama tokenizer usually adds BOS if bos=True. Here we want raw tokens.
+            prefix_ids = torch.tensor(prefix_ids_list, device=device, dtype=torch.long)
+        else:
+            # Fallback if no tokenizer available (shouldn't happen in valid flow)
+            prefix_ids = torch.tensor([], device=device, dtype=torch.long)
+            
+        # Prepend to the prompt
+        # prompt_ids includes BOS if original data had it. We insert AFTER BOS if present, or just prepend.
+        # Assuming prompt_ids[0] is BOS (128000 for Llama 3).
+        has_bos = False
+        if prompt_ids.numel() > 0 and tokenizer and prompt_ids[0] == tokenizer.bos_id:
+            has_bos = True
+            
+        if has_bos:
+            current_ids = torch.cat([
+                prompt_ids[:1],  # BOS
+                prefix_ids,      # Injection
+                prompt_ids[1:]   # Rest of prompt
+            ], dim=0).unsqueeze(0)
+        else:
+            current_ids = torch.cat([
+                prefix_ids,
+                prompt_ids
+            ], dim=0).unsqueeze(0)
+            
+        gen_log_probs = []
+        
+        base_llm = getattr(self.llm_model, "base_model", self.llm_model)
+        
+        for _ in range(max_new_tokens):
+            # Embed current sequence
+            current_embeddings = base_llm.tok_embeddings(current_ids)
+            
+            # Concatenate prefix + current
+            full_embeddings = torch.cat([prefix_embeddings, current_embeddings], dim=1)
+            
+            # Forward pass
+            # We use the full sequence forward (inefficient but safe)
+            # _llama_forward_from_embeds returns (hidden, logits)
+            _, logits = self._llama_forward_from_embeds(full_embeddings)
+            
+            # Get last token logits
+            next_token_logits = logits[0, -1, :]
+            
+            # Sample
+            # Apply temperature
+            if temperature > 0:
+                next_token_logits = next_token_logits / temperature
+            
+            # Apply top_p
+            if top_p < 1.0:
+                sorted_logits, sorted_indices = torch.sort(next_token_logits, descending=True)
+                cumulative_probs = torch.cumsum(F.softmax(sorted_logits, dim=-1), dim=-1)
+                sorted_indices_to_remove = cumulative_probs > top_p
+                # Shift the indices to the right to keep also the first token above the threshold
+                sorted_indices_to_remove[..., 1:] = sorted_indices_to_remove[..., :-1].clone()
+                sorted_indices_to_remove[..., 0] = 0
+                indices_to_remove = sorted_indices[sorted_indices_to_remove]
+                next_token_logits[indices_to_remove] = float('-inf')
+                
+            probs = F.softmax(next_token_logits, dim=-1)
+            next_token = torch.multinomial(probs, num_samples=1)
+            
+            # Append
+            current_ids = torch.cat([current_ids, next_token.unsqueeze(0)], dim=1)
+            gen_log_probs.append(torch.log(probs[next_token]).item())
+            
+            # Stop if EOS
+            if tokenizer and next_token.item() == tokenizer.eos_id:
+                break
+                
+        # 5. Decode
+        if tokenizer:
+            # Input text (Prompt)
+            input_text = tokenizer.decode(prompt_ids.cpu().tolist())
+            
+            # Target text (True Answer)
+            # Filter out -100 if any remain (though we sliced them out) and padding
+            target_ids_list = [t for t in target_ids.cpu().tolist() if t != -100 and t != tokenizer.pad_id]
+            target_text = tokenizer.decode(target_ids_list)
+            
+            # Generated text (excluding prompt)
+            generated_ids_list = current_ids[0, prompt_ids.size(0):].cpu().tolist()
+            generated_text = tokenizer.decode(generated_ids_list)
+        else:
+            input_text = str(prompt_ids.cpu().tolist())
+            target_text = str(target_ids.cpu().tolist())
+            generated_text = str(current_ids[0, prompt_ids.size(0):].cpu().tolist())
+            
+        return generated_text, input_text, target_text, gen_log_probs
 
     @classmethod
     def from_config_file(cls, llm_model, spectral_model, config_path: Union[str, Path]):

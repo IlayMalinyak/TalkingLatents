@@ -3,15 +3,16 @@ experiment:
   seed: 42
 
 llm:
-  llm_root: /data/.llama
+  llm_root: /home/ilay.kamai/work/.llama
   llm_model: Llama3.1-8B
   llm_path: null
   llm_precision: fp16
 
 data:
-  json_file: /data/TalkingLatents/data/dataset/stellar_descriptions_questions_short.json
-  tokenizer_path: /data/.llama/Llama3.1-8B/tokenizer.model
-  batch_size: 4
+  json_file: /home/ilay.kamai/work/TalkingLatents/data/dataset/stellar_qa_hybrid.json
+  features_file: None
+  tokenizer_path: /home/ilay.kamai/work/.llama/Llama3.1-8B/tokenizer.model
+  batch_size: 2
   num_workers: 2
   train_ratio: 0.7
   val_ratio: 0.15
@@ -20,13 +21,13 @@ data:
   max_length: 128
   cache_dir: cache/late_fusion
   dataset_kwargs:
-    followup_json_file: /data/TalkingLatents/data/dataset/stellar_descriptions_questions.json
-    followup_mode: mixed
+    # followup_json_file is likely not needed for diverse loader as it has its own logic, but keeping if it uses base args
+    # followup_mode: mixed
   # Cycle-fusion follow-up controls (optional)
   use_followups: true
   followup_prob: 1.0
   max_followups: 1
-  followup_seed: 42
+  followup_seed: 12345
   append_answer_prompt: true
 
 model:
@@ -40,6 +41,7 @@ model:
       reconstruction: 1.0
       contrastive: 0.5
       ce: 1.0
+      param_regression: 1.0
     modality_dropout:
       enabled: true
       drop_text_prob: 0.3
@@ -50,16 +52,16 @@ spectral_model:
 
 training:
   distributed: True
-  num_epochs: 50
+  num_epochs: 1000
   optimizer:
     type: adamw
-    lr: 0.0001
-    weight_decay: 0.01
+    lr: 0.0002
+    weight_decay: 0.001
     betas: [0.9, 0.999]
   scheduler:
     type: cosine
     t_max: 2
-    min_lr: 1.0e-5
+    min_lr: 1.0e-6
   accumulation_steps: 1
   grad_clip: true
   max_grad_norm: 1.0

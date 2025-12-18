@@ -1,13 +1,13 @@
 #!/bin/bash
-#SBATCH --job-name=TL_fup_qwen
+#SBATCH --job-name=TL_qwen_inference
 #SBATCH --nodes=1
 #SBATCH --ntasks=1                   
-#SBATCH --gres=gpu:nvidia_l40s:4
+#SBATCH --gres=gpu:nvidia_l40s:1
 #SBATCH --cpus-per-task=32
 #SBATCH --mem=180G                    # Increased from 128G to handle 32B model loading
-#SBATCH --partition=l40s-public
-#SBATCH --qos=24h_4g
-#SBATCH -t 24:00:00
+#SBATCH --partition=l40s-shared
+#SBATCH --qos=12h_4g
+#SBATCH -t 12:00:00
 
 set -euo pipefail
 
@@ -39,8 +39,8 @@ OUTDIR=${OUTDIR:-/home/ilay.kamai/work/TalkingLatents/logs}
 
 EXP=${EXP:-qwen32_4bit_fup_v2}
 EPOCHS=${EPOCHS:-30}
-BATCH=${BATCH:-4}
-MAXLEN=${MAXLEN:-128}
+BATCH=${BATCH:-8}
+MAXLEN=${MAXLEN:-256}
 WORKERS=${WORKERS:-4}
 LR=${LR:-1e-4}
 WD=${WD:-1e-3}
@@ -52,30 +52,6 @@ srun --ntasks=$SLURM_NNODES --ntasks-per-node=1 \
     --output=/home/ilay.kamai/athena/logs/%x_%j_%N_%t.out \
   --error=/home/ilay.kamai/athena/logs/%x_%j_%N_%t.err \
   --container=/rg/perets_prj/ilay.kamai/containers/torch2.7-tf2.20-cu128.sif \
-  python -u /home/ilay.kamai/work/TalkingLatents/src/simple_questions_multitok.py \
-  --llm_backend qwen \
-  --hf_model_name Qwen/Qwen2.5-32B-Instruct \
-  --hf_quantization 4bit \
-  --hf_max_memory_gb 30 \
-  --hf_device_map '{"": 0}' \
-  --hf_trust_remote_code \
-  --json_file "${JSON_FILE}" \
-  --mode single_star \
-  --single_dataset_type regular \
-  --output_dir "${OUTDIR}" \
-  --exp_name "${EXP}" \
-  --batch_size "${BATCH}" \
-  --num_epochs "${EPOCHS}" \
-  --learning_rate "${LR}" \
-  --weight_decay "${WD}" \
-  --max_seq_length "${MAXLEN}" \
-  --num_workers "${WORKERS}" \
-  --num_spectral_features "${TOKS}" \
-  --loss_lambda "${LAMBDA}" \
-  --llm_precision bf16 \
-  --use_amp \
-  --gradient_checkpointing \
-  --disable_classification \
-  --enable_followup_augmentation \
-  --followup_prob 0.7 \
-  --max_followup_turns 2 \
+  python -u /home/ilay.kamai/work/TalkingLatents/src/follow_up_inference.py \
+  --checkpoint_path /home/ilay.kamai/work/TalkingLatents/logs/qwen_32b_best_2025-11-29-22-53/qwen32_4bit_fup_resume_best.pth \
+  --max_samples 200

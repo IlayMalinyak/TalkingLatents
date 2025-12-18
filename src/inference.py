@@ -37,8 +37,8 @@ from src.simple_questions_multitok import (
     build_model_multitok,
     ensure_backend_config,
 )
+from src.tokenizer_adapter import load_tokenizer_adapter
 from nn.llm_multi import MultimodalLlamaModelMultiTokens
-from llama3.llama.tokenizer import Tokenizer
 from nn.train import LLMTrainer
 from nn.optim import CQR
 from data.transforms import GeneralSpectrumPreprocessor, ToTensor, Compose
@@ -424,8 +424,26 @@ def run_feature_interpolation(trainer: LLMTrainer,
         model_was_training = model.training
         model.eval()
 
-    _, tokenizer_path = get_model_path(args)
-    tokenizer = Tokenizer(model_path=tokenizer_path)
+    backend_config = ensure_backend_config(args)
+    tokenizer_backend = backend_config.tokenizer_backend
+    tokenizer_path = backend_config.tokenizer_path
+    if tokenizer_backend == 'llama' and tokenizer_path is None:
+        _, tokenizer_path = get_model_path(args)
+        backend_config.tokenizer_path = tokenizer_path
+    
+    print(f"Loading tokenizer (backend={tokenizer_backend})...")
+    try:
+        tokenizer = load_tokenizer_adapter(
+            backend=tokenizer_backend,
+            tokenizer_path=tokenizer_path,
+            hf_model_name=backend_config.model_name_or_path if tokenizer_backend != 'llama' else None,
+            trust_remote_code=backend_config.trust_remote_code,
+            hf_revision=backend_config.revision,
+        )
+        print(f"[OK] Loaded tokenizer from {tokenizer_path or backend_config.model_name_or_path}")
+    except Exception as e:
+        print(f"Error loading tokenizer: {e}")
+        sys.exit(1)
 
     if isinstance(device, int):
         if torch.cuda.is_available():
@@ -3466,7 +3484,7 @@ def run_prediction_evaluation(trainer: LLMTrainer,
                               inference_args,
                               quantiles: List[float],
                               plots_dir: str,
-                              backend_config: LLMBackendConfig | None = None) -> None:
+                              backend_config = None) -> None:
     """Generate stellar predictions, text generations, consistency plots, and save outputs."""
     print("Running text generation for consistency analysis...")
     max_samples = getattr(inference_args, 'consistency_max_samples', None)
@@ -3608,7 +3626,7 @@ def parse_inference_args():
                         help='Directory to save inference results')
     parser.add_argument('--llm_backend', type=str, choices=['llama', 'hf', 'qwen'], default='llama',
                         help='Backbone family to use for inference.')
-    parser.add_argument('--llm_root', type=str, default=os.environ.get('LLM_ROOT', '/data/.llama'),
+    parser.add_argument('--llm_root', type=str, default=os.environ.get('LLM_ROOT', '/home/ilay.kamai/work/.llama'),
                        help='Root directory containing LLaMA models (or set env LLM_ROOT)')
     parser.add_argument('--llm_model', type=str, default='Llama3.1-8B',
                         help='LLaMA model name relative to --llm_root.')
@@ -3639,13 +3657,13 @@ def parse_inference_args():
     
     # Data arguments (can be overridden from config)
     parser.add_argument('--json_file', type=str, 
-                        default='/data/TalkingLatents/data/dataset/stellar_descriptions_questions_short.json',
+                        default='/home/ilay.kamai/work/TalkingLatents/data/dataset/stellar_descriptions_questions_short.json',
                         help='Path to main dataset JSON file')
     parser.add_argument('--comparative_json_file', type=str,
-                        default='/data/TalkingLatents/data/dataset/comparative_dataset.json',
+                        default='/home/ilay.kamai/work/TalkingLatents/data/dataset/comparative_dataset.json',
                         help='Path to comparative dataset JSON file')
     parser.add_argument('--features_file', type=str,
-                        default='/data/TalkingLatents/logs/2025-07-29/features.npy',
+                        default='/home/ilay.kamai/work/TalkingLatents/logs/2025-07-29/features.npy',
                         help='Path to pre-computed spectral features')
     
     # Inference settings

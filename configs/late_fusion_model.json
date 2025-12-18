@@ -1,26 +1,22 @@
 {
   "llm_hidden_dim": 4096,
   "spectral_feature_dim": 2048,
-
-  "d_model": 768,
+  "d_model": 2048,
   "d_align": 512,
   "d_llm": 4096,
-
-  "M_latent": 32,
+  "M_latent": 64,
+  "llm_prefix_len": 32,
   "num_latent_blocks": 8,
   "num_heads": 8,
   "ffn_mult": 4,
-
   "dropout": 0.1,
   "attn_dropout": 0.0,
   "rope_theta": 10000.0,
-
   "freeze_llm": true,
   "freeze_spectral": true,
-
   "use_joint_encode": true,
-  "enable_alignment": true,
-  "contrastive_alignment_point": "pre",  
+  "enable_alignment": false,
+  "contrastive_alignment_point": "pre",
   "w_clip_pre": 1.0,
   "w_clip_post": 1.0,
   "contrastive": {
@@ -58,20 +54,22 @@
       "duality_weight": 1.0
     }
   },
-
   "learn_temperature": true,
   "temperature_init": 0.07,
-
-  "spectral_length": 2048,
+  "spectral_length": 4096,
   "spectral_token_count": 128,
   "spectral_target_dim": 2048,
-  "spectral_decode_mode": "film_1d",     
-
-  "loss_weights": { "reconstruction": 1.0, "contrastive": 1.0 },
-
+  "spectral_decode_mode": "film_1d",
+  "num_stellar_params": 3,
+  "loss_weights": {
+    "reconstruction": 1.0,
+    "contrastive": 1.0,
+    "param_regression": 1.0,
+    "ce": 1.0
+  },
   "modality_dropout": {
     "enabled": true,
-    "drop_text_prob": 0.0,
+    "drop_text_prob": 0.5,
     "drop_spectra_prob": 0.5
   }
 }

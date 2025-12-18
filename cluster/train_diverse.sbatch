@@ -1,22 +1,27 @@
 #!/bin/bash
-#SBATCH --job-name=TL_single_l05
+#SBATCH --job-name=TL_diverse_8B
 #SBATCH --nodes=1
-#SBATCH --ntasks=2
-#SBATCH --ntasks-per-node=2
+#SBATCH --ntasks=4
+#SBATCH --ntasks-per-node=4
 #SBATCH --cpus-per-task=8
-#SBATCH --gpus-per-node=a100:2
+#SBATCH --gpus-per-node=a100:4
 #SBATCH --qos=basic
-#SBATCH --mem=64G
+#SBATCH --mem=180G
 
-# Base paths
-JSON_FILE=/data/TalkingLatents/data/dataset/stellar_descriptions_questions_short.json
-JSON_FOLLOWUP=/data/TalkingLatents/data/dataset/stellar_descriptions_questions.json
+export MASTER_ADDR=$(scontrol show hostnames "$SLURM_NODELIST" | head -n1)
+export MASTER_PORT=$((29500 + ${SLURM_JOB_ID} % 1000))
 
-OUTDIR=${OUTDIR:-/data/TalkingLatents/logs}
-LLM_PATH=/data/.llama/Llama3.1-8B
+export HF_HOME=/rg/perets_prj/ilay.kamai/.cache/huggingface
+export TRANSFORMERS_CACHE=$HF_HOME/transformers
+export HF_DATASETS_CACHE=$HF_HOME/datasets
+export HUGGINGFACE_HUB_CACHE=$HF_HOME/hub
+mkdir -p $HF_HOME $TRANSFORMERS_CACHE $HF_DATASETS_CACHE $HUGGINGFACE_HUB_CACHE
+
+OUTDIR=${OUTDIR:-/home/ilay.kamai/work/TalkingLatents/logs}
+LLM_PATH=/home/ilay.kamai/work/.llama/Llama3.1-8B
 
 # Training hyper-parameters
-EXP=${EXP:-abl_single_fup_v2}
+EXP=${EXP:-diverse_qa}
 EPOCHS=${EPOCHS:-30}
 BATCH=${BATCH:-8}
 MAXLEN=${MAXLEN:-256}
@@ -27,18 +32,15 @@ TOKS=${TOKS:-8}
 LAMBDA=${LAMBDA:-1.0}
 
 srun --kill-on-bad-exit=1 \
-  --container-image="/rg/perets_prj/ilay.kamai/containers/astro2.sqsh" \
+  --container-image='/home/ilay.kamai/work/containers/astro2.sqsh' \
   --mem=64G \
   --output=/home/ilay.kamai/athena/logs/%x_%j_%s_%t.out \
   --error=/home/ilay.kamai/athena/logs/%x_%j_%s_%t.err \
   --no-container-entrypoint \
-  --container-mounts=/home/ilay.kamai/work:/data \
-  python -u /data/TalkingLatents/src/simple_questions_multitok.py \
+  --container-mounts='/home/ilay.kamai/work:/home/ilay.kamai/work' \
+    python -u /home/ilay.kamai/work/TalkingLatents/src/train_diverse_qa.py \
         --llm_path "${LLM_PATH}" \
-        --json_file "${JSON_FILE}" \
-        --followup_json_file "${JSON_FOLLOWUP}" \
         --mode single_star \
-        --single_dataset_type regular \
         --output_dir "${OUTDIR}" \
         --exp_name "${EXP}" \
         --batch_size "${BATCH}" \
@@ -52,7 +54,6 @@ srun --kill-on-bad-exit=1 \
         --llm_precision fp16 \
         --use_amp \
         --gradient_checkpointing \
-        --disable_classification \
         --enable_followup_augmentation  \
-        --followup_prob 0.7  \
+        --followup_prob 1.0  \
         --max_followup_turns 2

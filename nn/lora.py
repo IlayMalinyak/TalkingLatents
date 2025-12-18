@@ -23,27 +23,28 @@ class LoRALayer(nn.Module):
         self.alpha = alpha
         self.scaling = alpha / rank
 
-        # LoRA matrices - initialize on correct device/dtype
+        # Force LoRA weights to use bfloat16 even if base layer is quantized (uint8/int8)
+        # This prevents "normal_kernel_cuda not implemented for 'Byte'" error
+        lora_dtype = torch.bfloat16 if dtype in [torch.uint8, torch.int8, None] else dtype
+        
+        # LoRA matrices - initialize on correct device with float dtype
         self.lora_A = nn.Parameter(
-            torch.randn(rank, in_features, device=device, dtype=dtype) * 0.01
+            torch.randn(rank, in_features, device=device, dtype=lora_dtype) * 0.01
         )
         self.lora_B = nn.Parameter(
-            torch.zeros(out_features, rank, device=device, dtype=dtype)
+            torch.zeros(out_features, rank, device=device, dtype=lora_dtype)
         )
         self.dropout = nn.Dropout(dropout) if dropout > 0 else nn.Identity()
 
     def forward(self, x):
-        # Ensure LoRA params match input dtype/device (handles AMP/fp16)
-        if self.lora_A.dtype != x.dtype:
-            self.lora_A.data = self.lora_A.data.to(dtype=x.dtype)
-            self.lora_B.data = self.lora_B.data.to(dtype=x.dtype)
-        if self.lora_A.device != x.device:
-            self.lora_A.data = self.lora_A.data.to(device=x.device)
-            self.lora_B.data = self.lora_B.data.to(device=x.device)
-
-        # x shape: (..., in_features)
+        # Convert input to bfloat16 for LoRA computation if needed
+        # This ensures we work in a stable floating point format even if input is from quantized layer
+        x_lora = x.to(dtype=torch.bfloat16) if x.dtype != torch.bfloat16 else x
+        
+        # LoRA parameters stay in bfloat16 for gradient stability
+        # x_lora shape: (..., in_features)
         # LoRA forward: x @ A^T @ B^T * scaling
-        lora_out = (x @ self.lora_A.T @ self.lora_B.T) * self.scaling
+        lora_out = (x_lora @ self.lora_A.T @ self.lora_B.T) * self.scaling
         return self.dropout(lora_out)
 
 
@@ -88,8 +89,17 @@ class LoRALinear(nn.Module):
             param.requires_grad = False
 
     def forward(self, x):
+        # Get base layer output (may be in various dtypes from quantization)
         original_out = self.original_layer(x)
+        
+        # Compute LoRA delta (always in bfloat16)
         lora_out = self.lora(x)
+        
+        # Ensure both outputs are in the same dtype before adding
+        # Convert to bfloat16 for numerical stability
+        if original_out.dtype != torch.bfloat16:
+            original_out = original_out.to(dtype=torch.bfloat16)
+        
         return original_out + lora_out
 
 

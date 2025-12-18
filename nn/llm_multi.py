@@ -961,6 +961,10 @@ class MultimodalLlamaModelMultiTokens(MultimodalBackboneBase):
         gen_logps = []
         gen_ids = []
 
+        # Extract special tokens
+        pad_id = getattr(tokenizer, 'pad_id', getattr(tokenizer, 'pad_token_id', 0)) if tokenizer else 0
+        eos_id = getattr(tokenizer, 'eos_id', getattr(tokenizer, 'eos_token_id', None)) if tokenizer else None
+
         def sample_top_p(logits: torch.Tensor) -> int:
             # Check for NaN or inf in logits
             if torch.isnan(logits).any() or torch.isinf(logits).any():
@@ -972,6 +976,10 @@ class MultimodalLlamaModelMultiTokens(MultimodalBackboneBase):
             
             if temperature > 0:
                 logits = logits / temperature
+            
+            # Suppress padding token
+            if pad_id is not None:
+                logits[pad_id] = float('-inf')
             
             # Safe softmax with numerical stability
             logits_max = logits.max()
@@ -1048,9 +1056,9 @@ class MultimodalLlamaModelMultiTokens(MultimodalBackboneBase):
             prompt = torch.cat([prompt, next_tensor], dim=1)
 
             # Stop on EOS if available
-            if tokenizer is not None and hasattr(tokenizer, 'eos_id'):
-                if next_token == getattr(tokenizer, 'eos_id'):
+            if eos_id is not None:
+                if next_token == eos_id:
                     break
-
-        generated_text = tokenizer.decode(torch.tensor(gen_ids).cpu().numpy()) if tokenizer is not None else ''
+        
+        generated_text = tokenizer.decode(gen_ids) if tokenizer is not None else ''
         return generated_text, input_text, target_text, gen_logps

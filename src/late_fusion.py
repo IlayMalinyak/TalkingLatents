@@ -11,7 +11,7 @@ import random
 import sys
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Optional, List
 
 import numpy as np
 import torch
@@ -22,11 +22,14 @@ from torch.nn.parallel import DistributedDataParallel as DDP
 # Ensure project root on path
 ROOT_DIR = Path(__file__).resolve().parents[1]
 sys.path.append(str(ROOT_DIR))
+os.system('pip install tiktoken fairscale fire blobfile torchdiffeq torchcfm transformers bitsandbytes accelerate')
 
-from data.dataset_late_fusion import create_late_fusion_dataloaders
+
+from data.dataset_diverse import create_diverse_dataloaders
 from nn.late_fusion import LateFusionModel
 from nn.train import LateFusionTrainer
 from src.simple_questions import setup, _load_llm_model, _load_spectra_model
+from src.tokenizer_adapter import load_tokenizer_adapter
 
 
 def parse_args() -> argparse.Namespace:
@@ -175,29 +178,42 @@ def build_scheduler(optimizer: torch.optim.Optimizer, sched_cfg: Optional[Dict[s
     raise ValueError(f"Unsupported scheduler type: {sched_type}")
 
 
-def build_dataloaders(data_cfg: Dict[str, Any], world_size: int):
-    dataset_kwargs = dict(data_cfg.get("dataset_kwargs", {}))
+def build_dataloaders(data_cfg: Dict[str, Any], llm_cfg: Dict[str, Any], world_size: int):
+    dataset_kwargs = dict(data_cfg.get("dataset_kwargs") or {})
     cache_dir = resolve_path(data_cfg.get("cache_dir"))
-    tokenizer_path = resolve_path(data_cfg.get("tokenizer_path"))
-    if tokenizer_path:
-        dataset_kwargs["tokenizer_path"] = str(tokenizer_path)
     if cache_dir:
         dataset_kwargs["cache_dir"] = str(cache_dir)
 
     # Cycle-fusion follow-up controls (optional)
     if data_cfg.get("use_followups") is not None:
-        dataset_kwargs["use_followups"] = bool(data_cfg.get("use_followups"))
+        dataset_kwargs["enable_followup"] = bool(data_cfg.get("use_followups"))
     if data_cfg.get("followup_prob") is not None:
         dataset_kwargs["followup_prob"] = float(data_cfg.get("followup_prob"))
     if data_cfg.get("max_followups") is not None:
-        dataset_kwargs["max_followups"] = int(data_cfg.get("max_followups"))
-    if data_cfg.get("followup_seed") is not None:
-        dataset_kwargs["followup_seed"] = int(data_cfg.get("followup_seed"))
-    if data_cfg.get("append_answer_prompt") is not None:
-        dataset_kwargs["append_answer_prompt"] = bool(data_cfg.get("append_answer_prompt"))
+        dataset_kwargs["max_followup_turns"] = int(data_cfg.get("max_followups"))
+    
+    # Construct tokenizer args from LLM config and Data Config
+    llm_backend = llm_cfg.get("backend", "llama")
+    # Prefer tokenizer path given in data config, fallback to llm config
+    tokenizer_path = resolve_path(data_cfg.get("tokenizer_path") or llm_cfg.get("tokenizer_path"))
+    
+    tokenizer_adapter = load_tokenizer_adapter(
+        backend=llm_backend,
+        tokenizer_path=str(tokenizer_path) if tokenizer_path else None,
+        hf_model_name=llm_cfg.get("llm_model") if llm_backend != 'llama' else None,
+    )
+    
+    # Features loading
+    features_file = resolve_path(data_cfg.get("features_file"))
+    features_array = None
+    if features_file and features_file.exists():
+        print(f"Loading spectral features from {features_file}")
+        features_array = np.load(features_file)
 
-    train_loader, val_loader, test_loader = create_late_fusion_dataloaders(
+    print(f"DEBUG: dataset_kwargs passed to loader: {dataset_kwargs}")
+    train_loader, val_loader, test_loader = create_diverse_dataloaders(
         json_file=str(resolve_path(data_cfg["json_file"])),
+        features_array=features_array,
         batch_size=data_cfg.get("batch_size", 4),
         train_ratio=data_cfg.get("train_ratio", 0.7),
         val_ratio=data_cfg.get("val_ratio", 0.15),
@@ -206,6 +222,8 @@ def build_dataloaders(data_cfg: Dict[str, Any], world_size: int):
         num_workers=data_cfg.get("num_workers", 0),
         world_size=world_size,
         max_length=data_cfg.get("max_length", 512),
+        tokenizer=tokenizer_adapter,
+        tokenizer_backend=llm_backend,
         **dataset_kwargs,
     )
     return train_loader, val_loader, test_loader
@@ -223,17 +241,44 @@ def save_runtime_config(exp_dir: Path, config: Dict[str, Any], args: argparse.Na
 
 
 def resume_from_checkpoint(trainer: LateFusionTrainer, resume_path: str, device: torch.device) -> Dict[str, Any]:
-    ckpt = torch.load(resume_path, map_location=device)
+    print(f"Loading checkpoint from {resume_path} to CPU with mmap...")
+    try:
+        # Load with mmap to reduce RAM usage, map to CPU
+        ckpt = torch.load(resume_path, map_location='cpu', mmap=True)
+    except (TypeError, AttributeError):
+        print("mmap=True not supported/failed, falling back to standard CPU load")
+        ckpt = torch.load(resume_path, map_location='cpu')
+
     state = ckpt.get("model_state_dict", ckpt)
     trainer._unwrap_model().load_state_dict(state, strict=False)
+    del state  # Free reference to state code
+    
     if trainer.optimizer is not None and ckpt.get("optimizer"):
         trainer.optimizer.load_state_dict(ckpt["optimizer"])
     if trainer.scheduler is not None and ckpt.get("scheduler"):
         trainer.scheduler.load_state_dict(ckpt["scheduler"])
     if trainer.scaler is not None and ckpt.get("scaler"):
         trainer.scaler.load_state_dict(ckpt["scaler"])
+        # IMPORTANT: Reset the scaler's loss scale to a safe value
+        # A very large scale from checkpoint can cause numerical instability
+        current_scale = trainer.scaler.get_scale()
+        if current_scale > 2**16:  # Scale is too large, reset to safe value
+            print(f"Warning: GradScaler scale was {current_scale:.0f}, resetting to 2^16=65536 for stability")
+            trainer.scaler._scale.fill_(2**16)
+        elif current_scale < 1.0:  # Scale is too small
+            print(f"Warning: GradScaler scale was {current_scale:.6f}, resetting to 2^16=65536")
+            trainer.scaler._scale.fill_(2**16)
+    
     print(f"✓ Resumed weights from {resume_path}")
-    return ckpt
+    
+    # Extract metadata to return, then delete ckpt to free memory
+    resume_info = {
+        "epoch": ckpt.get("epoch", 0),
+        "min_loss": ckpt.get("min_loss"),
+        "best_acc": ckpt.get("best_acc"),
+    }
+    del ckpt
+    return resume_info
 
 
 def main():
@@ -269,24 +314,21 @@ def main():
     print(f"Using device {device}, world_size={world_size}")
 
     data_cfg = config.get("data", {})
-    train_loader, val_loader, _ = build_dataloaders(data_cfg, world_size)
+    llm_cfg = config.get("llm", {})
+    print(data_cfg.keys())
+    train_loader, val_loader, _ = build_dataloaders(data_cfg, llm_cfg, world_size)
 
     # Print sample follow-up questions before training
+    tokenizer = None
     if (not distributed) or local_rank == 0:
         print("\n" + "="*80)
         print("SAMPLE FOLLOW-UP QUESTIONS AND ANSWERS")
         print("="*80)
 
-        # Load tokenizer for decoding
-        tokenizer_path = resolve_path(data_cfg.get("tokenizer_path"))
-        tokenizer = None
-        if tokenizer_path and tokenizer_path.exists():
-            try:
-                from llama3.llama.tokenizer import Tokenizer
-                tokenizer = Tokenizer(model_path=str(tokenizer_path))
-                print(f"✓ Loaded tokenizer from {tokenizer_path}")
-            except Exception as e:
-                print(f"⚠ Could not load tokenizer: {e}")
+        # Load tokenizer for decoding - use the one from the dataset adapter
+        tokenizer = train_loader.dataset.tokenizer
+        if tokenizer:
+             print("✓ Tokenizer available for decoding debug")
 
         # Sample a few batches
         sample_count = 0
@@ -375,9 +417,17 @@ def main():
     apply_precision(llm_model, config.get("llm", {}).get("llm_precision", "fp16"))
     llm_model = llm_model.to(device)
 
-    spectral_model = maybe_load_spectral_model(config.get("spectral_model", {}))
-    if spectral_model is not None:
-        spectral_model = spectral_model.to(device)
+    spectral_model = None
+    # If using pre-computed features (feature mode), we don't load the spectral model
+    # The dataset loader handles feature loading, and LateFusionModel will use input as features
+    features_file = resolve_path(data_cfg.get("features_file"))
+    if features_file and features_file.exists():
+        print(f"Using pre-computed features from {features_file}; skipping spectral model load.")
+        spectral_model = None
+    else:
+        spectral_model = maybe_load_spectral_model(config.get("spectral_model", {}))
+        if spectral_model is not None:
+            spectral_model = spectral_model.to(device)
 
     perceiver_config = load_model_config(config.get("model", {}))
     model = LateFusionModel(llm_model, spectral_model, perceiver_config).to(device)
@@ -385,29 +435,47 @@ def main():
     num_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
     print(f"Number of trainable parameters: {num_params}")
 
-    if distributed:
-        model = DDP(
-            model,
-            device_ids=[local_rank],
-            output_device=local_rank,
-            find_unused_parameters=True,
-        )
+    # DDP Wrapping moved to after Trainer initialization (Layer Freezing)
 
-    optimizer = build_optimizer(model, training_cfg.get("optimizer", {}))
-    scheduler = build_scheduler(optimizer, training_cfg.get("scheduler"))
+    # Load LoRA parameters from config file
+    lora_params = None
+    lora_config_path = training_cfg.get("lora_config_path", "/home/ilay.kamai/work/TalkingLatents/src/llm_config_tuned.json")
+    if lora_config_path:
+        lora_config_path_resolved = resolve_path(lora_config_path)
+        if lora_config_path_resolved and lora_config_path_resolved.exists():
+            try:
+                with open(lora_config_path_resolved, "r") as f:
+                    lora_config = json.load(f)
+                    lora_params = lora_config.get("lora_params")
+                    if lora_params:
+                        print(f"✓ Loaded LoRA config from {lora_config_path_resolved}")
+                        print(f"  LoRA rank: {lora_params.get('lora_rank')}")
+                        print(f"  LoRA alpha: {lora_params.get('lora_alpha')}")
+                        print(f"  Freeze strategy: {lora_params.get('freeze_strategy')}")
+                        print(f"  LoRA start epoch: {lora_params.get('lora_start_epoch')}")
+                    else:
+                        print(f"⚠ No lora_params found in {lora_config_path_resolved}")
+            except Exception as e:
+                print(f"⚠ Error loading LoRA config from {lora_config_path_resolved}: {e}")
+        else:
+            print(f"⚠ LoRA config file not found: {lora_config_path}, continuing without LoRA")
+
+    # Define scaler before trainer
     use_amp = bool(training_cfg.get("use_amp", True) and torch.cuda.is_available())
     scaler = GradScaler(enabled=use_amp) if use_amp else None
 
+    # Create trainer first (this applies LoRA and freeze strategy!)
     trainer = LateFusionTrainer(
+        lora_params=lora_params,
         model=model,
-        optimizer=optimizer,
+        optimizer=None, # Will set later
         criterion=None,
         train_dataloader=train_loader,
         val_dataloader=val_loader,
         device=device,
         world_size=world_size,
         output_dim=1,
-        scheduler=scheduler,
+        scheduler=None, # Will set later
         max_iter=training_cfg.get("max_iter", -1),
         scaler=scaler,
         use_amp=use_amp,
@@ -419,6 +487,31 @@ def main():
         save_full_every_epoch=training_cfg.get("save_full_every_epoch", True),
         log_loss_every=training_cfg.get("log_losses_every"),
     )
+    
+    
+    # Wrap in DDP AFTER applying freeze/LoRA strategies
+    if distributed:
+        model = DDP(
+            model,
+            device_ids=[local_rank],
+            output_device=local_rank,
+            find_unused_parameters=True,
+        )
+        trainer.model = model
+
+    # Re-verify trainable parameters after trainer applied strategies
+    real_model = model.module if hasattr(model, "module") else model
+    llm_trainable = sum(p.numel() for p in real_model.llm_model.parameters() if p.requires_grad)
+    print(f"DEBUG: Post-Trainer LLM trainable params: {llm_trainable}")
+    
+    # NOW build optimizer with strictly trainable parameters
+    optimizer = build_optimizer(model, training_cfg.get("optimizer", {}))
+    scheduler = build_scheduler(optimizer, training_cfg.get("scheduler"))
+    
+    # Attach to trainer
+    trainer.optimizer = optimizer
+    trainer.scheduler = scheduler
+    trainer.tokenizer = tokenizer
 
     # Optional CE warmup schedule for cycle-fusion
     ce_cfg = training_cfg.get("ce", {}) or {}
@@ -441,6 +534,14 @@ def main():
     if args.dry_run:
         print("Dry run flag set; exiting before training.")
         return
+
+    # Run initial evaluation before training starts
+    if (not distributed) or local_rank == 0:
+        print("Running initial evaluation before training...")
+        try:
+            trainer.evaluate_validation_samples(device, epoch=-1)
+        except Exception as e:
+            print(f"Warning: Initial evaluation failed: {e}")
 
     results = trainer.fit(
         num_epochs=training_cfg.get("num_epochs", 1),

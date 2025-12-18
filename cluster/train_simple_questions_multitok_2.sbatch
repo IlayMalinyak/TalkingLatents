@@ -14,7 +14,7 @@ JSON_FILE=/data/TalkingLatents/data/dataset/stellar_descriptions_questions_short
 COMPARATIVE_JSON_FILE=/data/TalkingLatents/data/dataset/comparative_dataset.json
 ADVANCED_JSON_PATH=/data/TalkingLatents/data/dataset/caption_advanced_100k.json
 DATASET_TYPE=regular
-MODE=combined
+MODE=single_star
 FEATURES_FILE=/data/TalkingLatents/logs/2025-07-29/features.npy
 LLM_PATH=/data/.llama/Llama3.1-8B
 

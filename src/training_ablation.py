@@ -222,7 +222,7 @@ def main():
 
     # Define ablation grid
     grid: List[AblationConfig] = []
-    for json_variant in ('short'):
+    for json_variant in ('short',):
         for followup in (False, True):
             for feature_pred in ('none', 'pred_pair_random', 'pred_pair_nn'):
                 label = f"{json_variant}-fup{int(followup)}-{feature_pred}"

@@ -99,23 +99,50 @@ class LateFusionDataset(StellarQuestionsDataset):
         import json
         try:
             with open(self.followup_json_file, 'r') as f:
-                self.followup_data = json.load(f)
-            print(f"Loaded {len(self.followup_data)} follow-up samples from {self.followup_json_file}")
+                raw_followup = json.load(f)
+            
+            # Convert list to dict keyed by obsid
+            self.followup_data = {}
+            count = 0
+            for item in raw_followup:
+                # Try to find obsid in top level or inside stellar_data
+                obsid = item.get("obsid")
+                if obsid is None and "stellar_data" in item:
+                    obsid = item["stellar_data"].get("obsid")
+                
+                if obsid is not None:
+                    # Store by integer obsid if possible
+                    try:
+                        obsid = int(obsid)
+                    except (ValueError, TypeError):
+                        pass
+                    self.followup_data[obsid] = item
+                    count += 1
+
+            print(f"Loaded {count} follow-up samples from {self.followup_json_file} (indexed by obsid)")
         except Exception as e:
             print(f"Warning: Could not load follow-up JSON {self.followup_json_file}: {e}")
             self.followup_data = None
 
     def _select_description_text(self, sample: Dict[str, Any]) -> str:
         parsed = self.parse_description_text(sample.get("description", ""))
-        text = parsed.get("answer") or sample.get("description", "")
+        text = parsed.get("question")
         return text.strip()
 
-    def _get_followup_from_description(self, sample_idx: int) -> Optional[Tuple[str, str]]:
+    def _get_followup_from_description(self, obsid: int) -> Optional[Tuple[str, str]]:
         """Extract question and answer from the follow-up JSON file."""
-        if self.followup_data is None or sample_idx >= len(self.followup_data):
+        if self.followup_data is None:
+            return None
+        
+        try:
+            obsid = int(obsid)
+        except (ValueError, TypeError):
+            pass
+
+        followup_sample = self.followup_data.get(obsid)
+        if followup_sample is None:
             return None
 
-        followup_sample = self.followup_data[sample_idx]
         description = followup_sample.get("description", "")
 
         if not description:
@@ -180,11 +207,17 @@ class LateFusionDataset(StellarQuestionsDataset):
                     use_description = True
                 elif self.followup_mode == "mixed" and self.followup_data is not None:
                     # 50% probability for description, 50% for stellar type
-                    use_description = self._rng.random() < 0.5
+                    # For validation, use deterministic hash of obsid to ensure variety across samples
+                    # regardless of seed. For training, use RNG (which might be effectively static if not reseeded).
+                    if self.split == 'val':
+                        use_description = (hash(str(obsid)) % 2) == 0
+                    else:
+                        use_description = self._rng.random() < 0.5
 
                 # Try to use description from follow-up JSON file
                 if use_description:
-                    qa_pair = self._get_followup_from_description(sample_idx)
+                    # Use obsid for lookup
+                    qa_pair = self._get_followup_from_description(obsid)
                     if qa_pair is not None:
                         q, a = qa_pair
 
@@ -214,10 +247,33 @@ class LateFusionDataset(StellarQuestionsDataset):
                 if q and a:
                     if self.append_answer_prompt:
                         q = f"{q}\nAnswer:"
-                    q_ids, _ = self._tokenize_text(q, bos=True)
-                    a_ids, _ = self._tokenize_text(a, bos=False)
-                    sample_out["followup_question_ids"] = q_ids
-                    sample_out["followup_answer_ids"] = a_ids
+                    
+                    # Use no_pad to get raw lists
+                    q_ids, _ = self._tokenize_text_no_pad(q, bos=True)
+                    a_ids, _ = self._tokenize_text_no_pad(a, bos=False)
+                    
+                    # Concatenate
+                    combined_ids = q_ids + a_ids
+                    # Labels: -100 for Q, a_ids for A
+                    combined_labels = [-100] * len(q_ids) + a_ids
+                    
+                    # Truncate if necessary
+                    if len(combined_ids) > self.max_length:
+                        combined_ids = combined_ids[:self.max_length]
+                        combined_labels = combined_labels[:self.max_length]
+                        
+                    # Pad
+                    pad_len = self.max_length - len(combined_ids)
+                    if pad_len > 0:
+                        pad_id = 0
+                        if self.tokenizer is not None and hasattr(self.tokenizer, 'pad_id'):
+                            pad_id = self.tokenizer.pad_id
+                            
+                        combined_ids = combined_ids + [pad_id] * pad_len
+                        combined_labels = combined_labels + [-100] * pad_len
+                        
+                    sample_out["followup_input_ids"] = torch.tensor(combined_ids, dtype=torch.long)
+                    sample_out["followup_labels"] = torch.tensor(combined_labels, dtype=torch.long)
                     sample_out["has_followup"] = torch.tensor(1, dtype=torch.uint8)
                 else:
                     sample_out["has_followup"] = torch.tensor(0, dtype=torch.uint8)
@@ -246,12 +302,12 @@ def late_fusion_collate_fn(batch: List[Dict[str, Any]]) -> Dict[str, Any]:
     }
 
     # Optional follow-up tensors: collate only if present for at least one item
-    if any("followup_question_ids" in item for item in batch):
-        fq_tensors = [item.get("followup_question_ids", torch.zeros_like(input_ids[0])) for item in batch]
-        out["followup_question_ids"] = torch.stack(fq_tensors)
-    if any("followup_answer_ids" in item for item in batch):
-        fa_tensors = [item.get("followup_answer_ids", torch.zeros_like(input_ids[0])) for item in batch]
-        out["followup_answer_ids"] = torch.stack(fa_tensors)
+    if any("followup_input_ids" in item for item in batch):
+        fi_tensors = [item.get("followup_input_ids", torch.zeros_like(input_ids[0])) for item in batch]
+        out["followup_input_ids"] = torch.stack(fi_tensors)
+    if any("followup_labels" in item for item in batch):
+        fl_tensors = [item.get("followup_labels", torch.full_like(input_ids[0], -100)) for item in batch]
+        out["followup_labels"] = torch.stack(fl_tensors)
     if any("has_followup" in item for item in batch):
         out["has_followup"] = torch.stack([item.get("has_followup", torch.tensor(0, dtype=torch.uint8)) for item in batch])
 
@@ -317,8 +373,8 @@ def create_late_fusion_dataloaders(
 if __name__ == "__main__":
     from pathlib import Path
 
-    json_path = Path("/data/TalkingLatents/data/dataset/stellar_descriptions_questions_short.json")
-    tokenizer_path = Path("/data/.llama/Llama3.2-1B/tokenizer.model")
+    json_path = Path("/home/ilay.kamai/work/TalkingLatents/data/dataset/stellar_descriptions_questions_short.json")
+    tokenizer_path = Path("/home/ilay.kamai/work/.llama/Llama3.2-1B/tokenizer.model")
 
     dataset = LateFusionDataset(
         json_file=str(json_path),

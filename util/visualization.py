@@ -3,25 +3,31 @@ from scipy.signal import savgol_filter
 import numpy as np
 import umap
 
+BOUNDS = {'MAX_TEFF' : 7500, 'MIN_TEFF' : 3000, 'MAX_LOGG' : 5.0, 'MIN_LOGG' : 0, 'MAX_FEH' : 0.5, 'MIN_FEH' : -3}
 
-def plot_quantiles(true, preds, quantiles, scales, names, savedir='figs'):
+
+def _scale(arr, name):
+    return arr * (BOUNDS[f'MAX_{name.upper()}'] - BOUNDS[f'MIN_{name.upper()}']) + BOUNDS[f'MIN_{name.upper()}']
+
+
+def plot_quantiles(true, preds, quantiles, names, savedir='figs'):
     num_quantiles = len(quantiles) // 2
-    for i, (name, scale) in enumerate(zip(names, scales)):
+    for i, name in enumerate(names):
         color_list = plt.cm.get_cmap('Dark2', 8)
         print("plotting ", name)
-        t = true[:, i] * scale
+        t = _scale(true[:, i], name)
         sorting_indices = np.argsort(t)
         t = t[sorting_indices]
         for q in range(num_quantiles):
             color = color_list(q)
             conf_interval = (quantiles[-(q + 1)] - quantiles[q]) * 100
-            q_pred_down = preds[:, i, q][sorting_indices] * scale
-            q_pred_up = preds[:, i, -(q + 1)][sorting_indices] * scale
+            q_pred_down = _scale(preds[:, i, q][sorting_indices], name)
+            q_pred_up = _scale(preds[:, i, -(q + 1)][sorting_indices], name) 
             q_up_smooth = savgol_filter(q_pred_down, window_length=20, polyorder=1)
             q_down_smooth = savgol_filter(q_pred_up, window_length=20, polyorder=1)
             plt.plot(t, q_up_smooth, color=color, alpha=0.4, label=f'{conf_interval}% confidence interval')
             plt.plot(t, q_down_smooth, color=color, alpha=0.4)
-        q_med = preds[:, i, num_quantiles][sorting_indices] * scale
+        q_med = _scale(preds[:, i, num_quantiles][sorting_indices], name)
         plt.scatter(t, q_med, color='orange', alpha=0.4, s=5)
         plt.xlabel(f'True {name}')
         plt.ylabel(f'Predicted {name}')

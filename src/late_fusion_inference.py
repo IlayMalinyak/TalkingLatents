@@ -189,6 +189,7 @@ def run_late_fusion(
     input_ids: torch.Tensor,
     spectral_data: torch.Tensor,
     masked_spectra: torch.Tensor,
+    stellar_data: Dict[str, Any],
     device: torch.device,
 ) -> Dict[str, Any]:
     with torch.no_grad():
@@ -197,15 +198,28 @@ def run_late_fusion(
             "attention_mask": (input_ids != 0).long().to(device),
             "spectral_data": spectral_data.to(device),
             "masked_spectra": masked_spectra.to(device),
+            "stellar_data": [stellar_data],  # List of dicts for batch processing
         }
         outputs = model(batch)
-    # Keep both a tensor version (for generation) and a JSON-friendly version
+    
+    # Extract outputs
     prefix_embeds = outputs.get("prefix_embeddings")
     prefix_embeds_list = (
         prefix_embeds.detach().cpu().tolist() if isinstance(prefix_embeds, torch.Tensor) else None
     )
+    
+    # Extract spectral reconstruction
+    spectral_pred = outputs["spectral_reconstruction"][0].detach().cpu()
+    
+    # Extract stellar parameter prediction
+    stellar_pred = outputs.get("stellar_prediction")
+    stellar_pred_list = (
+        stellar_pred[0].detach().cpu().tolist() if isinstance(stellar_pred, torch.Tensor) else None
+    )
+    
     return {
-        "spectral_prediction": outputs["spectral_reconstruction"][0].detach().cpu().tolist(),
+        "spectral_prediction": spectral_pred.tolist(),
+        "stellar_params_pred": stellar_pred_list,
         "prefix_embeddings_tensor": prefix_embeds,
         "prefix_embeddings": prefix_embeds_list,
     }
@@ -404,6 +418,7 @@ def main() -> None:
                 base_ids,
                 spectral_data,
                 masked_spectra,
+                stellar_data,
                 device,
             )
 
@@ -419,8 +434,46 @@ def main() -> None:
                     temperature=0.7,
                     top_p=0.9,
                 )
-
+            
+            # Compute metrics against ground truth
             star_params = extract_params(stellar_data)
+            
+            # Spectra MSE
+            spectra_mse = None
+            if spectral_data is not None:
+                # Compute MSE between predicted and clean spectra
+                pred_spectra = torch.tensor(base_prediction["spectral_prediction"])
+                clean_spectra = spectral_data.squeeze()
+                min_len = min(pred_spectra.size(-1), clean_spectra.size(-1))
+                spectra_mse = torch.nn.functional.mse_loss(
+                    pred_spectra[..., :min_len],
+                    clean_spectra[..., :min_len]
+                ).item()
+            
+            # Stellar parameter MSE/MAE
+            param_mse = None
+            param_mae = None
+            if base_prediction.get("stellar_params_pred") and star_params:
+                pred_params = base_prediction["stellar_params_pred"]  # [Teff, logg, Fe_H]
+                true_values = [
+                    star_params.get("Teff"),
+                    star_params.get("logg"),
+                    star_params.get("Fe_H"),
+                ]
+                
+                # Filter out None values
+                valid_pairs = [
+                    (p, t) for p, t in zip(pred_params, true_values) if t is not None
+                ]
+                
+                if valid_pairs:
+                    preds = [p for p, _ in valid_pairs]
+                    trues = [t for _, t in valid_pairs]
+                    errors = [p - t for p, t in valid_pairs]
+                    param_mse = np.mean([e ** 2 for e in errors])
+                    param_mae = np.mean([abs(e) for e in errors])
+
+
             followup_specs = create_follow_up_specs(
                 star_params,
                 rng,
@@ -441,6 +494,7 @@ def main() -> None:
                     follow_ids,
                     spectral_data,
                     masked_spectra,
+                    stellar_data,
                     device,
                 )
                 follow_generated = ""
@@ -469,7 +523,12 @@ def main() -> None:
                 "obsid": batch["obsids"][idx],
                 "base_text": base_text,
                 "base_prediction": base_prediction["spectral_prediction"],
+                "base_stellar_params_pred": base_prediction.get("stellar_params_pred"),
                 "base_generated_text": base_generated,
+                "true_stellar_params": star_params,
+                "base_spectra_mse": spectra_mse,
+                "base_param_mse": param_mse,
+                "base_param_mae": param_mae,
                 "follow_up_turns": followup_turns,
             }
             results.append(sample_result)

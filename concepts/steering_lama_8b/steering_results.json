@@ -1,0 +1,74 @@
+[
+  {
+    "obsid": "sample_0",
+    "concept": "evolution_giant_minus_dwarf",
+    "alpha": 0.0,
+    "params_gt": {
+      "Teff": 0.7799199819564819,
+      "logg": 0.8343999981880188,
+      "FeH": 0.8417142629623413
+    },
+    "params_extracted": {
+      "Teff": null,
+      "logg": null,
+      "FeH": null
+    },
+    "input_text": "Describe this star based on its given stellar parameters?",
+    "target_text": "This star exhibits the following characteristics: Teff = 6510 K, log g = 4. 17, and [Fe/H] = -0. 05. These parameters suggest a main-sequence star similar to our Sun, potentially slightly evolved.",
+    "generated_text": "furtherinfrinefolding: analysis required to evaluate this effect on the road. Amino-sphere analysis?A task.The analysis provided no sufficient to indicate at this point. A potential process to further investigate. These data suggest a traditional process analysis. Given these data, it is evident that they do indeed represent a potential of the analysis. It is, however, that of the combined satisfy suggest it is at this point of the analysis, or it is-akin-to-suggest."
+  },
+  {
+    "obsid": "sample_0",
+    "concept": "teff_hot_minus_cool",
+    "alpha": 0.0,
+    "params_gt": {
+      "Teff": 0.7799199819564819,
+      "logg": 0.8343999981880188,
+      "FeH": 0.8417142629623413
+    },
+    "params_extracted": {
+      "Teff": null,
+      "logg": null,
+      "FeH": null
+    },
+    "input_text": "Describe this star based on its given stellar parameters?",
+    "target_text": "This star exhibits the following characteristics: Teff = 6510 K, log g = 4. 17, and [Fe/H] = -0. 05. These parameters suggest a main-sequence star similar to our Sun, potentially slightly evolved.",
+    "generated_text": "finae analysis?twinning sphere analysis:The sample was painless to us, so it's a great example of our process at the lab. It certainly does not involve any known chemical analogs. What are the relevant nanakoff groups?The sample analysis is currently missing a relevant set of kinobacterial to evaluate. With these words, we're genuinely considering the known. Further analysis revealed:To further define the sample. A genuine sample. What are the known process at the sample"
+  },
+  {
+    "obsid": "sample_0",
+    "concept": "logg_high_minus_low",
+    "alpha": 0.0,
+    "params_gt": {
+      "Teff": 0.7799199819564819,
+      "logg": 0.8343999981880188,
+      "FeH": 0.8417142629623413
+    },
+    "params_extracted": {
+      "Teff": null,
+      "logg": null,
+      "FeH": null
+    },
+    "input_text": "Describe this star based on its given stellar parameters?",
+    "target_text": "This star exhibits the following characteristics: Teff = 6510 K, log g = 4. 17, and [Fe/H] = -0. 05. These parameters suggest a main-sequence star similar to our Sun, potentially slightly evolved.",
+    "generated_text": "fadeoffry?Part of the analysis.nsake off the tone.What are the known process inhibitors affecting the known process?The analysis is in the know. What are the known process inhibitors affecting the known process? The analysis is in the know. What are the known process inhibitors affecting the known process? The analysis is in the know. What are the known process inhibitors affecting the known process? The analysis is in the know. This analysis does not yet provide a specific sample to evaluate;"
+  },
+  {
+    "obsid": "sample_0",
+    "concept": "feh_rich_minus_poor",
+    "alpha": 0.0,
+    "params_gt": {
+      "Teff": 0.7799199819564819,
+      "logg": 0.8343999981880188,
+      "FeH": 0.8417142629623413
+    },
+    "params_extracted": {
+      "Teff": null,
+      "logg": null,
+      "FeH": null
+    },
+    "input_text": "Describe this star based on its given stellar parameters?",
+    "target_text": "This star exhibits the following characteristics: Teff = 6510 K, log g = 4. 17, and [Fe/H] = -0. 05. These parameters suggest a main-sequence star similar to our Sun, potentially slightly evolved.",
+    "generated_text": "furtherinfrizzle analysis:Itz in the nanjobk to suggest. This is a very effective, and what are the potential species? It is a very effective. It is a very effective. It is a very effective analysis. What are the relevant process?It is indeed very effective. What are the relevant process of your analysis? It is very effective, suggesting it is not a scheduled event. What further are these data to suggest regarding your analysis? The analysis suggests: 1"
+  }
+]

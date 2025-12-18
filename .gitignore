@@ -13,6 +13,8 @@ data/dataset_noiseless/
 data/dataset/
 cache/
 figs/
+papers/
+concepts_v2/
 checkpoints/
 tables/
 depreceated/

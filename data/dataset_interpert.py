@@ -143,18 +143,46 @@ class StellarQuestionsDataset(Dataset):
         """Load the follow-up JSON file for Q&A pairs."""
         try:
             with open(self.followup_json_file, 'r') as f:
-                self.followup_data = json.load(f)
-            print(f"Loaded {len(self.followup_data)} follow-up samples from {self.followup_json_file}")
+                raw_followup = json.load(f)
+            
+            # Convert list to dict keyed by obsid
+            self.followup_data = {}
+            count = 0
+            for item in raw_followup:
+                # Try to find obsid in top level or inside stellar_data
+                obsid = item.get("obsid")
+                if obsid is None and "stellar_data" in item:
+                    obsid = item["stellar_data"].get("obsid")
+                
+                if obsid is not None:
+                    # Store by integer obsid if possible
+                    try:
+                        obsid = int(obsid)
+                    except (ValueError, TypeError):
+                        pass
+                    self.followup_data[obsid] = item
+                    count += 1
+                    
+            print(f"Loaded {count} follow-up samples from {self.followup_json_file} (indexed by obsid)")
         except Exception as e:
             print(f"Warning: Could not load follow-up JSON {self.followup_json_file}: {e}")
             self.followup_data = None
 
-    def _get_followup_from_description(self, sample_idx: int) -> Optional[Tuple[str, str]]:
-        """Extract question and answer from the follow-up JSON file."""
-        if self.followup_data is None or sample_idx >= len(self.followup_data):
+    def _get_followup_from_description(self, obsid: int) -> Optional[Tuple[str, str]]:
+        """Extract question and answer from the follow-up JSON file by obsid."""
+        if self.followup_data is None:
+            return None
+        
+        # Ensure obsid is int/consistent
+        try:
+            obsid = int(obsid)
+        except (ValueError, TypeError):
+            pass
+
+        followup_sample = self.followup_data.get(obsid)
+        if followup_sample is None:
             return None
 
-        followup_sample = self.followup_data[sample_idx]
         description = followup_sample.get("description", "")
 
         if not description:
@@ -276,39 +304,35 @@ class StellarQuestionsDataset(Dataset):
                                full_tokens: List[int],
                                target_tokens: List[int],
                                stellar_params: Dict[str, Optional[float]],
-                               sample_idx: int = -1) -> None:
+                               sample_idx: int = -1) -> List[Tuple[str, str]]:
+        """Append followup turns and return list of (question, answer) text pairs."""
         if not self.enable_followup or self.followup_prob <= 0.0:
-            return
+            return []
         if self.followup_rng.random() > self.followup_prob:
-            return
-
-        # Decide which mode to use based on followup_mode
-        use_description = False
-        if self.followup_mode == "description" and self.followup_data is not None:
-            use_description = True
-        elif self.followup_mode == "mixed" and self.followup_data is not None:
-            # 50% probability for description, 50% for stellar type
-            use_description = self.followup_rng.random() < 0.5
+            return []
 
         followups = []
 
-        # Try to use description from follow-up JSON file
-        if use_description and sample_idx >= 0:
+        # FIRST followup: Generate stellar type question from templates
+        stellar_type_followups = create_follow_up_specs(
+            stellar_params,
+            self.followup_rng,
+            max_pairs=1,  # Get just one stellar type question
+            include_answers=True,
+        )
+        if stellar_type_followups:
+            followups.append(stellar_type_followups[0])
+
+        # SECOND followup: Get description from JSON file (if available and max_followup_turns >= 2)
+        if self.max_followup_turns >= 2 and self.followup_data is not None and sample_idx is not None:
+            # Note: sample_idx here is actually used as obsid in the updated logic
             qa_pair = self._get_followup_from_description(sample_idx)
             if qa_pair is not None:
                 question, answer = qa_pair
-                # Format as a followup spec for consistent processing
                 followups.append({'question': question, 'answer': answer})
 
-        # Generate stellar type questions from templates (if not using description or as fallback)
-        if not followups:
-            followups = create_follow_up_specs(
-                stellar_params,
-                self.followup_rng,
-                max_pairs=self.max_followup_turns,
-                include_answers=True,
-            )
-
+        # Tokenize and append both followup questions
+        text_pairs = []
         for spec in followups:
             question_text = f"\nFollow-up question: {spec['question']}\nAnswer:"
             q_tokens, _ = self._tokenize_text_no_pad(question_text, bos=False)
@@ -318,8 +342,11 @@ class StellarQuestionsDataset(Dataset):
             a_tokens, _ = self._tokenize_text_no_pad(answer_text, bos=False)
             self._extend_with_tokens(full_tokens, target_tokens, q_tokens, mask_targets=True)
             self._extend_with_tokens(full_tokens, target_tokens, a_tokens, mask_targets=False)
+            text_pairs.append((spec['question'], answer_text))
             if len(full_tokens) >= self.max_length:
                 break
+
+        return text_pairs
     
     def _load_data(self):
         """Load data from JSON file"""
@@ -330,6 +357,22 @@ class StellarQuestionsDataset(Dataset):
             
         print(f"Loaded {len(self.raw_data)} samples from JSON")
         
+        # Polyfill description from qa_pairs if missing
+        for sample in self.raw_data:
+            if not sample.get('description') and sample.get('qa_pairs'):
+                try:
+                    # Pick the first QA pair - or prefer reasoning/classification?
+                    # Let's just pick the first one for now to ensure we have data
+                    pair = sample['qa_pairs'][0]
+                    # Create the JSON structure expected by parse_description_text
+                    desc_obj = {
+                        "Question": pair.get('question', ''),
+                        "Description": pair.get('answer', '')
+                    }
+                    sample['description'] = json.dumps(desc_obj)
+                except (IndexError, AttributeError, TypeError):
+                    pass
+
         # Filter samples with valid descriptions if requested
         if self.filter_valid_descriptions:
             valid_samples = []
@@ -485,13 +528,10 @@ class StellarQuestionsDataset(Dataset):
         else:
             print("Creating new train/val/test splits...")
             
-            # First split: separate test set
-            temp_indices, test_indices = train_test_split(
-                indices, 
-                test_size=test_ratio,
-                random_state=self.random_state,
-                shuffle=True
-            )
+            # First split: separate test set (Fixed first 1000 samples as per user request)
+            # This avoids the test_size=0.0 error and provides the requested deterministic split
+            test_indices = indices[:1000]
+            temp_indices = indices[1000:]
             
             # Second split: separate train and val from remaining data
             adjusted_val_ratio = val_ratio / (train_ratio + val_ratio)
@@ -607,11 +647,11 @@ class StellarQuestionsDataset(Dataset):
     def get_raw_spectra(self, obsid: int, id_type='obsid') -> Optional[np.ndarray]:
         if id_type == 'obsid':
                 obsdir = str(obsid)[:4]
-                spectra_filename = os.path.join(f'/data/lamost/data', f'{obsdir}/{obsid}.fits')
+                spectra_filename = os.path.join(f'/home/ilay.kamai/work/lamost/data', f'{obsdir}/{obsid}.fits')
                 spectra, spectra_masked, meta = self.read_lamost_spectra(spectra_filename)
                 meta['obsid'] = obsid
         elif id_type == 'APOGEE_ID':
-            spectra_filename = f"/data/apogee/data/aspcapStar-dr17-{obsid}.fits"
+            spectra_filename = f"/home/ilay.kamai/work/apogee/data/aspcapStar-dr17-{obsid}.fits"
             spectra, spectra_masked, meta = self.read_apogee_spectra(spectra_filename)
             meta['apogee_id'] = obsid
         else:
@@ -674,8 +714,9 @@ class StellarQuestionsDataset(Dataset):
         # Optional follow-up turns conditioned on stellar parameters
         stellar_data = sample.get('stellar_data', {})
         stellar_params = self._extract_physical_params(stellar_data)
+        followup_text_pairs = []  # Track followup Q&A pairs as text
         if self.enable_followup:
-            self._append_followup_turns(full_sequence, target_sequence, stellar_params, sample_idx)
+            followup_text_pairs = self._append_followup_turns(full_sequence, target_sequence, stellar_params, sample_idx)
 
         # Pad remaining space with -100 placeholders
         remaining_space = self.max_length - len(full_sequence)
@@ -718,6 +759,7 @@ class StellarQuestionsDataset(Dataset):
             'target_length': base_answer_length,                # Length of base answer portion
             'input_text': parsed_desc['question'],
             'target_text': parsed_desc['answer'],
+            'followup_turns': followup_text_pairs,     # List of (question, answer) tuples for followup turns
             'features': features,
             'spectra': spectra,
             'masked_spectra': masked_spectra,
@@ -910,6 +952,7 @@ def collate_fn(batch: List[Dict[str, Any]]) -> Dict[str, Any]:
 
     input_texts = [item['input_text'] for item in batch]
     target_texts = [item['target_text'] for item in batch]
+    followup_turns = [item.get('followup_turns', []) for item in batch]  # Collect followup turns
     obsids = [item['obsid'] for item in batch]
     df_indices = [item['df_index'] for item in batch]
     stellar_data = [item['stellar_data'] for item in batch]
@@ -953,6 +996,7 @@ def collate_fn(batch: List[Dict[str, Any]]) -> Dict[str, Any]:
         'target_lengths': target_lengths,            # Answer lengths
         'input_texts': input_texts,
         'target_texts': target_texts,
+        'followup_turns': followup_turns,            # List of followup Q&A pairs per sample
         'features': features_tensor,
         'spectra': torch.stack(spectra),
         'masked_spectra': torch.stack(masked_spectra),
@@ -989,11 +1033,11 @@ def _stack_numeric(values: List[Optional[torch.Tensor]]) -> Tuple[torch.Tensor, 
 # Example usage and testing
 if __name__ == "__main__":
 
-    TOKENIZER_PATH = "/data/.llama/Llama3.2-1B/tokenizer.model"
+    TOKENIZER_PATH = "/home/ilay.kamai/work/.llama/Llama3.2-1B/tokenizer.model"
     tokenizer = Tokenizer(model_path=TOKENIZER_PATH)
 
-    json_path = "/data/TalkingLatents/data/dataset/stellar_descriptions_questions_short.json"
-    spectral_features = np.load('/data/TalkingLatents/logs/2025-07-29/features.npy')
+    json_path = "/home/ilay.kamai/work/TalkingLatents/data/dataset/stellar_descriptions_questions_short.json"
+    spectral_features = np.load('/home/ilay.kamai/work/TalkingLatents/logs/2025-07-29/features.npy')
     # Example usage
     print("Example usage:")
     # Case 3: Create all dataloaders at once

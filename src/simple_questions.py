@@ -32,14 +32,14 @@ from nn.train import LLMTrainer
 from util.utils import *
 # from nn.multimodal import setup
 
-JSON_PATH = '/data/TalkingLatents/data/dataset/stellar_descriptions_questions_short.json'
-ADVANCED_JSON_PATH = '/data/TalkingLatents/data/dataset/caption_advanced_100k.json'
-COMPARATIVE_JSON_FILE='/data/TalkingLatents/data/dataset/comparative_dataset.json'
-FEATURES_PATH = '/data/TalkingLatents/logs/2025-07-29/features.npy'  # Optional, can be None to load all features on-the-fly
-MODEL_PATH = "/data/.llama/Llama3.1-8B"
-TOKENIZER_PATH = "/data/.llama/Llama3.1-8B"
-SPECTRA_CONFIG_PATH = "/data/DESA/logs/spec_decode2_2025-02-16/MultiTaskRegressor_spectra__decode_4_complete_config.yaml"
-SPECTRA_WEIGHTS_PATH = "/data/DESA/logs/spec_decode2_2025-02-16/MultiTaskRegressor_spectra_decode_4.pth"
+JSON_PATH = '/home/ilay.kamai/work/TalkingLatents/data/dataset/stellar_descriptions_questions_short.json'
+ADVANCED_JSON_PATH = '/home/ilay.kamai/work/TalkingLatents/data/dataset/caption_advanced_100k.json'
+COMPARATIVE_JSON_FILE='/home/ilay.kamai/work/TalkingLatents/data/dataset/comparative_dataset.json'
+FEATURES_PATH = '/home/ilay.kamai/work/TalkingLatents/logs/2025-07-29/features.npy'  # Optional, can be None to load all features on-the-fly
+MODEL_PATH = "/home/ilay.kamai/work/.llama/Llama3.1-8B"
+TOKENIZER_PATH = "/home/ilay.kamai/work/.llama/Llama3.1-8B"
+SPECTRA_CONFIG_PATH = "/home/ilay.kamai/work/DESA/logs/spec_decode2_2025-02-16/MultiTaskRegressor_spectra__decode_4_complete_config.yaml"
+SPECTRA_WEIGHTS_PATH = "/home/ilay.kamai/work/DESA/logs/spec_decode2_2025-02-16/MultiTaskRegressor_spectra_decode_4.pth"
 
 print("number of gpus: ", torch.cuda.device_count())
 # os.environ['PYTORCH_CUDA_ALLOC_CONF'] = 'expandable_segments:True'
@@ -143,8 +143,12 @@ def _load_llm_model_with_error_handling(args) -> Transformer:
         else:
             print(f"Loading LLaMA checkpoint on rank {rank}: {checkpoints[0]}")
             try:
-                # Load weights on CPU to avoid GPU OOM; immediately free after load.
-                checkpoint = torch.load(checkpoints[0], map_location="cpu")
+                # Load weights on CPU with mmap to avoid OOM
+                try:
+                    checkpoint = torch.load(checkpoints[0], map_location="cpu", mmap=True)
+                except TypeError:
+                    print("mmap=True not supported/failed, falling back to standard load")
+                    checkpoint = torch.load(checkpoints[0], map_location="cpu")
                 
                 # Print checkpoint info
                 if isinstance(checkpoint, dict):
@@ -451,6 +455,7 @@ def create_model_memory_optimized(args, device):
 
 def _load_spectra_model_cpu():
     """Load spectral model directly to CPU to save memory"""
+    print("Loading spectral model...")
     config = yaml.safe_load(open(SPECTRA_CONFIG_PATH, 'r'))
     # config['model_args']['avg_output'] = False
     
@@ -543,6 +548,11 @@ def _load_hf_llm_model(args):
 
     hf_device_map = getattr(args, "hf_device_map", None)
     if hf_device_map:
+        if isinstance(hf_device_map, str) and hf_device_map.strip().startswith('{'):
+            try:
+                hf_device_map = json.loads(hf_device_map)
+            except json.JSONDecodeError:
+                print(f"Warning: Failed to parse hf_device_map as JSON: {hf_device_map}")
         load_kwargs["device_map"] = hf_device_map
 
     max_memory_gb = getattr(args, "hf_max_memory_gb", None)

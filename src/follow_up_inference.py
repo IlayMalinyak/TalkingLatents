@@ -14,6 +14,7 @@ import argparse
 import json
 import math
 import os
+os.system('pip install tiktoken fairscale fire blobfile torchdiffeq torchcfm transformers bitsandbytes accelerate')
 import random
 import sys
 import time
@@ -38,12 +39,14 @@ from src.simple_questions_multitok import (  # noqa: E402
     create_datasets_and_loaders,
     ensure_backend_config,
 )
-from llama3.llama.tokenizer import Tokenizer  # noqa: E402
+from src.tokenizer_adapter import load_tokenizer_adapter, TokenizerAdapter
 from src.follow_up_templates import (  # noqa: E402
     PHYSICAL_BOUNDS,
     PARAM_KEY_ALIASES,
     create_follow_up_specs,
 )
+from data.dataset_diverse import create_diverse_dataloaders
+from data.dataset_twostar_inference import create_twostar_inference_dataloader
 
 
 PHYSICAL_BOUNDS = {
@@ -106,6 +109,97 @@ def _profile_record(label: str, start_time: float, tokens: int = 0) -> None:
     ACTIVE_PROFILER.record(label, duration, tokens)
 
 
+def load_luminosity_mass_data(csv_path: str) -> Dict[str, Dict[str, float]]:
+    """
+    Load Lstar and Mstar from info_full.csv using standard csv module.
+    Returns a dict mapping obsid (as string) to {'Lstar': float, 'Mstar': float}.
+    """
+    if not os.path.exists(csv_path):
+        print(f"Warning: CSV file not found at {csv_path}")
+        return {}
+
+    print(f"Loading luminosity and mass data from {csv_path}...")
+    data_map = {}
+    try:
+        import csv
+        # Increase field limit just in case, though standard typically suffices for this file
+        csv.field_size_limit(1000000)
+        
+        with open(csv_path, 'r', encoding='utf-8') as f:
+            reader = csv.DictReader(f)
+            
+            # Check headers
+            if not reader.fieldnames:
+                print("Error: CSV file is empty or unreadable")
+                return {}
+                
+            # Handle potential whitespace in headers
+            headers = [h.strip() for h in reader.fieldnames]
+            if 'obsid' not in headers:
+                print(f"Error: 'obsid' column not found in CSV. available: {headers[:5]}...")
+                return {}
+            
+            # Map clean headers to actual headers if needed, but DictReader uses raw fieldnames
+            # We'll just access by key matching the raw header if it's clean, 
+            # otherwise we might need to be careful. The previous head showed clean names.
+            
+            count = 0
+            for row in reader:
+                # Basic safety check
+                if 'obsid' not in row:
+                    continue
+                    
+                obsid = str(row['obsid']).strip()
+                entry = {}
+                
+                # Parse Rstar (for prompt context)
+                if 'Rstar' in row and row['Rstar']:
+                    try:
+                        val = float(row['Rstar'])
+                        if not(math.isnan(val) or math.isinf(val)):
+                            entry['Rstar'] = val
+                    except (ValueError, TypeError):
+                        pass
+
+                # Parse Lstar
+                if 'Lstar' in row and row['Lstar']:
+                    try:
+                        val = float(row['Lstar'])
+                        if not(math.isnan(val) or math.isinf(val)):
+                            entry['Lstar'] = val
+                    except (ValueError, TypeError):
+                        pass
+
+                # Parse Mstar
+                if 'Mstar' in row and row['Mstar']:
+                    try:
+                        val = float(row['Mstar'])
+                        if not(math.isnan(val) or math.isinf(val)):
+                            entry['Mstar'] = val
+                    except (ValueError, TypeError):
+                        pass
+
+                # Parse SNR (snrg)
+                if 'snrg' in row and row['snrg']:
+                    try:
+                        val = float(row['snrg'])
+                        if not(math.isnan(val) or math.isinf(val)):
+                            entry['snr'] = val
+                    except (ValueError, TypeError):
+                        pass
+                
+                if entry:
+                    data_map[obsid] = entry
+                    count += 1
+                
+        print(f"[OK] Loaded Rstar/Lstar/Mstar data for {count} stars")
+        return data_map
+        
+    except Exception as e:
+        print(f"Error loading CSV: {e}")
+        return {}
+
+
 def _unwrap_model(model: torch.nn.Module) -> torch.nn.Module:
     return model.module if isinstance(
         model, (torch.nn.DataParallel, torch.nn.parallel.DistributedDataParallel)) else model
@@ -119,7 +213,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument('--max_samples', type=int, default=None, help='Limit the number of test samples to process')
     parser.add_argument('--batch_size', type=int, default=4, help='Batch size for dataloader (overrides config)')
     parser.add_argument('--seed', type=int, default=42, help='Random seed for reproducible follow-up prompts')
-    parser.add_argument('--max_new_tokens', type=int, default=64, help='Max tokens to sample per generation')
+    parser.add_argument('--max_new_tokens', type=int, default=128, help='Max tokens to sample per generation')
     parser.add_argument('--temperature', type=float, default=0.2, help='Sampling temperature for text generation')
     parser.add_argument('--top_p', type=float, default=0.8, help='Top-p nucleus sampling value')
     parser.add_argument('--json_filename', type=str, default='follow_up_answers.json', help='Filename for the saved JSON payload')
@@ -134,10 +228,15 @@ def parse_args() -> argparse.Namespace:
                         help='Use feature-prediction dataset/mode instead of QA dataset')
     parser.add_argument('--llm_backend', type=str, choices=['llama', 'hf', 'qwen'], default=None,
                         help='Override backbone family (defaults to what training used).')
-    parser.add_argument('--hf_model_name', type=str, default=None,
-                        help='Override HF model name when llm_backend=hf/qwen.')
-    parser.add_argument('--hf_revision', type=str, default=None,
-                        help='Override HF revision.')
+    parser.add_argument('--dataset_type', type=str, default='standard',
+                       choices=['standard', 'diverse', 'two_star'],
+                       help='Type of dataset to load: "standard" (original), "diverse" (mixed QA), or "two_star" (comparison inference).')
+    
+    parser.add_argument('--two_star_test', action='store_true',
+                       help='Run special 2-star comparison inference test')
+
+    parser.add_argument('--norm_stats_file', type=str, default=None,
+                       help='Path to feature normalization stats file (for diverse dataset)')
     parser.add_argument('--hf_trust_remote_code', action=argparse.BooleanOptionalAction, default=None,
                         help='Allow custom HF modeling code.')
     parser.add_argument('--hf_device_map', type=str, default=None,
@@ -154,6 +253,11 @@ def parse_args() -> argparse.Namespace:
                         help='Override base precision for Meta backbone.')
     parser.add_argument('--gradient_checkpointing', action=argparse.BooleanOptionalAction, default=None,
                         help='Request gradient checkpointing (LLaMA backend).')
+    
+    # Steering arguments
+    parser.add_argument('--steering_concept_file', type=str, default=None, help='Path to concept directions (.pt)')
+    parser.add_argument('--steering_alphas', type=str, default='0', help='Comma-sep alphas (e.g. -5,0,5)')
+    
     return parser.parse_args()
 
 
@@ -352,9 +456,91 @@ def get_stellar_params(batch: Dict[str, Any], sample_idx: int) -> Dict[str, Opti
     return params
 
 
-def create_follow_up_questions(params: Dict[str, Optional[float]], rng: random.Random) -> List[Dict[str, str]]:
-    specs = create_follow_up_specs(params, rng, include_answers=False)
-    return [{'type': spec['type'], 'question': spec['question']} for spec in specs]
+def create_follow_up_questions(params: Dict[str, Optional[float]], 
+                                rng: random.Random,
+                                followup_data: Optional[List] = None,
+                                sample_idx: Optional[int] = None,
+                                obsid: Optional[Any] = None,
+                                l_m_data: Optional[Dict[str, Dict[str, float]]] = None) -> List[Dict[str, str]]:
+    """Create followup questions: 1) stellar_type, 2) description, 3) luminosity/mass."""
+    followups = []
+    
+    # Pre-fetch star_info/SNR if available
+    snr_val = None
+    star_info = None
+    if l_m_data is not None and obsid is not None:
+        obsid_str = str(obsid)
+        star_info = l_m_data.get(obsid_str)
+        if star_info:
+            snr_val = star_info.get('snr')
+    
+    # FIRST followup: Generate stellar type question from templates
+    stellar_type_specs = create_follow_up_specs(params, rng, max_pairs=1, include_answers=False)
+    if stellar_type_specs:
+        if snr_val is not None:
+            stellar_type_specs[0]['snr'] = snr_val
+        followups.append(stellar_type_specs[0])
+    
+    # SECOND followup: Get description from JSON file (if available)
+    if followup_data is not None and sample_idx is not None and 0 <= sample_idx < len(followup_data):
+        try:
+            item = followup_data[sample_idx]
+            description = item.get('description', '')
+            if description:
+                # Try to parse as JSON
+                import json as json_module
+                try:
+                    parsed = json_module.loads(description)
+                    question = parsed.get('question', '')
+                    if question:
+                        spec = {'type': 'description_followup', 'question': question}
+                        if snr_val is not None:
+                            spec['snr'] = snr_val
+                        followups.append(spec)
+                except json_module.JSONDecodeError:
+                    pass
+        except (IndexError, KeyError, TypeError):
+            pass
+
+    # THIRD followup: Lstar and Mstar questions (from info_full.csv)
+    if star_info:
+        # Add Luminosity question
+        if 'Lstar' in star_info:
+            question_text = "Estimate the luminosity of the star."
+            l_calc = None
+                
+            if 'Rstar' in star_info:
+                question_text = f"Given a radius of {star_info['Rstar']} solar units, estimate the luminosity of the star."
+                     
+            # Calculate Stefan-Boltzmann Luminosity if Teff is available
+            # L/Lsun = (R/Rsun)^2 * (Teff/Tsun)^4
+            teff = params.get('Teff')
+            if teff is not None:
+                try:
+                    # Use Teff_sun = 5772 K
+                    l_calc = (star_info['Rstar'] ** 2) * ((teff / 5772.0) ** 4)
+                except Exception:
+                    pass
+
+            followups.append({
+                'type': 'luminosity_followup',
+                'question': question_text,
+                'true_value': 10 ** star_info['Lstar'],
+                'Rstar': star_info.get('Rstar'),
+                'L_SB_calculated': l_calc,
+                'snr': star_info.get('snr')
+                })
+                
+            # Add Mass question
+            if 'Mstar' in star_info:
+                followups.append({
+                    'type': 'mass_followup',
+                    'question': "Estimate the mass of the star.",
+                    'true_value': star_info['Mstar'],
+                    'snr': star_info.get('snr')
+                })
+    
+    return followups
 
 
 def normalize_mode_label(mode_value: Any) -> str:
@@ -450,7 +636,6 @@ def build_generation_context(batch_data: Dict[str, Any],
         else:
             feature_start_idx = torch.tensor(int(feature_start_raw), dtype=torch.long, device=input_ids.device)
         context.update({
-            'input_spectra': batch_data['masked_spectra'][batch_idx:batch_idx+1],
             'feature_start_idx': feature_start_idx,
         })
         answer_start_raw = batch_data['answer_start_indices'][batch_idx]
@@ -480,11 +665,12 @@ def build_generation_context(batch_data: Dict[str, Any],
     context.update({
         'prompt': prompt,
         'mode': current_mode,
+        'input_spectra': batch_data['masked_spectra'][batch_idx:batch_idx+1],
     })
     return context, input_text, target_text
 
 
-def append_text_to_prompt(context: Dict[str, Any], tokenizer: Tokenizer, text: str) -> None:
+def append_text_to_prompt(context: Dict[str, Any], tokenizer: TokenizerAdapter, text: str) -> None:
     """Append arbitrary text (tokenized) after the current model response."""
     if not text:
         return
@@ -495,9 +681,14 @@ def append_text_to_prompt(context: Dict[str, Any], tokenizer: Tokenizer, text: s
     context['prompt'] = torch.cat([context['prompt'], tensor], dim=1)
 
 
-def _sample_top_p(logits: torch.Tensor, temperature: float, top_p: float) -> int:
+def _sample_top_p(logits: torch.Tensor, temperature: float, top_p: float, pad_id: Optional[int] = None) -> int:
     if torch.isnan(logits).any() or torch.isinf(logits).any():
         return 0
+    
+    # Suppress padding
+    if pad_id is not None:
+        logits[pad_id] = float('-inf')
+
     logits = torch.clamp(logits, min=-1e4, max=1e4)
     if temperature > 0:
         logits = logits / temperature
@@ -585,9 +776,10 @@ def _build_forward_chunk(base_model: torch.nn.Module,
     return _forward
 
 
+@torch.no_grad()
 def _decode_generation_requests(model: torch.nn.Module,
                                 requests: List[Dict[str, Any]],
-                                tokenizer: Tokenizer,
+                                tokenizer: TokenizerAdapter,
                                 max_new_tokens: int,
                                 temperature: float,
                                 top_p: float,
@@ -645,10 +837,10 @@ def _decode_generation_requests(model: torch.nn.Module,
 
 def generate_text_from_context(model: torch.nn.Module,
                                context: Dict[str, Any],
-                               tokenizer: Tokenizer,
-                               max_new_tokens: int,
-                               temperature: float,
-                               top_p: float) -> str:
+                               tokenizer: TokenizerAdapter,
+                               max_new_tokens: int = 100,
+                               temperature: float = 0.7,
+                               top_p: float = 0.9) -> str:
     """
     Generate text conditioned on the running prompt and update the prompt with
     the tokens that were just produced so the next question follows the answer.
@@ -665,28 +857,59 @@ def generate_text_from_context(model: torch.nn.Module,
     prepared_inputs = _prepare_context_inputs(context, base_model)
     forward_chunk = _build_forward_chunk(base_model, prepared_inputs, mode, use_cache=False)
 
-    with torch.no_grad():
-        for _ in range(max_new_tokens):
-            outputs = forward_chunk(prompt, start_pos=0)
-            logits = outputs['logits'][:, -1, :]
-            next_token = _sample_top_p(logits.squeeze(0), temperature=temperature, top_p=top_p)
-            gen_ids.append(next_token)
-            next_tensor = torch.tensor([[next_token]], device=device, dtype=prompt.dtype)
-            prompt = torch.cat([prompt, next_tensor], dim=1)
-            if tokenizer is not None and hasattr(tokenizer, 'eos_id') and next_token == tokenizer.eos_id:
-                break
+    # Get EOS token IDs - handle both LLaMA and Qwen tokenizers
+    eos_ids = []
+    if tokenizer is not None:
+        if hasattr(tokenizer, 'eos_id'):
+            eos_ids.append(tokenizer.eos_id)
+        # Qwen special tokens: 151643 (<|im_end|>), 151645 (<|im_start|>)
+        if hasattr(tokenizer, 'special_tokens'):
+            if '<|im_end|>' in tokenizer.special_tokens:
+                eos_ids.append(tokenizer.special_tokens['<|im_end|>'])
+            if '<|im_start|>' in tokenizer.special_tokens:
+                eos_ids.append(tokenizer.special_tokens['<|im_start|>'])
+
+    pad_id = getattr(tokenizer, 'pad_id', 0)
+    
+    for i in range(max_new_tokens):
+        outputs = forward_chunk(prompt, start_pos=0)
+        logits = outputs['logits'][:, -1, :]
+        next_token = _sample_top_p(logits[0], temperature=temperature, top_p=top_p, pad_id=pad_id)
+        gen_ids.append(next_token)
+        
+        if next_token in eos_ids:
+            break
+        prompt = torch.cat([prompt, torch.tensor([[next_token]], device=device, dtype=prompt.dtype)], dim=1)
 
     context['prompt'] = prompt
     _profile_record(f"generate_text_{mode}", profile_start, len(gen_ids))
-    return tokenizer.decode(gen_ids) if tokenizer is not None else ''
+    
+    # Decode with error handling for invalid tokens
+    if tokenizer is not None:
+        try:
+            return tokenizer.decode(gen_ids)
+        except (KeyError, ValueError) as e:
+            # Filter out invalid tokens and try again
+            print(f"Warning: Token decoding error ({e}), filtering invalid tokens...")
+            valid_tokens = []
+            for token_id in gen_ids:
+                try:
+                    tokenizer.decode([token_id])  # Test if token is valid
+                    valid_tokens.append(token_id)
+                except (KeyError, ValueError):
+                    continue  # Skip invalid tokens
+            if valid_tokens:
+                return tokenizer.decode(valid_tokens)
+            return ''
+    return ''
 
 
 def generate_text_for_group(model: torch.nn.Module,
                             contexts: Sequence[Dict[str, Any]],
-                            tokenizer: Tokenizer,
-                            max_new_tokens: int,
-                            temperature: float,
-                            top_p: float) -> List[str]:
+                            tokenizer: TokenizerAdapter,
+                            max_new_tokens: int = 100,
+                            temperature: float = 0.7,
+                            top_p: float = 0.9) -> List[str]:
     if not contexts:
         return []
     base_model = _unwrap_model(model)
@@ -707,7 +930,7 @@ def generate_text_for_group(model: torch.nn.Module,
         latent_features = torch.cat([pi['latent_features'] for pi in prepared_inputs], dim=0)
         feature_start_idx = torch.cat([pi['feature_start_idx'] for pi in prepared_inputs], dim=0)
 
-    def _forward_chunk(chunk_tokens: torch.Tensor, start_pos: int) -> Dict[str, torch.Tensor]:
+    def _forward_chunk(chunk_tokens: torch.Tensor, start_pos: int, use_cache: bool = False) -> Dict[str, torch.Tensor]:
         if mode == "two_star":
             return base_model._forward_two_star_mode(
                 input_ids=chunk_tokens,
@@ -717,7 +940,7 @@ def generate_text_for_group(model: torch.nn.Module,
                 star_b_indices=star_b_indices,
                 start_pos=start_pos,
                 cache_rows=None,
-                use_cache=False,
+                use_cache=use_cache,
             )
         return base_model._forward_single_mode(
             input_ids=chunk_tokens,
@@ -725,39 +948,94 @@ def generate_text_for_group(model: torch.nn.Module,
             feature_start_indices=feature_start_idx,
             start_pos=start_pos,
             cache_rows=None,
-            use_cache=False,
+            use_cache=use_cache,
         )
 
     generated_tokens: List[List[int]] = [[] for _ in contexts]
     alive_mask = torch.ones(batch_size, dtype=torch.bool, device=device)
-    eos_id = getattr(tokenizer, 'eos_id', None)
     pad_id = getattr(tokenizer, 'pad_id', 0)
+    
+    # Get EOS token IDs
+    eos_ids = []
+    if tokenizer is not None:
+        if hasattr(tokenizer, 'eos_id'):
+            eos_ids.append(tokenizer.eos_id)
+        if hasattr(tokenizer, 'special_tokens'):
+            if '<|im_end|>' in tokenizer.special_tokens:
+                eos_ids.append(tokenizer.special_tokens['<|im_end|>'])
+            if '<|im_start|>' in tokenizer.special_tokens:
+                eos_ids.append(tokenizer.special_tokens['<|im_start|>'])
 
-    for _ in range(max_new_tokens):
+    # Optimized generation loop with KV caching
+    start_pos = 0
+    curr_input = prompt
+    
+    for i in range(max_new_tokens):
         if not alive_mask.any():
             break
-        outputs = _forward_chunk(prompt, start_pos=0)
+            
+        # Determine if we need to pass full prompt or just the last token
+        if i == 0:
+            # First pass: process the entire prompt
+            pass
+        else:
+            # Subsequent passes: process only the last generated token
+            curr_input = torch.tensor(next_tokens, device=device, dtype=torch.long).unsqueeze(1)
+
+        outputs = _forward_chunk(curr_input, start_pos=start_pos, use_cache=True)
+        
+        # Determine how many tokens were processed to update start_pos correctly
+        num_processed = curr_input.shape[1]
+        
         logits = outputs['logits'][:, -1, :]
         next_tokens = []
         for idx in range(batch_size):
             if not alive_mask[idx]:
                 next_tokens.append(pad_id)
                 continue
-            sampled = _sample_top_p(logits[idx], temperature=temperature, top_p=top_p)
-            next_tokens.append(sampled)
-            generated_tokens[idx].append(sampled)
-            if eos_id is not None and sampled == eos_id:
+            token = _sample_top_p(logits[idx], temperature=temperature, top_p=top_p, pad_id=pad_id)
+            next_tokens.append(token)
+            generated_tokens[idx].append(token)
+            if token in eos_ids:
                 alive_mask[idx] = False
-        next_tensor = torch.tensor(next_tokens, device=device, dtype=prompt.dtype).unsqueeze(1)
+        
+        # Update start_pos for next iteration
+        start_pos += num_processed
+        
+        # Update prompt trace (optional, but good for debugging/decoding)
+        next_tensor = torch.tensor(next_tokens, device=device, dtype=torch.long).unsqueeze(1)
         prompt = torch.cat([prompt, next_tensor], dim=1)
 
-    decoded = [tokenizer.decode(tokens) if tokenizer is not None else '' for tokens in generated_tokens]
+    # Safely decode tokens, filtering out invalid ones
+    def safe_decode(token_list):
+        if tokenizer is None:
+            return ''
+        try:
+            return tokenizer.decode(token_list)
+        except (KeyError, ValueError) as e:
+            # Filter out invalid tokens
+            valid_tokens = []
+            for token_id in token_list:
+                try:
+                    tokenizer.decode([token_id])
+                    valid_tokens.append(token_id)
+                except (KeyError, ValueError):
+                    continue
+            if valid_tokens:
+                try:
+                    return tokenizer.decode(valid_tokens)
+                except (KeyError, ValueError):
+                    return ''
+            return ''
+    
+    decoded = [safe_decode(tokens) for tokens in generated_tokens]
 
     for row_idx, ctx in enumerate(contexts):
         ctx['prompt'] = prompt[row_idx:row_idx+1].clone()
     total_tokens = sum(len(tokens) for tokens in generated_tokens)
     _profile_record(f"batch_generate_{mode}", profile_start, total_tokens)
     return decoded
+
 
 
 def main():
@@ -785,142 +1063,363 @@ def main():
 
     backend_config = ensure_backend_config(args)
     model = load_model(cli_args.checkpoint_path, args, device)
-    _, tokenizer_path = get_model_path(args)
-    tokenizer = Tokenizer(model_path=tokenizer_path)
+    backend_config = ensure_backend_config(args)
+    tokenizer_backend = backend_config.tokenizer_backend
+    tokenizer_path = backend_config.tokenizer_path
+    if tokenizer_backend == 'llama' and tokenizer_path is None:
+        _, tokenizer_path = get_model_path(args)
+        backend_config.tokenizer_path = tokenizer_path
+    
+    print(f"Loading tokenizer (backend={tokenizer_backend})...")
+    try:
+        tokenizer = load_tokenizer_adapter(
+            backend=tokenizer_backend,
+            tokenizer_path=tokenizer_path,
+            hf_model_name=backend_config.model_name_or_path if tokenizer_backend != 'llama' else None,
+            trust_remote_code=backend_config.trust_remote_code,
+            hf_revision=backend_config.revision,
+        )
+        print(f"[OK] Loaded tokenizer from {tokenizer_path or backend_config.model_name_or_path}")
+    except Exception as e:
+        print(f"Error loading tokenizer: {e}")
+        sys.exit(1)
     print(f"[OK] Loaded tokenizer from {tokenizer_path}")
 
-    _, _, test_loader = create_datasets_and_loaders(args, device, backend_config)
+    # Load followup JSON data for description questions
+    followup_data = None
+    followup_json_path = getattr(args, 'followup_json_file', '/home/ilay.kamai/work/TalkingLatents/data/dataset/stellar_descriptions_questions.json')
+    if followup_json_path and os.path.exists(followup_json_path):
+        try:
+            with open(followup_json_path, 'r') as f:
+                followup_data = json.load(f)
+            print(f"[OK] Loaded {len(followup_data)} followup description samples from {followup_json_path}")
+        except Exception as e:
+            print(f"Warning: Could not load followup JSON: {e}")
+
+    # Load Luminosity and Mass data (NEW)
+    l_m_data = load_luminosity_mass_data('/home/ilay.kamai/work/TalkingLatents/logs/2025-07-29/info_full.csv')
+
+    dataset_type = getattr(args, 'dataset_type', 'standard')
+    print(f"Dataset type: {dataset_type}")
+
+    dataset_type = getattr(args, 'dataset_type', 'standard')
+    print(f"Dataset type: {dataset_type}")
+
+    if cli_args.two_star_test:
+        print("Initializing 2-star comparison test mode...")
+        # Check if features file is provided
+        spectral_features = None
+        features_file = getattr(args, 'features_file', None)
+        if features_file and os.path.exists(features_file):
+            print(f"Loading spectral features from {features_file}")
+            spectral_features = np.load(features_file)
+        
+        _, _, test_loader = create_twostar_inference_dataloader(
+            json_file=args.json_file,
+            features_array=spectral_features,
+            batch_size=getattr(args, 'batch_size', 4),
+            tokenizer_path=tokenizer_path,
+            tokenizer_backend=tokenizer_backend,
+            tokenizer=tokenizer,
+            num_spectral_features=getattr(args, 'num_spectral_features', 4)
+        )
+        if test_loader is not None and hasattr(test_loader, "dataset"):
+            setattr(test_loader.dataset, "backend_config", backend_config)
+
+    elif dataset_type == 'diverse':
+        # Load features locally for diverse dataset
+        spectral_features = None
+        features_file = getattr(args, 'features_file', None)
+        if features_file and os.path.exists(features_file):
+            print(f"Loading spectral features from {features_file}")
+            spectral_features = np.load(features_file)
+            print(f"Spectral features shape: {spectral_features.shape}")
+        
+        print(f"Creating diverse QA datasets from {args.json_file}...")
+        # We assume max_seq_length is in args or default to 128
+        max_len = getattr(args, 'max_seq_length', 128)
+        
+        # Call the diverse loader
+        _, _, test_loader = create_diverse_dataloaders(
+            json_file=args.json_file,
+            features_array=spectral_features,
+            batch_size=getattr(args, 'batch_size', 4),
+            train_ratio=0.8, 
+            val_ratio=0.2, 
+            test_ratio=0.0, # Fixed 1000 samples for test
+            random_state=args.seed,
+            cache_dir=os.path.join(output_dir, 'cache'),
+            tokenizer_path=tokenizer_path,
+            tokenizer=tokenizer,
+            tokenizer_backend=tokenizer_backend,
+            max_length=max_len,
+            num_workers=getattr(args, 'num_workers', 4),
+            device=device,
+            enable_followup=False, # We do inference manually
+            num_spectral_features=getattr(args, 'num_spectral_features', 4),
+        )
+        # Ensure backend config attached
+        if test_loader is not None and hasattr(test_loader, "dataset"):
+            setattr(test_loader.dataset, "backend_config", backend_config)
+            
+    else:
+        # Standard loader
+        _, _, test_loader = create_datasets_and_loaders(args, device, backend_config)
+
     print(f"Test loader has {len(test_loader.dataset)} samples")
 
     results: List[Dict[str, Any]] = []
     processed = 0
+    
+    # Steering setup
+    steering_enabled = False
+    concepts = {}
+    alphas = [0.0]
+    if getattr(cli_args, 'steering_concept_file', None):
+        print(f"Loading steering concepts from {cli_args.steering_concept_file}")
+        map_loc = f"cuda:{device}" if isinstance(device, int) else device
+        concepts = torch.load(cli_args.steering_concept_file, map_location=map_loc)
+        steering_enabled = True
+        if getattr(cli_args, 'steering_alphas', None):
+            alphas = [float(x) for x in cli_args.steering_alphas.split(',')]
+        print(f"Steering enabled with alphas: {alphas} and concepts: {list(concepts.keys())}")
+    else:
+        # Default "dummy" concept to run loop once
+        concepts = {'none': None}
+        alphas = [0.0]
 
     for batch in tqdm(test_loader, desc="Running follow-up inference"):
         move_batch_to_device(batch, device)
         batch_size = batch['input_ids'].shape[0]
+        
+        # Save original spectra for steering
+        original_masked_spectra = None
+        if 'masked_spectra' in batch:
+            original_masked_spectra = batch['masked_spectra'].clone()
+            
+        # Get stats for denormalization/steering if needed
+        # We assume dataset has stats if normalisation happened
+        # steer_inference.py discussion suggested steer in normalized space with v/sigma
+        # or disabled normalization.
+        # But here follow_up_inference uses standard loaders -> Normalized.
+        # So we should use sigma from dataset to scale v.
+        sigma = torch.ones(1).to(device)
+        if hasattr(test_loader.dataset, 'get_feature_normalization_stats'):
+             stats = test_loader.dataset.get_feature_normalization_stats()
+             if stats:
+                 # Ensure sigma has correct shape/device
+                 sigma = torch.from_numpy(stats['std']).to(device)
+                 if sigma.ndim == 1 and original_masked_spectra is not None:
+                     if sigma.shape[0] != original_masked_spectra.shape[-1]:
+                         # fallback or adjust?
+                         pass
+        
         batch_modes = infer_batch_modes(batch, batch_size)
         sample_entries: List[Dict[str, Any]] = []
         obsids = batch.get('obsids', [])
         target_texts = batch.get('target_texts', [])
-
-        for sample_idx in range(batch_size):
-            if cli_args.max_samples is not None and processed + len(sample_entries) >= cli_args.max_samples:
+        
+        
+        # Extract subclasses from stellar_data
+        stellar_data_list = batch.get('stellar_data', [])
+        subclasses = []
+        if isinstance(stellar_data_list, list):
+            for sd in stellar_data_list:
+                if isinstance(sd, dict):
+                    subclasses.append(sd.get('subclass', None))
+                else:
+                    subclasses.append(None)
+        
+        # Determine how many samples to process from this batch to respect max_samples
+        n_to_process = batch_size
+        if cli_args.max_samples is not None:
+            remaining = cli_args.max_samples - processed
+            if remaining <= 0:
                 break
+            n_to_process = min(batch_size, remaining)
+        
+        # Iterate over Steering configurations
+        print(f"DEBUG: Entering steering loops. Concepts: {len(concepts)}, Alphas: {len(alphas)}")
+        for concept_name, concept_vec in concepts.items():
+            print(f"DEBUG: Processing concept: {concept_name}")
+            if concept_vec is not None:
+                 concept_vec = concept_vec.to(device)
+                 # v_norm = v / sigma logic
+                 v_norm_space = concept_vec / sigma
+            
+            for alpha in alphas:
+                 print(concept_name, alpha)
+                 # Initialize sample entries for this alpha group
+                 sample_entries: List[Dict[str, Any]] = []
 
-            context, dataset_question, dataset_target = build_generation_context(
-                batch_data=batch,
-                batch_idx=sample_idx,
-            )
-            stellar_params = get_stellar_params(batch, sample_idx)
-            follow_up_specs = create_follow_up_questions(stellar_params, seed_rng)
-            obsid_value = obsids[sample_idx] if sample_idx < len(obsids) else None
-            target_value = target_texts[sample_idx] if sample_idx < len(target_texts) else dataset_target
+                 # Apply steering
+                 if steering_enabled and concept_vec is not None and original_masked_spectra is not None:
+                      # h_steered = h + alpha * v_norm
+                      # h is original_masked_spectra (Normalized)
+                      print("v_norm_space shape", v_norm_space.shape)
+                      batch['masked_spectra'] = original_masked_spectra + alpha * v_norm_space
+                      print('masked spectra shape', batch['masked_spectra'].shape)
+                 elif original_masked_spectra is not None:
+                      # Restore/Maintain original
+                      batch['masked_spectra'] = original_masked_spectra
 
-            sample_entries.append({
-                'context': context,
-                'dataset_question': dataset_question,
-                'dataset_target': target_value,
-                'stellar_params': stellar_params,
-                'follow_up_specs': follow_up_specs,
-                'obsid': obsid_value,
-                'mode_label': batch_modes[sample_idx] if sample_idx < len(batch_modes) else 'single_star',
-                'batch_ref': batch,
-                'batch_sample_idx': sample_idx,
-            })
+                 for sample_idx in range(n_to_process):
+                    context, dataset_question, dataset_target = build_generation_context(
+                        batch_data=batch,
+                        batch_idx=sample_idx,
+                    )
+            
+                    # --- Fix for 2-star metadata ---
+                    if cli_args.two_star_test:
+                        # In 2-star mode, the question and target are in the metadata, not standard fields
+                        pass
+                
+                    # Two star metadata extraction logic
+                    batch_meta_list = batch.get('metadata', [])
+                    if sample_idx < len(batch_meta_list):
+                       curr_meta = batch_meta_list[sample_idx]
+                       if isinstance(curr_meta, dict):
+                            dataset_question = curr_meta.get('question', dataset_question)
+                            dataset_target = curr_meta.get('expected_answer', dataset_target)
+                    # -------------------------------
 
-        if not sample_entries:
-            if cli_args.max_samples is not None and processed >= cli_args.max_samples:
-                break
-            continue
+                    stellar_params = get_stellar_params(batch, sample_idx)
+                    
+                    # Get full stellar_data dict
+                    full_stellar_data = None
+                    if stellar_data_list and sample_idx < len(stellar_data_list):
+                        full_stellar_data = stellar_data_list[sample_idx]
+                    
+                    target_value = target_texts[sample_idx] if sample_idx < len(target_texts) else dataset_target
+                    
+                    # Create followup questions
+                    if cli_args.two_star_test:
+                        follow_up_specs = []
+                    else:
+                        # Use global sample index (processed + sample_idx) for determinism/indexing if needed
+                        follow_up_specs = create_follow_up_questions(
+                            stellar_params, 
+                            seed_rng,
+                            followup_data=followup_data,
+                            sample_idx=processed + sample_idx,
+                            obsid=obsids[sample_idx] if sample_idx < len(obsids) else None,
+                            l_m_data=l_m_data
+                        )
 
-        for entry in sample_entries:
-            base_text, _, _, _ = model.generate_response_from_batch(
-                batch_data=entry['batch_ref'],
-                batch_idx=entry['batch_sample_idx'],
-                tokenizer=tokenizer,
-                max_new_tokens=cli_args.max_new_tokens,
-                temperature=cli_args.temperature,
-                top_p=cli_args.top_p,
-            )
-            entry['base_answer'] = base_text
-            entry.pop('batch_ref', None)
-            entry.pop('batch_sample_idx', None)
-            if tokenizer is not None:
-                gen_tokens = tokenizer.encode(base_text, bos=False, eos=False)
-                if gen_tokens:
-                    tensor = torch.tensor([gen_tokens],
-                                          dtype=entry['context']['prompt'].dtype,
-                                          device=entry['context']['prompt'].device)
-                    entry['context']['prompt'] = torch.cat([entry['context']['prompt'], tensor], dim=1)
+                    entry = {
+                        'context': context,
+                        'dataset_question': dataset_question,
+                        'dataset_target': target_value,
+                        'stellar_params': stellar_params,
+                        'stellar_data': full_stellar_data,
+                        'follow_up_specs': follow_up_specs,
+                        'obsid': obsids[sample_idx] if len(obsids) > sample_idx else None,
+                        'subclass': subclasses[sample_idx] if len(subclasses) > sample_idx else None,
+                        'mode_label': batch_modes[sample_idx] if sample_idx < len(batch_modes) else 'single_star',
+                        'steering_concept': concept_name if steering_enabled else None,
+                        'steering_alpha': alpha if steering_enabled else 0.0
+                    }
+                    
+                    # Add Lstar/Mstar/Rstar/SNR if available
+                    obsid_key = entry['obsid']
+                    if obsid_key and obsid_key in l_m_data:
+                         star_info = l_m_data[obsid_key]
+                         entry.update(star_info)
+                    
+                     # --- Generate Base Answer Immediately ---
+                    base_text, _, _, _ = model.generate_response_from_batch(
+                        batch_data=batch,
+                        batch_idx=sample_idx,
+                        tokenizer=tokenizer,
+                        max_new_tokens=cli_args.max_new_tokens,
+                        temperature=cli_args.temperature,
+                        top_p=cli_args.top_p,
+                    )
+                    entry['base_answer'] = base_text
+                    
+                    # Update prompt for follow-ups
+                    if tokenizer is not None:
+                        gen_tokens = tokenizer.encode(base_text, bos=False, eos=False)
+                        if gen_tokens:
+                            tensor = torch.tensor([gen_tokens],
+                                                  dtype=entry['context']['prompt'].dtype,
+                                                  device=entry['context']['prompt'].device)
+                            entry['context']['prompt'] = torch.cat([entry['context']['prompt'], tensor], dim=1)
+                    
+                    sample_entries.append(entry)
 
-        for entry in sample_entries:
-            entry['follow_up_answers'] = []
-            append_text_to_prompt(entry['context'], tokenizer, "\n")
+                 # --- Process Follow-ups for this Alpha Group ---
+                 if not sample_entries:
+                     continue
 
-        max_follow_ups = max((len(entry['follow_up_specs']) for entry in sample_entries), default=0)
-        for round_idx in range(max_follow_ups):
-            round_requests: List[Dict[str, Any]] = []
-            for entry in sample_entries:
-                if round_idx >= len(entry['follow_up_specs']):
-                    continue
-                spec = entry['follow_up_specs'][round_idx]
-                question_text = spec['question'].strip()
-                append_text_to_prompt(
-                    entry['context'],
-                    tokenizer,
-                    f"\nFollow-up question: {question_text}\n",
-                )
+                 # Initialize follow-up answers list and prepare prompt
+                 for entry in sample_entries:
+                     entry['follow_up_answers'] = []
+                     append_text_to_prompt(entry['context'], tokenizer, "\n")
+ 
+                 max_follow_ups = max((len(entry['follow_up_specs']) for entry in sample_entries), default=0)
+                 for round_idx in range(max_follow_ups):
+                     round_requests: List[Dict[str, Any]] = []
+                     for entry in sample_entries:
+                         if round_idx >= len(entry['follow_up_specs']):
+                             continue
+                         spec = entry['follow_up_specs'][round_idx]
+                         question_text = spec['question'].strip()
+                         append_text_to_prompt(
+                             entry['context'],
+                             tokenizer,
+                             f"\nFollow-up question: {question_text}\n",
+                         )
+ 
+                         def _make_on_answer(entry=entry, spec=spec, question_text=question_text):
+                             def _assign(answer: str) -> None:
+                                 result_entry = {k: v for k, v in spec.items()}
+                                 result_entry['answer'] = answer
+                                 entry['follow_up_answers'].append(result_entry)
+                                 append_text_to_prompt(entry['context'], tokenizer, "\n")
+                             return _assign
+ 
+                         round_requests.append({
+                             'context': entry['context'],
+                             'on_answer': _make_on_answer(),
+                         })
+ 
+                     _decode_generation_requests(
+                         model=model,
+                         requests=round_requests,
+                         tokenizer=tokenizer,
+                         max_new_tokens=cli_args.max_new_tokens,
+                         temperature=cli_args.temperature,
+                         top_p=cli_args.top_p,
+                         max_parallel=cli_args.max_decode_group,
+                         max_prompt_tokens=cli_args.max_decode_tokens_per_group,
+                     )
+                 
+                 # Save results
+                 for entry_idx, entry in enumerate(sample_entries):
+                    entry['context'].pop('prepared_inputs', None) # Cleanup to save memory
+                     
 
-                def _make_on_answer(entry=entry, spec=spec, question_text=question_text):
-                    def _assign(answer: str) -> None:
-                        entry['follow_up_answers'].append({
-                            'type': spec.get('type', 'follow_up'),
-                            'question': question_text,
-                            'answer': answer,
-                        })
-                        append_text_to_prompt(entry['context'], tokenizer, "\n")
-                    return _assign
-
-                round_requests.append({
-                    'context': entry['context'],
-                    'on_answer': _make_on_answer(),
-                })
-
-            _decode_generation_requests(
-                model=model,
-                requests=round_requests,
-                tokenizer=tokenizer,
-                max_new_tokens=cli_args.max_new_tokens,
-                temperature=cli_args.temperature,
-                top_p=cli_args.top_p,
-                max_parallel=cli_args.max_decode_group,
-                max_prompt_tokens=cli_args.max_decode_tokens_per_group,
-            )
-
-        stop_processing = False
-        for entry_idx, entry in enumerate(sample_entries):
-            entry['context'].pop('prepared_inputs', None)
-
-            results.append({
-                'sample_index': processed,
-                'obsid': entry['obsid'],
-                'mode': entry['mode_label'],
-                'dataset_question': entry['dataset_question'],
-                'dataset_target_answer': entry['dataset_target'],
-                'model_answer': entry['base_answer'],
-                'stellar_params': {k: sanitize_for_json(v) for k, v in entry['stellar_params'].items()},
-                'follow_up_answers': entry['follow_up_answers'],
-            })
-            processed += 1
-            if cli_args.max_samples is not None and processed >= cli_args.max_samples:
-                stop_processing = True
-                remaining = sample_entries[entry_idx + 1:]
-                for pending in remaining:
-                    pending['context'].pop('prepared_inputs', None)
-                break
-
-        if stop_processing:
-            break
+                    results.append({
+                         'sample_index': processed + entry_idx, # Use global index relative to base samples 
+                         'obsid': entry['obsid'],
+                         'subclass': entry.get('subclass'),
+                         'mode': entry['mode_label'],
+                         'dataset_question': entry['dataset_question'],
+                         'dataset_target_answer': entry['dataset_target'],
+                         'model_answer': entry['base_answer'],
+                         'stellar_params': {k: sanitize_for_json(v) for k, v in entry['stellar_params'].items()},
+                         'stellar_data': sanitize_for_json(entry.get('stellar_data')),
+                         'follow_up_answers': entry['follow_up_answers'],
+                         'steering_concept': entry.get('steering_concept'),
+                         'steering_alpha': entry.get('steering_alpha'),
+                     })
+                    print(f"DEBUG: Appended result. Total results: {len(results)}. Concept: {entry.get('steering_concept')}, Alpha: {entry.get('steering_alpha')}")
+        
+        # Update processed count by the number of unique samples processed in this batch
+        processed += n_to_process
+        if cli_args.max_samples is not None and processed >= cli_args.max_samples:
+             break
 
     backend_metadata = backend_config.to_dict() if hasattr(backend_config, "to_dict") else backend_config
 

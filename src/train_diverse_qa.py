@@ -9,6 +9,7 @@ from pathlib import Path
 import torch
 from torch.nn.parallel import DistributedDataParallel as DDP
 
+# Setup path and installs
 ROOT_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.append(ROOT_DIR)
 os.system('pip install tiktoken fairscale fire blobfile torchdiffeq torchcfm transformers bitsandbytes accelerate')
@@ -26,11 +27,6 @@ from src.tokenizer_adapter import load_tokenizer_adapter
 from nn.llm_multi import MultimodalLlamaModelMultiTokens
 from nn.llm_hf_multi import HuggingFaceMultimodalModel
 from nn.train import LLMTrainer
-from data.dataset_interpert import create_stellar_dataloaders, StellarQuestionsDataset
-from data.dataset_comparative import create_comparative_dataloaders
-from data.dataset_advanced import AdvancedStellarQuestionsDataset
-from data.dataset_mixed import create_mixed_dataloaders
-from data.dataset_feature_pred import create_feature_prediction_dataloaders
 from data.transforms import GeneralSpectrumPreprocessor, ToTensor, Compose
 import numpy as np
 import torch.distributed as dist
@@ -38,6 +34,11 @@ import gc
 
 from src.llm_backend_config import LLMBackendConfig
 
+# Import new diverse dataset loader
+from data.dataset_diverse import create_diverse_dataloaders
+
+# Copy helper functions from simple_questions_multitok.py 
+# (Since these are local to the script usually, it is safer to copy them to ensure self-containment)
 
 def _normalize_backend(backend):
     """Map user-facing backend aliases to internal canonical strings."""
@@ -95,36 +96,30 @@ def ensure_backend_config(args):
 
 def parse_args(argv=None):
     """Parse command line arguments"""
-    parser = argparse.ArgumentParser(description='Train CLIP Multimodal Stellar Model')
+    parser = argparse.ArgumentParser(description='Train CLIP Multimodal Stellar Model (Diverse QA)')
     
-    # Data paths - use the same defaults from simple_questions.py
-    JSON_PATH = '/home/ilay.kamai/work/TalkingLatents/data/dataset/stellar_descriptions_questions_short.json'
-    JSON_PATH_LONG = '/home/ilay.kamai/work/TalkingLatents/data/dataset/stellar_descriptions_questions.json'
-    ADVANCED_JSON_PATH = '/home/ilay.kamai/work/TalkingLatents/data/dataset/caption_advanced_100k.json'
-    FEATURES_PATH = '/home/ilay.kamai/work/TalkingLatents/logs/2025-07-29/features.npy'  # Optional, can be None to load all features on-the-fly
-    # FEATURES_PATH = '/home/ilay.kamai/work/TalkingLatents/logs/2025-12-16/tokens.npy' # different model
+    # Updated default JSON path
+    JSON_PATH = '/home/ilay.kamai/work/TalkingLatents/data/dataset/stellar_qa_hybrid.json'
+    FEATURES_PATH = '/home/ilay.kamai/work/TalkingLatents/logs/2025-07-29/features.npy'  
     
     parser.add_argument('--json_file', type=str, default=JSON_PATH,
-                       help='Path to stellar descriptions JSON file')
-    parser.add_argument('--advanced_json_file', type=str, default=ADVANCED_JSON_PATH,
-                       help='Path to advanced stellar questions JSON file')
-    parser.add_argument('--single_dataset_type', type=str, choices=['regular', 'advanced'],
-                       default='regular', help='Select which single-star dataset variant to load')
+                       help='Path to stellar descriptions JSON file (Hybrid QA)')
     parser.add_argument('--features_file', type=str, default=FEATURES_PATH,
                        help='Path to spectral features numpy file')
     parser.add_argument('--output_dir', type=str, default='logs',
                        help='Output directory for logs and models')
-    parser.add_argument('--exp_name', type=str, default='interpert',
+    parser.add_argument('--exp_name', type=str, default='diverse_qa',
                        help='Experiment name')
-    parser.add_argument('--enable_followup_augmentation', action='store_true', default=False,
-                        help='Append synthetic follow-up QA turns during training')
-    parser.add_argument('--followup_prob', type=float, default=0.0,
+    
+    # Follow-up config
+    parser.add_argument('--enable_followup_augmentation', action='store_true', default=True,
+                        help='Enable follow-up QA turns (random choice of classification/reasoning)')
+    parser.add_argument('--followup_prob', type=float, default=0.5,
                         help='Probability of augmenting a sample with follow-up QA')
+    # Note: max_followup_turns logic in dataset_diverse currently appends just 1 turn if enabled
     parser.add_argument('--max_followup_turns', type=int, default=1,
                         help='Maximum number of follow-up QA turns to append per sample')
-    parser.add_argument('--followup_json_file', type=str, default=JSON_PATH_LONG,
-                        help='json file for followup questions')
-                        
+
     
     # Model configuration
     parser.add_argument('--llm_backend', type=str, choices=['llama', 'hf', 'qwen'],
@@ -160,7 +155,7 @@ def parse_args(argv=None):
                        help='Spectral model embedding dimension')
     parser.add_argument('--hidden_dim', type=int, default=512,
                        help='Common projection space dimension')
-    parser.add_argument('--num_spectral_features', type=int, default=8,
+    parser.add_argument('--num_spectral_features', type=int, default=4,
                        help='Number of spectral features to integrate into LLM')
     parser.add_argument('--latent_ids', type=list, nargs='*', default=['Teff', 'logg', 'FeH'],
                        help='List of latent variable IDs to include (e.g., --latent_ids mass age metallicity)')
@@ -184,8 +179,6 @@ def parse_args(argv=None):
                    help='Dimension of features to predict (default: 2048)')
     parser.add_argument('--feature_loss_weight', type=float, default=1.0,
                    help='Weight for feature prediction loss (default: 1.0)')
-    parser.add_argument('--random_pairing', action='store_true', default=False,
-                       help='pairing strategy - random (True) or nearest neighbor (False)')
 
     # Training parameters
     parser.add_argument('--batch_size', type=int, default=16,
@@ -213,22 +206,10 @@ def parse_args(argv=None):
     parser.add_argument('--loss_scale', type=float, default=None,
                        help='Static loss scaling factor (None for dynamic)')
 
-    parser.add_argument('--mode', type=str, choices=['single_star', 'two_star', 'combined'], 
-                       default='combined', help='Training mode: single_star, two_star, or combined')
+    # Mode defaults to single_star for diverse loader to keep things simple as requested
+    parser.add_argument('--mode', type=str, default='single_star', 
+                       help='Training mode: always single_star for diverse QA')
     
-    parser.add_argument('--switch_epoch', type=int, default=7,
-                       help='Epoch to switch from single_star to two_star in combined mode')
-    
-    parser.add_argument('--comparative_json_file', type=str, 
-                       default='/data/TalkingLatents/data/dataset/comparative_dataset.json',
-                       help='Path to comparative questions JSON file (used in two_star mode)')
-    parser.add_argument('--enable_classification', action='store_true', default=True,
-                       help='Enable classification head for comparative questions (default: True)')
-    parser.add_argument('--disable_classification', action='store_true', default=False,
-                       help='Disable classification head to save memory')
-    
-    parser.add_argument('--single_sample_prob', type=float, default=1.0,
-                       help='Probability of drawing a single-star sample when using the mixed dataset')
     
     parser.add_argument('--curriculum_decay_steps', type=int, default=1000,
                        help='Number of iterations between single_sample_prob decreases (0 = no curriculum)')
@@ -244,11 +225,11 @@ def parse_args(argv=None):
     
     # Data splitting
     parser.add_argument('--train_ratio', type=float, default=0.8,
-                       help='Training set ratio')
-    parser.add_argument('--val_ratio', type=float, default=0.1,
-                       help='Validation set ratio')
-    parser.add_argument('--test_ratio', type=float, default=0.1,
-                       help='Test set ratio')
+                       help='Training set ratio (of non-test set)')
+    parser.add_argument('--val_ratio', type=float, default=0.2,
+                       help='Validation set ratio (of non-test set)')
+    parser.add_argument('--test_ratio', type=float, default=0.0,
+                       help='Test set ratio (ignored, first 1000 fixed)')
     parser.add_argument('--random_seed', type=int, default=42,
                        help='Random seed for data splitting')
 
@@ -531,45 +512,20 @@ def prepare_training_with_resume(
 
 
 def create_datasets_and_loaders(args, device, backend_config: LLMBackendConfig | None = None):
-    """Create datasets and dataloaders with mode support - only on rank 0 for memory efficiency"""
+    """Create diverse datasets and dataloaders - only on rank 0 for memory efficiency"""
     
     rank = dist.get_rank() if dist.is_initialized() else 0
     world_size = dist.get_world_size() if dist.is_initialized() else 1
     
-    # Handle missing attributes for backward compatibility with old configs
-    random_pairing = getattr(args, 'random_pairing', False)
-    
     # Only rank 0 loads spectral features to avoid OOM
     spectral_features = None
-    print(args.features_file)
     if args.features_file and os.path.exists(args.features_file):
         print(f"Loading spectral features from {args.features_file}")
         spectral_features = np.load(args.features_file)
         print(f"Spectral features shape: {spectral_features.shape}")
     else:
         print("No spectral features file provided or file not found. Will use raw spectra on-the-fly.")
-    dataset_type = getattr(args, "single_dataset_type", "regular")
-    if dataset_type == "advanced":
-        single_dataset_cls = AdvancedStellarQuestionsDataset
-        single_json_file = getattr(args, "advanced_json_file", None) or args.json_file
-    else:
-        single_dataset_cls = StellarQuestionsDataset
-        single_json_file = args.json_file
 
-    args.json_file = single_json_file
-
-    followup_kwargs = dict(
-        enable_followup=getattr(args, 'enable_followup_augmentation', False),
-        followup_prob=getattr(args, 'followup_prob', 0.0),
-        max_followup_turns=getattr(args, 'max_followup_turns', 1),
-        followup_seed=getattr(args, 'random_seed', 42),
-        followup_json_file=getattr(args, 'followup_json_file', None)
-    )
-
-    # # Synchronize before proceeding
-    # if dist.is_initialized():
-    #     dist.barrier()
-    
     backend_config = backend_config or ensure_backend_config(args)
     tokenizer_backend = backend_config.tokenizer_backend
     tokenizer_path = backend_config.tokenizer_path
@@ -584,112 +540,36 @@ def create_datasets_and_loaders(args, device, backend_config: LLMBackendConfig |
         trust_remote_code=backend_config.trust_remote_code,
         hf_revision=backend_config.revision,
     )
-    transf = Compose([GeneralSpectrumPreprocessor(rv_norm=True), ToTensor()])
     
     # Create cache directory for split consistency
     cache_dir_base = os.path.join(args.output_dir, 'cache')
     cache_dir = cache_dir_base if rank == 0 else f"{cache_dir_base}_r{rank}"
     os.makedirs(cache_dir, exist_ok=True)
 
-    if hasattr(args, 'predict_features') and args.predict_features:
-        if args.mode != 'single_star':
-            raise ValueError("predict_features mode is only supported in single_star mode")
-    
-        if rank == 0:
-            print(f"Creating feature prediction dataloaders from {single_json_file}...")
-        
-        # Features array is required for feature prediction
-        if spectral_features is None:
-            raise ValueError("Feature prediction requires features_file to be provided")
-        
-        
-        train_loader, val_loader, test_loader = create_feature_prediction_dataloaders(
-            json_file=single_json_file,
-            features_array=spectral_features,
-            batch_size=args.batch_size,
-            train_ratio=args.train_ratio,
-            val_ratio=args.val_ratio,
-            test_ratio=args.test_ratio,
-            random_state=args.random_seed,
-            num_workers=args.num_workers // world_size if world_size > 1 else args.num_workers,
-            cache_dir=cache_dir,
-            world_size=world_size,
-            device=str(device),
-            tokenizer_path=tokenizer_path,
-            tokenizer=tokenizer_adapter,
-            max_length=args.max_seq_length,
-            num_spectral_features=args.num_spectral_features,
-            random_pairing=random_pairing,
-            enable_followup=followup_kwargs['enable_followup'],
-            followup_prob=followup_kwargs['followup_prob'],
-            max_followup_turns=followup_kwargs['max_followup_turns'],
-            followup_seed=followup_kwargs['followup_seed'],
-            followup_json_file=followup_kwargs['followup_json_file']
+    if rank == 0:
+        print(f"Creating diverse QA datasets from {args.json_file}...")
 
-            
-        )
-    else:
-    
-        if args.mode == "two_star":
-            if rank == 0:
-                print(f"Creating two-star comparative datasets from {args.comparative_json_file}...")
-            
-            train_loader, val_loader, test_loader = create_comparative_dataloaders(
-                json_file=args.comparative_json_file,
-                features_array=spectral_features,
-                batch_size=args.batch_size,
-                train_ratio=args.train_ratio,
-                val_ratio=args.val_ratio,
-                test_ratio=args.test_ratio,
-                random_state=args.random_seed,
-                num_workers=args.num_workers // world_size if world_size > 1 else args.num_workers,
-                cache_dir=cache_dir,
-                tokenizer_path=tokenizer_path,
-                tokenizer=tokenizer_adapter,
-                max_length=args.max_seq_length,
-                num_spectral_features=args.num_spectral_features,
-                world_size=world_size,
-                device=str(local_rank),
-            )
-            
-        elif args.mode == "combined":
-            raise NotImplementedError('combined dataset no longer implemented!')
-
-        else:
-            # Check if we should create feature prediction dataloaders
-            
-            if rank == 0:
-                print(f"Creating {dataset_type} single-star datasets from {single_json_file}...")
-
-            train_loader, val_loader, test_loader = create_stellar_dataloaders(
-                json_file=single_json_file,
-                features_array=spectral_features,
-                spectral_transforms=transf,
-                train_ratio=args.train_ratio,
-                val_ratio=args.val_ratio,
-                test_ratio=args.test_ratio,
-                random_state=args.random_seed,
-                num_spectral_features=args.num_spectral_features,
-                cache_dir=cache_dir,
-                tokenizer_path=tokenizer_path,
-                tokenizer=tokenizer_adapter,
-                tokenizer_backend=tokenizer_backend,
-                max_length=args.max_seq_length,
-                batch_size=args.batch_size,
-                num_workers=args.num_workers // world_size if world_size > 1 else args.num_workers,
-                world_size=world_size,
-                device=device,
-                dataset_cls=single_dataset_cls,
-                enable_followup=followup_kwargs['enable_followup'],
-                followup_prob=followup_kwargs['followup_prob'],
-                max_followup_turns=followup_kwargs['max_followup_turns'],
-                followup_seed=followup_kwargs['followup_seed'],
-                followup_json_file=followup_kwargs['followup_json_file']
-                )
-
-    # # Synchronize all processes after dataset creation
-    # if dist.is_initialized():
-    #     dist.barrier()
+    train_loader, val_loader, test_loader = create_diverse_dataloaders(
+        json_file=args.json_file,
+        features_array=spectral_features,
+        train_ratio=args.train_ratio,
+        val_ratio=args.val_ratio,
+        test_ratio=args.test_ratio, # Ignored, fixed first 1000
+        random_state=args.random_seed,
+        num_spectral_features=args.num_spectral_features,
+        cache_dir=cache_dir,
+        tokenizer_path=tokenizer_path,
+        tokenizer=tokenizer_adapter,
+        tokenizer_backend=tokenizer_backend,
+        max_length=args.max_seq_length,
+        batch_size=args.batch_size,
+        num_workers=args.num_workers // world_size if world_size > 1 else args.num_workers,
+        world_size=world_size,
+        device=device,
+        enable_followup=getattr(args, 'enable_followup_augmentation', True),
+        followup_prob=getattr(args, 'followup_prob', 0.5),
+        max_followup_turns=getattr(args, 'max_followup_turns', 1),
+    )
 
     for loader in (train_loader, val_loader, test_loader):
         if loader is not None and hasattr(loader, "dataset"):
@@ -740,10 +620,13 @@ def build_model_multitok(args, device, world_size=1, backend_config: LLMBackendC
     if not is_hf_backend:
         llm = llm.to(device)
 
-    enable_cls = getattr(args, 'enable_classification', False)
+    # Simplified model instantiation: Always MultimodalLlamaModelMultiTokens or HF variant
     model_cls = MultimodalLlamaModelMultiTokens if not is_hf_backend else HuggingFaceMultimodalModel
 
     hf_device_map = getattr(args, "hf_device_map", None)
+
+    # Always enable classification head currently as user didn't specify otherwise and it was default
+    enable_cls = True 
 
     model = model_cls(
         base_model=llm,
@@ -791,7 +674,6 @@ def build_model_multitok(args, device, world_size=1, backend_config: LLMBackendC
     else:
         model = model.to(device)
     
-    # Note: stellar predictor, stellar transformer, and feature predictor will be set to FP32 after DDP wrapping
     return model
 
 
@@ -808,11 +690,7 @@ def main():
             print(f"Resolved resume checkpoint: {resolved_resume}")
     else:
         date = datetime.datetime.now().strftime('%Y-%m-%d-%H-%M')
-        dataset_tag = getattr(args, "single_dataset_type", "regular")
-        if getattr(args, "mode", "") != "single_star":
-            dataset_tag = args.mode
-        lambda_tag = str(args.loss_lambda).replace('.', 'p')
-        run_name = f"{dataset_tag}_loss{lambda_tag}_{date}"
+        run_name = f"{args.exp_name}_loss{str(args.loss_lambda).replace('.', 'p')}_{date}"
         args.output_dir = os.path.join(args.output_dir, run_name)
     
     local_rank, world_size, _ = setup()
@@ -850,12 +728,7 @@ def main():
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
     
-    # Handle tokenizer extraction for combined mode
-    if args.mode == "combined":
-        # For mixed datasets, get tokenizer from the single dataset inside the mixed dataset
-        tokenizer = train_loader.dataset.single_dataset.tokenizer
-    else:
-        tokenizer = train_loader.dataset.tokenizer
+    tokenizer = train_loader.dataset.tokenizer
 
     print("Creating multitoken multimodal model...")
     model = build_model_multitok(args, local_rank, world_size, backend_config)
@@ -869,8 +742,7 @@ def main():
     if hasattr(model, 'module'):
         print(f"Model.module mode: {model.module.mode}")
 
-    # Freeze large submodules BEFORE wrapping with DDP so the reducer
-    # only tracks truly trainable parameters (avoids unused-grad errors).
+    # Freeze large submodules
     base = model
     if isinstance(base, DDP):
         base = base.module
@@ -883,7 +755,6 @@ def main():
             p.requires_grad = False
         print("✓ Frozen spectral FM parameters")
     
-    # Clear memory after freezing parameters
     gc.collect()
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
@@ -892,9 +763,6 @@ def main():
 
     if world_size > 1:
         print(f"Wrapping with DDP (world_size={world_size})")
-        # All large modules are frozen; but LoRA may be applied later and
-        # not participate immediately. Use find_unused_parameters=True to
-        # avoid reducer errors in early epochs.
         model = DDP(
             model,
             device_ids=[local_rank],
@@ -906,7 +774,6 @@ def main():
     else:
         print("Single GPU - no DDP")
 
-    # Keep stellar predictor, transformer, and feature predictor in FP32 for numerical stability (after DDP wrapping)
     base_model = model.module if isinstance(model, DDP) else model
     if hasattr(base_model, 'stellar_predictor') and base_model.stellar_predictor is not None:
         base_model.stellar_predictor.float()
@@ -918,19 +785,16 @@ def main():
     if hasattr(base_model, 'feature_predictor') and base_model.feature_predictor is not None:
         base_model.feature_predictor.float()
         print("✓ Feature predictor set to float32")
-    # Note: Classification head remains in model precision (FP16/BF16) for memory efficiency
     if hasattr(base_model, 'classification_head') and base_model.classification_head is not None:
         print("✓ Classification head using model precision for memory efficiency")
 
     print("Preparing trainer configuration...")
-    # Load tuned LoRA config (attention-only by default)
     tuned_cfg_path = os.path.join(ROOT_DIR, 'src', 'llm_config_tuned.json')
     if os.path.isfile(tuned_cfg_path):
         with open(tuned_cfg_path, 'r') as f:
             tuned_cfg = json.load(f)
         lora_params = tuned_cfg.get('lora_params', {})
     else:
-        # Fallback to base config if tuned not found
         base_cfg_path = os.path.join(ROOT_DIR, 'src', 'llm_config.json')
         with open(base_cfg_path, 'r') as f:
             base_cfg = json.load(f)
@@ -964,7 +828,6 @@ def main():
             initial_min_loss=initial_min_loss,
             initial_best_acc=initial_best_acc
         )
-        # Only rank 0 saves training results to avoid multiple files
         if local_rank == 0:
             output_filename = f'{args.output_dir}/fit_res.json'
             with open(output_filename, "w") as f:
@@ -973,7 +836,6 @@ def main():
 
 if __name__ == '__main__':
     print("="*80)
-    print("MULTIMODAL STELLAR MODEL TRAINING (Multi spectral tokens)")
-    print("Supports both single-star and two-star comparative modes")
+    print("MULTIMODAL STELLAR MODEL TRAINING (Diverse Hybrid QA)")
     print("="*80)
     main()

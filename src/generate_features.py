@@ -1,50 +1,118 @@
 import yaml
-from data.transforms import *
-from data.spectra_dataset import SpectraDataset
 import pandas as pd
-from nn.models import *
+from torch.utils.data import DataLoader
+import datetime
+import argparse
+import torch
+import os
+from collections import OrderedDict
+os.system('pip install tiktoken fairscale fire blobfile torchdiffeq torchcfm transformers bitsandbytes accelerate')
+
+import sys
+ROOT_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+sys.path.append(ROOT_DIR)
+print("running from ", ROOT_DIR) 
+from nn.spectra_model import *
 from nn.train import *
 from util.visualization import *
 from util.utils import *
 from nn.optim import CQR
-from torch.utils.data import DataLoader
-import datetime
-import argparse
+from data.transforms import *
+from data.spectra_dataset import SpectraDataset
+from nn.spectra_model import SpectralViT, MultiTaskRegressor
+
 
 # these are just for my convenient. The actual paths are given as arguments
-config_path = 'pretrained_models/MultiTaskRegressor_spectra__decode_1_complete_config.yaml'
+config_path = '/home/ilay.kamai/work/MultiDESA/configs/lamost.yaml'
 weights_path = 'pretrained_models/spectra.pth'
-lamost_data_dir = r"C:\Users\Ilay\projects\kepler\data\lamost\data"
+lamost_data_dir = '/home/ilay.kamai/work/lamost/data'
 simulation_data_dir = "data/dataset_noiseless/lamost"
 simulation_df_path = "data/dataset_noiseless/simulation_properties.csv"
-lamost_df_path = r"C:\Users\Ilay\projects\kepler\data\lamost\lamost_local_catalog.csv"
+lamost_df_path = "home/ilay.kamai/work/lamost/lamost_local_catalog.csv"
+
+BOUNDS = {'MAX_TEFF' : 7500, 'MIN_TEFF' : 3000, 'MAX_LOGG' : 5.0, 'MIN_LOGG' : 0, 'MAX_FEH' : 0.5, 'MIN_FEH' : -3}
 
 
 def get_lamost_df(df_path):
+    print("reading lamost dataframe...")
     lamost_catalog = pd.read_csv(df_path)
-    lamost_catalog = lamost_catalog.drop_duplicates(subset=['obsid'])
-    lamost_catalog = lamost_catalog[lamost_catalog['snrg'] > 0]
-    lamost_catalog.rename(columns={'teff': 'Teff', 'feh':'FeH'}, inplace=True)
-    lamost_catalog = lamost_catalog.dropna(subset=['Teff', 'logg', 'FeH'])
+    print("Applying basic filters...")
+    for s in ['snrg', 'snru', 'snrr', 'snri']:
+        lamost_catalog = lamost_catalog[lamost_catalog[s] > 0]
+    lamost_catalog['snr'] = lamost_catalog[['snrg', 'snru', 'snrr', 'snri']].mean(axis=1)
+    lamost_catalog.rename(columns={'Teff':'teff', 'FeH':'feh'}, inplace=True)
+    lamost_catalog = lamost_catalog.dropna(subset=['teff', 'logg', 'feh'])
+    lamost_catalog['teff'] = lamost_catalog['teff'] * 5778 # remove old normalization
+        
+    print("\nNormalizing parameters...")
     print("values ranges: ")
-    for c in ['Teff', 'logg', 'FeH']:
-        if c == 'Teff':
-            lamost_catalog[c] = lamost_catalog[c] / 5778  # match the pretraining normalization
-        print(c, lamost_catalog[c].min(), lamost_catalog[c].max())
+    for c in ['teff', 'logg', 'feh']: 
+        C = c.upper()
+        if c != 'feh':
+            lamost_catalog = lamost_catalog[lamost_catalog[c] > 0]
+        print(c, lamost_catalog[c].min(), lamost_catalog[c].max(), "nans: ", lamost_catalog[c].isna().sum())
+        lamost_catalog[c] = (lamost_catalog[c] - BOUNDS[f'MIN_{C}']) / (BOUNDS[f'MAX_{C}'] - BOUNDS[f'MIN_{C}'])
+        print(c, lamost_catalog[c].min(), lamost_catalog[c].max(), "nans: ", lamost_catalog[c].isna().sum())
+    
+    lamost_catalog['snr'] = lamost_catalog['snr'] / lamost_catalog['snr'].max()
     return lamost_catalog
 
 def get_simulation_df(df_path):
-    sim_df = pd.read_csv(df_path)
-    for c in ['Teff', 'logg', 'FeH']:
-        if c == 'Teff':
-            sim_df[c] = sim_df[c] / 5778  # match the pretraining normalization
-        print(c, sim_df[c].min(), sim_df[c].max())
-    return sim_df
+    print("reading simulation dataframe...")
+    df = pd.read_csv(df_path)
+    return df
+
+def get_args():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--config_path", type=str, default=config_path)
+    parser.add_argument("--weights_path", type=str, default=weights_path)
+    parser.add_argument("--lamost_data_dir", type=str, default=lamost_data_dir)
+    parser.add_argument("--simulation_data_dir", type=str, default=simulation_data_dir)
+    parser.add_argument("--simulation_df_path", type=str, default=simulation_df_path)
+    parser.add_argument("--lamost_df_path", type=str, default=lamost_df_path)
+    parser.add_argument("--output_path", type=str, default="logs/2025-07-29/features.npy")
+    return parser.parse_args()
+
 
 def load_model(config):
-    model = MultiTaskRegressor(Container(**config['model_args']), Container(**config['conformer_args']))
-    return model
+    print("loading model...")
+    # config is already a dict from yaml.safe_load
+    
+    # Check for SpectralViT config first
+    if 'SpectralViT' in config:
+        print("Loading SpectralViT model...")
+        model_args = Container(**config['SpectralViT'])
+        # In MultiDESA/src/lamost.py, transformer_args uses Conformer config
+        conformer_args = Container(**config['Conformer'])
+        
+        model = SpectralViT(model_args, transformer_args=conformer_args)
+        
+        # Load checkpoint
+        ckpt_path = model_args.checkpoint_path
+        print(f"Loading checkpoint from {ckpt_path}")
+        if os.path.exists(ckpt_path):
+            state_dict = torch.load(ckpt_path, map_location='cpu')
+            # Handle DDP prefix if present
+            new_state_dict = OrderedDict()
+            for k, v in state_dict.items():
+                name = k[7:] if k.startswith('module.') else k
+                new_state_dict[name] = v
+            model.load_state_dict(new_state_dict)
+        else:
+            print(f"Warning: Checkpoint not found at {ckpt_path}")
 
+    else:
+        # Fallback to old behavior
+        print("Loading MultiTaskRegressor model...")
+        spectra_args = Container(**config['MultiTaskRegressor'])
+        conformer_args = Container(**config['Conformer'])
+        model = MultiTaskRegressor(spectra_args, conformer_args)
+        # Weights for MTR are loaded via load_checkpoints_ddp in run() function usually,
+        # but let's check run(). run() calls load_checkpoints_ddp AFTER load_model.
+        # So we don't need to load weights here for MTR.
+        
+    model.eval()
+    return model
 def predict(model, test_dl, device, max_iter=100):
     loss_fn = CQR(quantiles=[0.1,0.25,0.5,0.75,0.9], reduction='none')
     ssl_loss_fn = torch.nn.MSELoss()
@@ -57,15 +125,15 @@ def predict(model, test_dl, device, max_iter=100):
                                      scheduler=None, train_dataloader=None,
                                      val_dataloader=None, device=device,
                                      num_quantiles=5,
-                                     exp_num='local', log_path=None, range_update=None,
+                                    log_path=None, range_update=None,
                                      accumulation_step=1, max_iter=max_iter, w_name=None,
-                                     w_init_val=1, exp_name=f"predict")
+                                    exp_name=f"predict")
 
     return trainer.predict(test_dl, device=device)
 
 
-def test_predictions(log_dir, quantile_labels=['Teff', 'logg', 'FeH'],
-                     umap_labels=['Teff', 'logg', 'FeH'],
+def test_predictions(log_dir, quantile_labels=['teff', 'logg', 'feh'],
+                     umap_labels=['teff', 'logg', 'feh'],
                      savedir='figs'
                      ):
     info_df = pd.read_csv(os.path.join(log_dir, 'info.csv'))
@@ -75,7 +143,7 @@ def test_predictions(log_dir, quantile_labels=['Teff', 'logg', 'FeH'],
     xs = np.load(os.path.join(log_dir, 'xs.npy'))
     decodes = np.load(os.path.join(log_dir, 'decodes.npy'))
 
-    plot_quantiles(targets, preds, [0.1,0.25,0.5,0.75,0.9], [5778, 1, 1], quantile_labels, savedir=savedir)
+    plot_quantiles(targets, preds, [0.1,0.25,0.5,0.75,0.9], quantile_labels, savedir=savedir)
     plot_decode(xs, decodes, info_df, num_sampels=10, savedir=savedir)
     plot_umap(features, info_df, umap_labels, savedir=savedir)
 
@@ -98,20 +166,29 @@ def run(config_path, weights_path, data_dir, df_path, simulation=True, max_iter=
     rv_norm = not simulation
     file_type = 'pqt' if simulation else 'fits'
     id = 'Simulation Number' if simulation else 'obsid'
-    labels = ['Teff', 'logg', 'FeH']
+    labels = ['teff', 'logg', 'feh']
     transf = Compose([GeneralSpectrumPreprocessor(rv_norm=rv_norm), ToTensor()])
-    train_ds = SpectraDataset(data_dir,
-                              transf, train_df,
-                              max_len=4096,
-                              id=id,
-                              labels=labels,
-                              file_type=file_type)
+    train_ds = SpectraDataset(cfg['Data']['spectra_dir'],
+                            transforms=transf, df=train_df,
+                            max_len=cfg['Data']['max_len'],
+                            target_norm=cfg['Data']['target_norm'],
+                            id='obsid',
+                            labels=cfg['Data']['prediction_labels'],
+                            store_wv=True
+                            )
     train_dl = DataLoader(train_ds,
                           batch_size=16,
-                          collate_fn=kepler_collate_fn,
+                          collate_fn=collate_with_idx,
                           )
-    preds, targets, features, xs, decodes, info = predict(model, train_dl, device, max_iter=max_iter)
-    print(preds.shape, targets.shape, features.shape, xs.shape, decodes.shape, info.keys())
+
+    for i, (batch, idx) in enumerate(train_dl):
+        if batch is not None:
+             spectra_masked,spectra,target, mask,_, info = batch
+             print(spectra_masked.shape, spectra.shape,target.shape)
+        if i > 3:
+            break
+    preds, targets, features, tokens, decodes, xs, info, mean_loss = predict(model, train_dl, device, max_iter=max_iter)
+    print(preds.shape, targets.shape, tokens.shape, features.shape, xs.shape, decodes.shape, info.keys())
     if info:
         max_length = max(len(v) for v in info.values())
         for key in info:
@@ -121,14 +198,19 @@ def run(config_path, weights_path, data_dir, df_path, simulation=True, max_iter=
                 info[key].extend([np.nan] * (max_length - current_length))
 
     info_df = pd.DataFrame(info)
-    info_df.to_csv(f'logs/{cur_time}/info.csv', index=False)
-    np.save(f'logs/{cur_time}/preds.npy', preds)
-    np.save(f'logs/{cur_time}/targets.npy', targets)
-    np.save(f'logs/{cur_time}/features.npy', features)
-    np.save(f'logs/{cur_time}/xs.npy', xs)
-    np.save(f'logs/{cur_time}/decodes.npy', decodes)
+    save_dir = f"/home/ilay.kamai/work/TalkingLatents/logs/{cur_time}"
+    os.makedirs(save_dir, exist_ok=True)
+    info_df.to_csv(f'{save_dir}/info.csv', index=False)
+    np.save(f'{save_dir}/preds.npy', preds)
+    np.save(f'{save_dir}/targets.npy', targets)
+    np.save(f'{save_dir}/features.npy', features)
+    np.save(f'{save_dir}/tokens.npy', tokens)
+    np.save(f'{save_dir}/xs.npy', xs)
+    np.save(f'{save_dir}/decodes.npy', decodes)
 
-    test_predictions(f'logs/{cur_time}', savedir=savedir)
+    print("outputs saved into: ", save_dir)
+
+    test_predictions(f'{save_dir}', savedir=f'{save_dir}/figs')
 
 if __name__ == '__main__':
 
