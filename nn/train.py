@@ -19,9 +19,13 @@ import gc
 import inspect
 
 
-from nn.lora import apply_lora_to_model
+from nn.lora import apply_lora_to_model, LoRALinear
 from nn.optim import CQR
-from fairscale.nn.model_parallel.layers import RowParallelLinear, ColumnParallelLinear
+try:
+    from fairscale.nn.model_parallel.layers import RowParallelLinear, ColumnParallelLinear
+except ImportError:
+    RowParallelLinear = None
+    ColumnParallelLinear = None
 
 
 def print_tensor_memory(tensor, name="tensor"):
@@ -883,17 +887,28 @@ class LLMTrainer(Trainer):
         print("Applying LoRA layers...")
 
         # Get supported linear layer types
-        try:
-            linear_types = (torch.nn.Linear, RowParallelLinear, ColumnParallelLinear)
-            print("Using FairScale parallel layers support")
-        except ImportError:
-            linear_types = (torch.nn.Linear,)
-            print("FairScale not available, using only torch.nn.Linear")
+        linear_types = [torch.nn.Linear]
+        if RowParallelLinear is not None:
+            linear_types.append(RowParallelLinear)
+        if ColumnParallelLinear is not None:
+            linear_types.append(ColumnParallelLinear)
+        linear_types = tuple(linear_types)
+        print(f"Using linear types: {linear_types}")
+
+        # Use unwrapped model to avoid module. prefix issues
+        model_to_search = self._unwrap_model()
+        
+        # Check if LoRA is already applied to the unwrapped model
+        existing_lora = [m for m in model_to_search.modules() if isinstance(m, LoRALinear)]
+        if existing_lora:
+            print(f"✓ LoRA already applied to {len(existing_lora)} modules. Skipping re-application.")
+            self.lora_modules = existing_lora
+            return
 
         # First, let's see what modules actually exist in the model
         print("Available modules in model:")
         all_modules = []
-        for name, module in self.model.named_modules():
+        for name, module in model_to_search.named_modules():
             if isinstance(module, linear_types):
                 all_modules.append(name)
 
@@ -937,7 +952,7 @@ class LLMTrainer(Trainer):
             return
 
         self.lora_modules = apply_lora_to_model(
-            self.model,
+            model_to_search,
             target_modules,
             rank=self.lora_rank,
             alpha=self.lora_alpha,
@@ -945,6 +960,26 @@ class LLMTrainer(Trainer):
         )
 
         print(f"Successfully applied LoRA to {len(self.lora_modules)} modules")
+        
+        # Critical: Update optimizer with new parameters
+        if self.optimizer is not None:
+            # Gather new parameters (requires_grad=True and 'lora' in name)
+            # that are not already in the optimizer
+            existing_params = set()
+            for group in self.optimizer.param_groups:
+                for p in group['params']:
+                    existing_params.add(p)
+            
+            new_params = []
+            for name, p in model_to_search.named_parameters():
+                if p.requires_grad and p not in existing_params:
+                     new_params.append(p)
+            
+            if new_params:
+                print(f"Adding {len(new_params)} new LoRA parameters to optimizer")
+                self.optimizer.add_param_group({'params': new_params})
+            else:
+                print("Warning: No new parameters found to add to optimizer after LoRA application")
 
     def _apply_freeze_strategy(self, strategy: str):
         """Apply different freezing strategies to the model"""
@@ -963,17 +998,27 @@ class LLMTrainer(Trainer):
             # Apply LoRA if not already applied
             if not self.lora_modules and self.epoch == self.lora_start_epoch:
                 self._apply_lora()
-
-            # Freeze base model, enable encoder, regressor, AND LoRA parameters
-            for name, param in self.model.named_parameters():
-                if 'base_model' not in name and 'fm_model' not in name:
-                    param.requires_grad = True
-                    # print(f"  ✓ Unfrozen : {name}")
-                elif 'lora' in name:
-                    param.requires_grad = True
-                    # print(f"  ✓ Unfrozen (LoRA): {name}")
-                else:
-                    param.requires_grad = False
+            
+            # STAGED STRATEGY: 
+            # Phase 1 (Warmup): Train Projector (Aux), Freeze LoRA
+            # Phase 2 (LoRA): Train LoRA, Freeze Projector
+            
+            if self.epoch < self.lora_start_epoch:
+                # Phase 1: Projector/Aux only
+                for name, param in self.model.named_parameters():
+                    is_aux = 'base_model' not in name and 'fm_model' not in name
+                    if is_aux:
+                        param.requires_grad = True
+                    else:
+                        param.requires_grad = False
+            else:
+                # Phase 2: LoRA only
+                for name, param in self.model.named_parameters():
+                    is_lora = 'lora' in name
+                    if is_lora:
+                        param.requires_grad = True
+                    else:
+                        param.requires_grad = False
 
         elif strategy == 'none':
             # Unfreeze everything
@@ -983,12 +1028,13 @@ class LLMTrainer(Trainer):
         self.current_freeze_state = strategy
 
         # Verify critical components are trainable
-        critical_components = ['projector', 'projector_a', 'projector_b']
+        critical_components = ['projector']
         for component in critical_components:
             component_params = [p for name, p in self.model.named_parameters()
                                 if component in name and p.requires_grad]
             if not component_params:
                 print(f"ERROR: No trainable parameters in {component}!")
+                print(f"DEBUG: All params: {[n for n, p in self.model.named_parameters() if p.requires_grad]}")
             else:
                 total_params = sum(p.numel() for p in component_params)
                 print(f"✓ {component}: {len(component_params)} layers, {total_params:,} trainable params")
@@ -1009,6 +1055,7 @@ class LLMTrainer(Trainer):
 
         # print(f"Trainable module types: {list(trainable_modules)}")
         print(f"Total trainable parameters: {trainable_count:,}")
+        print(trainable_modules)
     
     def train_epoch(self, device, epoch):
         # Handle mode switching for combined mode
@@ -1061,7 +1108,7 @@ class LLMTrainer(Trainer):
         mode = getattr(self, 'mode', 'single_star')
 
         mem_before_forward = torch.cuda.memory_allocated(device) / 1024**3
-        with autocast(enabled=getattr(self, 'use_amp', False)):
+        with torch.amp.autocast('cuda', enabled=getattr(self, 'use_amp', False)):
             cm = torch.no_grad() if val else torch.enable_grad()
             with cm:
                 outputs = self.model(batch_device)
@@ -1770,7 +1817,7 @@ class LLMTrainer(Trainer):
 
                 # 2. Generate response and calculate generation perplexity
                 if isinstance(self.model, torch.nn.DataParallel) or isinstance(self.model, torch.nn.parallel.DistributedDataParallel):          
-                    generated_text, input_text, target_text, generation_log_probs = self.model.module.generate_response_from_batch(
+                    generated_text, input_text, target_text, generation_log_probs, gen_ids = self.model.module.generate_response_from_batch(
                         batch_data=batch,
                         batch_idx=batch_idx,
                         tokenizer=tokenizer,
@@ -1779,7 +1826,7 @@ class LLMTrainer(Trainer):
                         top_p=top_p
                     )
                 else:
-                    generated_text, input_text, target_text, generation_log_probs = self.model.generate_response_from_batch(
+                    generated_text, input_text, target_text, generation_log_probs, gen_ids = self.model.generate_response_from_batch(
                         batch_data=batch,
                         batch_idx=batch_idx,
                         tokenizer=tokenizer,
@@ -2718,6 +2765,52 @@ class LateFusionTrainer(Trainer):
         if hasattr(self, 'freeze_strategy') and self.freeze_strategy != 'none':
             self._apply_freeze_strategy(self.freeze_strategy)
 
+    def _check_inputs(self, batch, batch_idx, split="train"):
+        """Check for NaN/Inf in inputs and invalid token IDs."""
+        device = self.device  # Assume self.device is correct
+        
+        # Check input_ids for valid range (if vocab_size known)
+        # We need access to the tokenizer or model config for vocab size
+        vocab_size = None
+        if hasattr(self.model, 'module'):
+             model_ref = self.model.module
+        else:
+             model_ref = self.model
+             
+        if hasattr(model_ref, 'llm_model'):
+            llm = model_ref.llm_model 
+            base = getattr(llm, 'base_model', llm)
+            if hasattr(base, 'params'):
+                vocab_size = getattr(base.params, 'vocab_size', None)
+            elif hasattr(base, 'config'):
+                vocab_size = getattr(base.config, 'vocab_size', None)
+
+        # ids_to_check = ['input_ids', 'followup_input_ids']
+        # for key in ids_to_check:
+        #     if key in batch:
+        #         t = batch[key]
+        #         if torch.is_tensor(t):
+        #             if (t < 0).any():
+        #                 print(f"ERROR: [{split} batch {batch_idx}] Negative values in {key}!")
+        #                 return False
+        #             if vocab_size is not None and (t >= vocab_size).any():
+        #                 print(f"ERROR: [{split} batch {batch_idx}] Values >= vocab_size ({vocab_size}) in {key}!")
+        #                 # Print some bad values
+        #                 mask = t >= vocab_size
+        #                 print(f"  Bad values: {t[mask][:10]}")
+        #                 return False
+
+        # Check for NaNs/Infs in all float tensors
+        for key, value in batch.items():
+            if torch.is_tensor(value) and value.is_floating_point():
+                if torch.isnan(value).any():
+                    print(f"ERROR: [{split} batch {batch_idx}] NaNs in input {key}!")
+                    return False
+                if torch.isinf(value).any():
+                    print(f"ERROR: [{split} batch {batch_idx}] Infs in input {key}!")
+                    return False
+        return True
+
     def _move_to_device(self, obj, device):
         if torch.is_tensor(obj):
             return obj.to(device, non_blocking=True)
@@ -2753,17 +2846,20 @@ class LateFusionTrainer(Trainer):
             return
         if torch.distributed.is_initialized() and torch.distributed.get_rank() != 0:
             return
-        recon = outputs.get("reconstruction_loss", torch.tensor([0.0]))
+        raw_recon = outputs.get("reconstruction_loss", torch.tensor([0.0]))
+        feat_recon = outputs.get("feat_rec_loss", torch.tensor([0.0]))
+        desc_loss = outputs.get("desc_loss", torch.tensor([0.0]))
         params = outputs.get("param_loss", torch.tensor([0.0]))
-        contrast = outputs.get("contrastive_loss", torch.tensor([0.0]))
-        ce = outputs.get("ce_loss", torch.tensor([0.0]))
-        recon_val = float(recon.detach().cpu().item()) if recon is not None else 0.0
+        follow_ce = outputs.get("ce_loss", torch.tensor([0.0]))
+        feat_recon_val = float(feat_recon.detach().cpu().item()) if feat_recon is not None else 0.0
+        desc_loss_val = float(desc_loss.detach().cpu().item()) if desc_loss is not None else 0.0
+        recon_val = float(raw_recon.detach().cpu().item()) if raw_recon is not None else 0.0
         params_val = float(params.detach().cpu().item()) if params is not None else 0.0
-        contrast_val = float(contrast.detach().cpu().item()) if contrast is not None else 0.0
-        ce_val = float(ce.detach().cpu().item()) if ce is not None else 0.0
+        follow_ce_val = float(follow_ce.detach().cpu().item()) if follow_ce is not None else 0.0
         print(
-            f"[{split} step {batch_idx+1}] reconstruction_loss={recon_val:.6f}, "
-            f"param_loss={params_val:.6f}, contrastive_loss={contrast_val:.6f}, ce_loss={ce_val:.6f}",
+            f"[{split} step {batch_idx+1}] raw_recon={recon_val:.6f}, "
+            f"param_loss={params_val:.6f}, follow_ce={follow_ce_val:.6f} "
+            f"feat_recon={feat_recon_val:.6f}, desc_loss={desc_loss_val:.6f}",
             flush=True,
         )
 
@@ -2956,34 +3052,51 @@ class LateFusionTrainer(Trainer):
         return super().train_epoch(device, epoch)
 
     def train_batch(self, batch, batch_idx, device):
+        if not self._check_inputs(batch, batch_idx, split="train"):
+            print(f"Skipping training batch {batch_idx} due to invalid inputs.")
+            # Return dummy values to satisfy the loop
+            bsz = batch["input_ids"].size(0) if "input_ids" in batch else 1
+            return torch.tensor(0.0, device=device, requires_grad=True), torch.zeros(self.output_dim, device=device), torch.zeros(bsz, device=device)
+
         batch = self._move_to_device(batch, device)
         bsz = batch["input_ids"].size(0)
 
-        with autocast(enabled=self.use_amp):
+        # print("--------------test------------")
+        # print(batch['input_texts'][0], batch['target_texts'][0])
+        # print(batch['followup_turns'][0])
+
+        with torch.amp.autocast('cuda', enabled=self.use_amp):
             outputs = self.model(batch)
             loss = outputs["total_loss"]
 
         self._record_train_metrics(outputs)
         self._maybe_log_losses(outputs, batch_idx, split="train")
 
-        # Check for NaN/Inf in total loss
+        # Determine if this rank wants to skip
+        skip_reason = None
         if torch.isnan(loss) or torch.isinf(loss):
-            print(f"Warning: NaN/Inf detected in total_loss at batch {batch_idx+1}")
-            # Log component losses for debugging
-            for k, v in outputs.items():
-                if "loss" in k and isinstance(v, torch.Tensor):
-                    val = v.item() if v.numel() == 1 else "tensor"
-                    print(f"  {k}: {val}")
-            
-            # Zero gradients and return early to skip update
+            skip_reason = "NaN/Inf"
+        elif not loss.requires_grad:
+            skip_reason = "No Grad"
+        
+        # In DDP, ALL ranks must skip if ANY rank skips to avoid desync
+        # We use a tensor on the same device as the loss
+        skip_batch = torch.tensor([1.0 if skip_reason else 0.0], device=device)
+        if torch.distributed.is_initialized():
+            torch.distributed.all_reduce(skip_batch, op=torch.distributed.ReduceOp.MAX)
+        
+        if skip_batch.item() > 0:
+            if skip_reason and (batch_idx + 1) % 10 == 0:
+                rank_str = f"Rank {torch.distributed.get_rank()}" if torch.distributed.is_initialized() else ""
+                print(f"Warning: Skipping batch {batch_idx+1} due to {skip_reason} {rank_str}")
+                if skip_reason == "NaN/Inf":
+                    for k, v in outputs.items():
+                        if "loss" in k and isinstance(v, torch.Tensor):
+                            val = v.item() if v.numel() == 1 else "tensor"
+                            print(f"  {k}: {val}")
+                            
             self.optimizer.zero_grad()
-            # If using scaler, we might need to assume it's okay or reset? 
-            # Usually skipping is enough.
-            
-            loss_detached = torch.tensor(0.0, device=device) # Return 0 loss for this skipped step
-            acc = torch.zeros(self.output_dim, device=device)
-            dummy_targets = torch.zeros(bsz, device=device)
-            return loss_detached, acc, dummy_targets
+            return loss.detach(), torch.zeros(self.output_dim, device=device), torch.zeros(bsz, device=device)
 
         if self.scaler is not None:
             self.scaler.scale(loss).backward()
@@ -3001,6 +3114,7 @@ class LateFusionTrainer(Trainer):
                 self.scaler.update()
                 if self.scheduler is not None:
                     self.scheduler.step()
+                self.optimizer.zero_grad(set_to_none=True)
         else:
             loss.backward()
             if (batch_idx + 1) % self.accumulation_step == 0:
@@ -3016,6 +3130,8 @@ class LateFusionTrainer(Trainer):
                     self.optimizer.step()
                 if self.scheduler is not None:
                     self.scheduler.step()
+                if self.optimizer is not None:
+                    self.optimizer.zero_grad(set_to_none=True)
 
         loss_detached = loss.detach()
         acc = torch.zeros(self.output_dim, device=device)
@@ -3024,18 +3140,31 @@ class LateFusionTrainer(Trainer):
         # Explicit cleanup to break potential cycles or delayed GC
         del outputs
         del loss
-        # Debug memory
-        # if (batch_idx + 1) % 1 == 0:
-        #     print(f"Step {batch_idx}: Allocated {torch.cuda.memory_allocated()/1e9:.2f}GB, Reserved {torch.cuda.memory_reserved()/1e9:.2f}GB")
+        
+        # Debug memory accumulation
+        import gc
+        gc.collect()
+        
+        mem_alloc = torch.cuda.memory_allocated(device) / 1e9
+        mem_res = torch.cuda.memory_reserved(device) / 1e9
+        if (batch_idx + 1) % 1000 == 0:
+            print(f"Step {batch_idx+1} End: Allocated {mem_alloc:.2f}GB, Reserved {mem_res:.2f}GB", flush=True)
+            
+        return loss_detached, acc, dummy_targets
             
         return loss_detached, acc, dummy_targets
 
     def eval_batch(self, batch, batch_idx, device):
+        if not self._check_inputs(batch, batch_idx, split="val"):
+            print(f"Skipping validation batch {batch_idx} due to invalid inputs.")
+            bsz = batch["input_ids"].size(0) if "input_ids" in batch else 1
+            return torch.tensor(0.0, device=device), torch.zeros(self.output_dim, device=device), torch.zeros(bsz, device=device)
+
         batch = self._move_to_device(batch, device)
         bsz = batch["input_ids"].size(0)
 
         with torch.no_grad():
-            with autocast(enabled=self.use_amp):
+            with torch.amp.autocast('cuda', enabled=self.use_amp):
                 outputs = self.model(batch)
                 loss = outputs["total_loss"].detach()
 
@@ -3136,7 +3265,7 @@ class LateFusionTrainer(Trainer):
         use_amp = getattr(self, 'use_amp', False)
         
         with torch.no_grad():
-            with torch.cuda.amp.autocast(enabled=use_amp):
+            with torch.amp.autocast('cuda', enabled=use_amp):
                 while sample_count < num_samples:
                     try:
                         batch = next(val_iter)

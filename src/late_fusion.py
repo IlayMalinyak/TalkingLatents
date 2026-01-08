@@ -9,6 +9,7 @@ import json
 import os
 import random
 import sys
+import datetime
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, Dict, Optional, List
@@ -26,10 +27,13 @@ os.system('pip install tiktoken fairscale fire blobfile torchdiffeq torchcfm tra
 
 
 from data.dataset_diverse import create_diverse_dataloaders
+from data.dataset_hybrid import create_hybrid_dataloaders
 from nn.late_fusion import LateFusionModel
 from nn.train import LateFusionTrainer
-from src.simple_questions import setup, _load_llm_model, _load_spectra_model
+from src.simple_questions import setup, _load_llm_model 
 from src.tokenizer_adapter import load_tokenizer_adapter
+from nn.spectra_model import MultiTaskRegressor 
+from data.transforms import GeneralSpectrumPreprocessor, ToTensor, Compose
 
 
 def parse_args() -> argparse.Namespace:
@@ -121,10 +125,35 @@ def build_llm_args(llm_cfg: Dict[str, Any], data_cfg: Dict[str, Any]) -> SimpleN
     )
 
 
-def maybe_load_spectral_model(spec_cfg: Dict[str, Any]):
-    if not spec_cfg.get("enabled", False):
+def maybe_load_spectral_model(cfg: Dict[str, Any]):
+    if not cfg.get("enabled", False):
         return None
-    return _load_spectra_model()
+    
+    print("Loading spectral model (local implementation)...")
+    # Constants from src/simple_questions.py
+    SPECTRA_CONFIG_PATH = "/home/ilay.kamai/work/DESA/logs/spec_decode2_2025-02-16/MultiTaskRegressor_spectra__decode_4_complete_config.yaml"
+    SPECTRA_WEIGHTS_PATH = "/home/ilay.kamai/work/DESA/logs/spec_decode2_2025-02-16/MultiTaskRegressor_spectra_decode_4.pth"
+    
+    with open(SPECTRA_CONFIG_PATH, 'r') as f:
+        config = yaml.safe_load(f)
+        
+    spec_model_args = SimpleNamespace(**config['model_args'])
+    conformer_args = SimpleNamespace(**config['conformer_args'])
+    
+    model = MultiTaskRegressor(spec_model_args, conformer_args)
+    
+    if os.path.exists(SPECTRA_WEIGHTS_PATH):
+        print(f"Loading pretrained weights from {SPECTRA_WEIGHTS_PATH}")
+        checkpoint = torch.load(SPECTRA_WEIGHTS_PATH, map_location='cpu')
+        state_dict = checkpoint.get('state_dict', checkpoint)
+        # Remove 'module.' prefix from DDP checkpoints
+        state_dict = {k[7:] if k.startswith('module.') else k: v for k, v in state_dict.items()}
+        model.load_state_dict(state_dict)
+        model.eval()
+    else:
+        print(f"Warning: Spectral weights not found at {SPECTRA_WEIGHTS_PATH}")
+        
+    return model
 
 
 def apply_precision(llm_model: torch.nn.Module, precision: str) -> None:
@@ -156,6 +185,17 @@ def build_optimizer(model: torch.nn.Module, optim_cfg: Dict[str, Any]) -> torch.
     if opt_type == "sgd":
         momentum = optim_cfg.get("momentum", 0.9)
         return torch.optim.SGD(params, lr=lr, momentum=momentum, weight_decay=weight_decay)
+    if opt_type in ["adamw8bit", "paged_adamw_8bit"]:
+        try:
+            import bitsandbytes as bnb
+        except ImportError:
+            raise ImportError("Please install bitsandbytes to use 8-bit optimizers.")
+        betas = tuple(optim_cfg.get("betas", (0.9, 0.999)))
+        print(f"Using {opt_type} optimizer from bitsandbytes...")
+        if opt_type == "paged_adamw_8bit":
+             return bnb.optim.PagedAdamW8bit(params, lr=lr, betas=betas, weight_decay=weight_decay)
+        return bnb.optim.AdamW8bit(params, lr=lr, betas=betas, weight_decay=weight_decay)
+
     raise ValueError(f"Unsupported optimizer type: {opt_type}")
 
 
@@ -179,7 +219,15 @@ def build_scheduler(optimizer: torch.optim.Optimizer, sched_cfg: Optional[Dict[s
 
 
 def build_dataloaders(data_cfg: Dict[str, Any], llm_cfg: Dict[str, Any], world_size: int):
+    # Setup transforms for raw spectral data
+    spectral_transforms = Compose([
+        GeneralSpectrumPreprocessor(),
+        ToTensor() 
+    ])
+
     dataset_kwargs = dict(data_cfg.get("dataset_kwargs") or {})
+    dataset_kwargs["spectral_transforms"] = spectral_transforms
+    
     cache_dir = resolve_path(data_cfg.get("cache_dir"))
     if cache_dir:
         dataset_kwargs["cache_dir"] = str(cache_dir)
@@ -203,28 +251,33 @@ def build_dataloaders(data_cfg: Dict[str, Any], llm_cfg: Dict[str, Any], world_s
         hf_model_name=llm_cfg.get("llm_model") if llm_backend != 'llama' else None,
     )
     
-    # Features loading
+    # Features loading - not using precomputed features with GeneralSpectrumPreprocessor
     features_file = resolve_path(data_cfg.get("features_file"))
-    features_array = None
     if features_file and features_file.exists():
-        print(f"Loading spectral features from {features_file}")
-        features_array = np.load(features_file)
+        print(f"Warning: 'features_file' is specified ({features_file}), but GeneralSpectrumPreprocessor is used. "
+              "Pre-computed features will be ignored in favor of raw spectra processing.")
 
     print(f"DEBUG: dataset_kwargs passed to loader: {dataset_kwargs}")
-    train_loader, val_loader, test_loader = create_diverse_dataloaders(
+    dataset_type = data_cfg.get("dataset_type", "diverse")
+    print(f"DEBUG: Dataset type: {dataset_type}")
+    
+    
+    loader_fn = create_hybrid_dataloaders
+        
+    train_loader, val_loader, test_loader = loader_fn(
         json_file=str(resolve_path(data_cfg["json_file"])),
-        features_array=features_array,
+        features_array=None, # Not using precomputed features
         batch_size=data_cfg.get("batch_size", 4),
         train_ratio=data_cfg.get("train_ratio", 0.7),
         val_ratio=data_cfg.get("val_ratio", 0.15),
         test_ratio=data_cfg.get("test_ratio", 0.15),
         random_state=data_cfg.get("random_state", 42),
-        num_workers=data_cfg.get("num_workers", 0),
+        num_workers=data_cfg.get("num_workers", 2),
         world_size=world_size,
-        max_length=data_cfg.get("max_length", 512),
+        max_length=data_cfg.get("max_length", 256),
         tokenizer=tokenizer_adapter,
-        tokenizer_backend=llm_backend,
-        **dataset_kwargs,
+        tokenizer_backend=llm_cfg.get("llm_model", "Llama3.1-8B"), # Basic string or inferred
+        **dataset_kwargs
     )
     return train_loader, val_loader, test_loader
 
@@ -282,6 +335,8 @@ def resume_from_checkpoint(trainer: LateFusionTrainer, resume_path: str, device:
 
 
 def main():
+    # Turning off anomaly detection to allow GradScaler to handle Infs/NaNs naturally
+    torch.autograd.set_detect_anomaly(False)
     args = parse_args()
     config_path = resolve_path(args.config)
     if config_path is None or not config_path.exists():
@@ -290,6 +345,10 @@ def main():
 
     exp_cfg = config.get("experiment", {})
     exp_name = args.exp_name or exp_cfg.get("exp_name", "late_fusion")
+
+    if not args.resume:
+        date_str = datetime.datetime.now().strftime('%Y-%m-%d-%H-%M')
+        exp_name = f"{exp_name}_{date_str}"
     base_output = resolve_path(args.output_dir or exp_cfg.get("output_dir", "logs/late_fusion"))
     if base_output is None:
         raise ValueError("Unable to resolve output directory.")
@@ -335,82 +394,67 @@ def main():
         max_samples = 3
 
         for batch_idx, batch in enumerate(train_loader):
-            if sample_count >= max_samples:
-                break
-
-            # Check if batch has follow-up data
-            has_followup = batch.get("has_followup")
-            if has_followup is None:
+            print(f"Debug Batch {batch_idx}: max_samples={max_samples}, current_count={sample_count}")
+            
+            # Get batch size from input_ids (main turn)
+            if "input_ids" not in batch:
                 continue
+            curr_batch_size = batch["input_ids"].size(0)
 
-            fq_ids = batch.get("followup_question_ids")
-            fa_ids = batch.get("followup_answer_ids")
+            for i in range(curr_batch_size):
+                if sample_count >= max_samples:
+                    break
 
-            if fq_ids is None or fa_ids is None:
-                continue
-
-            # Print examples from this batch
-            batch_size = fq_ids.size(0)
-            for i in range(min(batch_size, max_samples - sample_count)):
-                if has_followup[i].item() == 0:
+                # Check for followup content in this specific sample
+                has_active_followup = False
+                # Check text-based followups (list of lists)
+                if "followup_turns" in batch:
+                    # 'followup_turns' is a list of length batch_size
+                    if i < len(batch["followup_turns"]) and batch["followup_turns"][i]:
+                        has_active_followup = True
+                
+                # If no text, check if we have tensors (less reliable for individual sample check if sparse, 
+                # but valid for hybrid which is dense).
+                # Only trust followup_turns for printing text.
+                
+                if not has_active_followup:
                     continue
 
                 sample_count += 1
                 print(f"\n--- Sample {sample_count} ---")
 
-                # Print original text (description) that enters the Perceiver
-                if "texts" in batch and len(batch["texts"]) > i:
-                    original_text = batch["texts"][i]
-                    print(f"Original Description (Perceiver input):")
-                    print(f"  {original_text}")
-                    print()
+                # Print Main Turn
+                if "input_texts" in batch:
+                    print(f"Main Question: {batch['input_texts'][i]}")
+                if "target_texts" in batch:
+                    print(f"Main Answer: {batch['target_texts'][i]}")
 
-                # Decode question
-                q_tokens = fq_ids[i].cpu().tolist()
-                if tokenizer:
-                    # Remove padding (0s) and invalid tokens (negative values)
-                    q_tokens_clean = [t for t in q_tokens if t > 0]
-                    q_text = tokenizer.decode(q_tokens_clean)
-                else:
-                    q_text = f"Token IDs: {q_tokens[:20]}..."
-
-                print(f"Question: {q_text}")
-
-                # Decode answer
-                a_tokens = fa_ids[i].cpu().tolist()
-                if tokenizer:
-                    # Remove padding (0s) and invalid tokens (negative values)
-                    a_tokens_clean = [t for t in a_tokens if t > 0]
-                    a_text = tokenizer.decode(a_tokens_clean)
-                else:
-                    a_text = f"Token IDs: {a_tokens[:20]}..."
-
-                print(f"Answer: {a_text}")
-
-                # Detect followup type based on answer content
-                followup_type = "unknown"
-                if "dwarf" in a_text.lower() or "giant" in a_text.lower() or "supergiant" in a_text.lower():
-                    if len(a_text.split()) < 10:  # Short answer
-                        followup_type = "stellar_type"
-                    else:
-                        followup_type = "description"
-                elif "this star" in a_text.lower() or "consistent with" in a_text.lower():
-                    followup_type = "description"
-
-                print(f"Followup Type: {followup_type}")
+                # Print Follow-up Turns
+                if "followup_turns" in batch:
+                    turns = batch["followup_turns"][i]
+                    for t_idx, turn in enumerate(turns):
+                        # turn is (q, a) tuple
+                        if len(turn) == 2:
+                            q, a = turn
+                            print(f"Follow-up {t_idx+1} Question: {q}")
+                            print(f"Follow-up {t_idx+1} Answer: {a}")
+                        else:
+                            print(f"Follow-up {t_idx+1}: {turn}")
 
                 # Print stellar data if available
                 if "stellar_data" in batch:
                     stellar_info = batch["stellar_data"][i]
                     print(f"Stellar Data: {stellar_info}")
 
-                if sample_count >= max_samples:
-                    break
+            if sample_count >= max_samples:
+                break
 
         if sample_count == 0:
-            print("⚠ No follow-up questions found in training data!")
+            print("⚠ No follow-up questions found in training data (checked first few batches)!")
 
         print("="*80 + "\n")
+    
+    # Removed exit() to allow training to proceed
 
     llm_args = build_llm_args(config.get("llm", {}), data_cfg)
     llm_model = _load_llm_model(llm_args)
@@ -536,12 +580,12 @@ def main():
         return
 
     # Run initial evaluation before training starts
-    if (not distributed) or local_rank == 0:
-        print("Running initial evaluation before training...")
-        try:
-            trainer.evaluate_validation_samples(device, epoch=-1)
-        except Exception as e:
-            print(f"Warning: Initial evaluation failed: {e}")
+    # if (not distributed) or local_rank == 0:
+    #     print("Running initial evaluation before training...")
+    #     try:
+    #         trainer.evaluate_validation_samples(device, epoch=-1)
+    #     except Exception as e:
+    #         print(f"Warning: Initial evaluation failed: {e}")
 
     results = trainer.fit(
         num_epochs=training_cfg.get("num_epochs", 1),

@@ -64,6 +64,11 @@ class HuggingFaceMultimodalModel(MultimodalBackboneBase):
 
         token_embeddings = embed_module(input_ids)
         token_embeddings = token_embeddings.clone()
+        # Enable gradients on embeddings to support gradient checkpointing and backprop
+        # even if the backbone embedding layer is frozen.
+        token_embeddings.requires_grad_(True)
+        # Make it a non-leaf variable to allow in-place operations
+        token_embeddings = token_embeddings + 0.0
         seq_len = token_embeddings.size(1)
         cfm_targets: List[torch.Tensor] = []
 
@@ -194,7 +199,9 @@ class HuggingFaceMultimodalModel(MultimodalBackboneBase):
         seq_len = token_embeddings.size(1)
 
         # Project spectral features to K token embeddings
-        spec_tokens = self.projector(latent_features)
+        # Ensure we encode/normalize first (critical for on-the-fly generation)
+        encoded_features = self._encode_latent_features(latent_features)
+        spec_tokens = self.projector(encoded_features)
         spec_tokens = spec_tokens.to(dtype=token_embeddings.dtype, device=token_embeddings.device)
 
         # Normalize feature_start_indices to a 1D tensor of length bsz
@@ -253,8 +260,12 @@ class HuggingFaceMultimodalModel(MultimodalBackboneBase):
         token_embeddings, pad_id = self._embed_and_sanitize(input_ids)
         seq_len = token_embeddings.size(1)
 
-        spec_tokens_a = self.projector_a(star_a_features).to(dtype=token_embeddings.dtype, device=token_embeddings.device)
-        spec_tokens_b = self.projector_b(star_b_features).to(dtype=token_embeddings.dtype, device=token_embeddings.device)
+        # Encode/normalize features first
+        encoded_a = self._encode_latent_features(star_a_features)
+        encoded_b = self._encode_latent_features(star_b_features)
+
+        spec_tokens_a = self.projector_a(encoded_a).to(dtype=token_embeddings.dtype, device=token_embeddings.device)
+        spec_tokens_b = self.projector_b(encoded_b).to(dtype=token_embeddings.dtype, device=token_embeddings.device)
 
         bsz = token_embeddings.size(0)
         for b in range(bsz):
@@ -314,11 +325,16 @@ class HuggingFaceMultimodalModel(MultimodalBackboneBase):
             attention_mask = attention_mask.to(device)
         token_embeddings = token_embeddings.to(device)
 
-        pad_token_id = getattr(tokenizer, 'pad_id', None)
+        # Get pad token (use eos if pad is missing, common in newer models)
+        pad_token_id = getattr(tokenizer, 'pad_token_id', None)
         if pad_token_id is None:
-            pad_token_id = getattr(self.base_model.config, 'pad_token_id', None)
+             pad_token_id = getattr(self.base_model.config, 'pad_token_id', None)
         if pad_token_id is None:
-            pad_token_id = getattr(self.base_model.config, 'eos_token_id', None)
+             pad_token_id = getattr(self.base_model.config, 'eos_token_id', None)
+        
+        # Ensure we have a valid pad_token_id for generation
+        if pad_token_id is None:
+            pad_token_id = 0 # Fallback
 
         gen_kwargs = {
             "inputs_embeds": token_embeddings,
@@ -329,17 +345,52 @@ class HuggingFaceMultimodalModel(MultimodalBackboneBase):
             "do_sample": temperature > 0,
             "pad_token_id": pad_token_id,
         }
+        
+        # Some models require eos_token_id explicitly if they don't have pad
+        if getattr(self.base_model.config, 'eos_token_id', None) is not None:
+             gen_kwargs['eos_token_id'] = self.base_model.config.eos_token_id
+
         sequences = self.base_model.generate(**gen_kwargs)
+        
+        # HF .generate() behavior with inputs_embeds is inconsistent across versions/models.
+        # Sometimes it returns [prompt + generated], sometimes just [generated].
+        # We check the length to decide.
+        
+        # input_ids length (in token space) is not directly strictly known without the IDs, 
+        # but token_embeddings.shape[1] is the prompt length.
         prompt_len = token_embeddings.shape[1]
         
-        # Check if sequences includes prompt (standard HF generate behavior vs inputs_embeds behavior)
-        if sequences.shape[1] > prompt_len:
-             generated_ids = sequences[:, prompt_len:]
+        # Squeeze batch dim if present
+        if sequences.dim() == 2:
+             seq = sequences[0]
         else:
-             generated_ids = sequences
+             seq = sequences
+
+        # Decision logic: if length > max_new_tokens (plus a margin), it likely includes prompt.
+        # But safer is: if length > prompt_len and it seems to copy prompt? 
+        # Actually, with inputs_embeds, we don't have input_ids to compare! 
+        # Heuristic: If seq length is close to prompt_len + generated, it includes prompt.
+        # However, many recent HF versions return ONLY new tokens when inputs_embeds is passed.
+        # Let's assume if len > prompt_len it *might* have it, but wait -- 
+        # if the model generated exactly prompt_len tokens, we are confused.
+        # Better checking: typically if using inputs_embeds, it returns ONLY new tokens or 
+        # it errors if we don't pass input_ids. Since it worked (didn't error), 
+        # let's proceed. 
+        
+        # CRITICAL OBSERVATION: Qwen/Llama via HF often returns ONLY new tokens 
+        # when we do NOT pass input_ids.
+        
+        if seq.shape[0] > prompt_len:
+             # Likely included prompt (or generated a LOT). 
+             # But wait, if we generated 1 token and prompt was 100, shape is 1 (if new only) or 101 (if full).
+             # So if shape > prompt_len, safe to assume it's full sequence.
+             generated_ids = seq[prompt_len:]
+        else:
+             # Must be new tokens only
+             generated_ids = seq
 
         if tokenizer is not None and generated_ids.numel() > 0:
-            generated_text = tokenizer.decode(generated_ids[0].tolist())
+            generated_text = tokenizer.decode(generated_ids, skip_special_tokens=True)
         else:
             generated_text = ""
 

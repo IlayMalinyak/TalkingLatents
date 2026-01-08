@@ -14,7 +14,7 @@ import os
 from pathlib import Path
 from astropy.io import fits
 import re
-
+from typing import Optional, Tuple, Dict, Any, List, Type, Union
 
 import os
 os.system('pip install tiktoken fairscale fire blobfile')
@@ -76,7 +76,9 @@ class StellarQuestionsDataset(Dataset):
                  followup_seed: int = 42,
                  # Optional second JSON for follow-up Q&A
                  followup_json_file: Optional[str] = None,
-                 followup_mode: str = "mixed"):
+                 followup_mode: str = "mixed",
+                 multimodal_df: Optional[pd.DataFrame] = None,
+                 index_df: Optional[pd.DataFrame] = None):
         
         assert split in ['train', 'val', 'test'], f"Split must be 'train', 'val', or 'test', got {split}"
         assert abs(train_ratio + val_ratio + test_ratio - 1.0) < 1e-6, "Ratios must sum to 1.0"
@@ -111,6 +113,30 @@ class StellarQuestionsDataset(Dataset):
         self.followup_data = None
         if self.followup_json_file and self.enable_followup:
             self._load_followup_json()
+
+        self.multimodal_df = multimodal_df
+        if self.multimodal_df is not None:
+            # Ensure index for faster lookup if possible, but user might pass raw dataframe
+            # We'll assume it's indexable by obsid or we find the row using a column
+            print(f"Loaded multimodal dataframe with {len(self.multimodal_df)} rows")
+
+        self.index_df = index_df
+        self.obsid_to_feature_idx = {}
+        if self.index_df is not None:
+             print(f"Loaded index dataframe for feature alignment with {len(self.index_df)} rows")
+             # Build lookup map: obsid -> row_idx
+             # Handle potential column name variations if needed, but assuming 'obsid' based on user request
+             if 'obsid' in self.index_df.columns:
+                 # Create mapping for both string and int versions to be robust
+                 for idx, row in self.index_df.iterrows():
+                     obsid_val = row['obsid']
+                     self.obsid_to_feature_idx[str(obsid_val)] = idx
+                     try:
+                         self.obsid_to_feature_idx[int(obsid_val)] = idx
+                     except (ValueError, TypeError):
+                         pass
+             else:
+                 print("Warning: index_df provided but 'obsid' column not found.")
 
         # Print follow-up mode info
         if self.enable_followup:
@@ -177,15 +203,18 @@ class StellarQuestionsDataset(Dataset):
         try:
             obsid = int(obsid)
         except (ValueError, TypeError):
+            print(f"Warning: Invalid obsid {obsid} (not an integer)")
             pass
 
         followup_sample = self.followup_data.get(obsid)
         if followup_sample is None:
+            print(f"Warning: No follow-up sample found for obsid {obsid}")
             return None
 
         description = followup_sample.get("description", "")
 
         if not description:
+            print(f"Warning: No description found for obsid {obsid}")
             return None
 
         # Parse the description to get question and answer
@@ -194,6 +223,7 @@ class StellarQuestionsDataset(Dataset):
         answer = parsed.get("answer", "")
 
         if not question or not answer:
+            print(f"Warning: No question or answer found for obsid {obsid}")
             return None
 
         return question, answer
@@ -282,29 +312,50 @@ class StellarQuestionsDataset(Dataset):
         else:
             target_tokens.extend(chunk)
 
-    def _extract_physical_params(self, stellar_data: Dict[str, Any]) -> Dict[str, Optional[float]]:
-        """Return raw Teff/logg/FeH values when available."""
+    def _extract_physical_params(self, stellar_data: Dict[str, Any], obsid: Optional[int] = None) -> Dict[str, Optional[float]]:
+        """Return raw Teff/logg/FeH values when available. Also merges from multimodal_df if preset."""
         params: Dict[str, Optional[float]] = {}
-        if not isinstance(stellar_data, dict):
-            return params
-        for param in ['Teff', 'logg', 'FeH']:
-            value = None
-            for key in self.numeric_key_alternatives.get(param, [param]):
-                raw_val = stellar_data.get(key)
-                if raw_val is not None:
-                    try:
-                        value = float(raw_val)
-                    except (TypeError, ValueError):
-                        value = None
-                    break
-            params[param] = value
+        
+        # 1. Basic params from internal JSON
+        if isinstance(stellar_data, dict):
+             for param in ['Teff', 'logg', 'FeH']:
+                value = None
+                for key in self.numeric_key_alternatives.get(param, [param]):
+                    raw_val = stellar_data.get(key)
+                    if raw_val is not None:
+                        try:
+                            value = float(raw_val)
+                        except (TypeError, ValueError):
+                            value = None
+                        break
+                params[param] = value
+        
+        # 2. Add multimodal params if available
+        if self.multimodal_df is not None and obsid is not None:
+            try:
+                row = None
+                row = self.multimodal_df[self.multimodal_df['obsid'] == obsid]
+                if row is not None:
+                    # Extract required fields: 'binarity_class_hard', 'final_age', 'age_ref', 'Age'
+                    for col in ['binarity_class_hard', 'final_age', 'age_ref', 'Age']:
+                        if col in row:
+                            val = row[col]
+                            # Handle Series vs scalar
+                            if hasattr(val, 'item'):
+                                val = val.item()
+                            params[col] = val
+            except Exception as e:
+                # Be robust
+                pass
+
         return params
 
     def _append_followup_turns(self,
                                full_tokens: List[int],
                                target_tokens: List[int],
                                stellar_params: Dict[str, Optional[float]],
-                               sample_idx: int = -1) -> List[Tuple[str, str]]:
+                               sample_idx: int = -1,
+                               obsid: Optional[int] = None) -> List[Tuple[str, str]]:
         """Append followup turns and return list of (question, answer) text pairs."""
         if not self.enable_followup or self.followup_prob <= 0.0:
             return []
@@ -313,20 +364,69 @@ class StellarQuestionsDataset(Dataset):
 
         followups = []
 
-        # FIRST followup: Generate stellar type question from templates
-        stellar_type_followups = create_follow_up_specs(
-            stellar_params,
-            self.followup_rng,
-            max_pairs=1,  # Get just one stellar type question
-            include_answers=True,
-        )
-        if stellar_type_followups:
-            followups.append(stellar_type_followups[0])
+        if self.multimodal_df is not None:
+             # Multimodal Followup Logic
+             choice = self.followup_rng.choice(['binarity', 'age', 'stellar_type'])
+             
+             if choice == 'binarity':
+                 q_text = "Is this star a binary?"
+                 bin_class = stellar_params.get('binarity_class_hard')
+                 if bin_class == 1:
+                     a_text = "Yes"
+                 elif bin_class == 2:
+                     a_text = "No"
+                 else:
+                     # nan or other -> probably no
+                     a_text = "Probably no"
+                 followups.append({'question': q_text, 'answer': a_text})
 
+             elif choice == 'age':
+                 q_text = "What is the age of this star in Gyrs?"
+                 final_age = stellar_params.get('final_age')
+                 age_val = None
+                 
+                 # Logic: use final_age if not nan
+                 if final_age is not None and not (isinstance(final_age, float) and math.isnan(final_age)):
+                     age_val = final_age
+                 else:
+                     # fallback to Age and set age_ref
+                     age = stellar_params.get('Age')
+                     if age is not None and not (isinstance(age, float) and math.isnan(age)):
+                         age_val = age
+                         stellar_params['age_ref'] = 'isochrone'
+                 
+                 if age_val is not None:
+                     a_text = f"{float(age_val):.2f}"
+                 else:
+                     a_text = "Unknown"
+                 
+                 followups.append({'question': q_text, 'answer': a_text})
+
+             else: # stellar_type
+                  stellar_type_followups = create_follow_up_specs(
+                    stellar_params,
+                    self.followup_rng,
+                    max_pairs=1, 
+                    include_answers=True,
+                )
+                  if stellar_type_followups:
+                      followups.append(stellar_type_followups[0])
+
+        else:
+            # ORIGINAL LOGIC
+            # FIRST followup: Generate stellar type question from templates
+            stellar_type_followups = create_follow_up_specs(
+                stellar_params,
+                self.followup_rng,
+                max_pairs=1,  # Get just one stellar type question
+                include_answers=True,
+            )
+            if stellar_type_followups:
+                followups.append(stellar_type_followups[0])
         # SECOND followup: Get description from JSON file (if available and max_followup_turns >= 2)
-        if self.max_followup_turns >= 2 and self.followup_data is not None and sample_idx is not None:
+        if self.max_followup_turns >= 2 and self.followup_data is not None and obsid is not None:
             # Note: sample_idx here is actually used as obsid in the updated logic
-            qa_pair = self._get_followup_from_description(sample_idx)
+            qa_pair = self._get_followup_from_description(obsid)
             if qa_pair is not None:
                 question, answer = qa_pair
                 followups.append({'question': question, 'answer': answer})
@@ -571,9 +671,29 @@ class StellarQuestionsDataset(Dataset):
         indices: List[int] = []
         if self.features_array is None:
             return indices
+            
         for raw_idx in self.split_indices:
             sample = self.raw_data[raw_idx]
-            df_idx = sample.get('index')
+            
+            # Logic to find feature index
+            df_idx = None
+            if self.index_df is not None:
+                 obsid = sample.get('obsid')
+                 if obsid is not None:
+                     df_idx = self.obsid_to_feature_idx.get(obsid)
+                     if df_idx is None:
+                         # Try int/str conversion just in case key format differs
+                         try:
+                             df_idx = self.obsid_to_feature_idx.get(int(obsid))
+                         except (ValueError, TypeError):
+                             pass
+                         if df_idx is None:
+                             df_idx = self.obsid_to_feature_idx.get(str(obsid))
+
+            # Fallback to internal index if index_df not used or lookup failed
+            if df_idx is None:
+                df_idx = sample.get('index')
+
             if df_idx is not None and 0 <= df_idx < len(self.features_array):
                 indices.append(df_idx)
         return indices
@@ -590,7 +710,9 @@ class StellarQuestionsDataset(Dataset):
 
     def _apply_feature_normalization(self, features: np.ndarray) -> np.ndarray:
         if self.feature_normalizer is None:
+            # print("not normalizing features")
             return np.asarray(features, dtype=np.float32)
+        # print("normalizing features")
         return self.feature_normalizer.transform(features)
         
     def read_lamost_spectra(self, filename):
@@ -713,10 +835,16 @@ class StellarQuestionsDataset(Dataset):
 
         # Optional follow-up turns conditioned on stellar parameters
         stellar_data = sample.get('stellar_data', {})
-        stellar_params = self._extract_physical_params(stellar_data)
+        obsid = sample.get('obsid', None)
+        try:
+             obsid_int = int(obsid) if obsid is not None else None
+        except:
+             obsid_int = None
+        stellar_params = self._extract_physical_params(stellar_data, obsid=obsid_int)
         followup_text_pairs = []  # Track followup Q&A pairs as text
         if self.enable_followup:
-            followup_text_pairs = self._append_followup_turns(full_sequence, target_sequence, stellar_params, sample_idx)
+            followup_text_pairs = self._append_followup_turns(full_sequence,
+             target_sequence, stellar_params, sample_idx, obsid=obsid_int)
 
         # Pad remaining space with -100 placeholders
         remaining_space = self.max_length - len(full_sequence)
@@ -732,7 +860,25 @@ class StellarQuestionsDataset(Dataset):
         target_ids = torch.tensor(target_sequence, dtype=torch.long)
         
         # Get other data
-        df_index = sample.get('index')
+        # Feature lookup logic
+        df_index = None
+        if self.index_df is not None:
+             # Use the provided index_df mapping
+             # obsid extracted earlier around line 800
+             if obsid is not None:
+                 df_index = self.obsid_to_feature_idx.get(obsid)
+                 if df_index is None:
+                      # Try alternate types
+                      try:
+                          df_index = self.obsid_to_feature_idx.get(int(obsid))
+                      except (ValueError, TypeError):
+                          pass
+                      if df_index is None:
+                          df_index = self.obsid_to_feature_idx.get(str(obsid))
+        
+        # Fallback to legacy 'index' field if no index_df or lookup failed
+        if df_index is None:
+            df_index = sample.get('index')
         
         if self.features_array is not None and df_index is not None:
             norm_features = self._apply_feature_normalization(self.features_array[df_index])
@@ -830,6 +976,8 @@ def create_stellar_dataloaders(json_file: str,
                              world_size: int = 1,
                              device: Optional[str] = None,
                              dataset_cls: Type["StellarQuestionsDataset"] = StellarQuestionsDataset,
+                             multimodal_df: Optional[pd.DataFrame] = None,
+                             index_df: Optional[pd.DataFrame] = None,
                              **dataset_kwargs) -> Tuple[DataLoader, DataLoader, DataLoader]:
     """
     Create train, validation, and test dataloaders
@@ -852,6 +1000,8 @@ def create_stellar_dataloaders(json_file: str,
         random_state=random_state,
         cache_dir=cache_dir,
         feature_stats=shared_feature_stats,
+        multimodal_df=multimodal_df,
+        index_df=index_df,
         **dataset_kwargs
     )
 
@@ -869,6 +1019,8 @@ def create_stellar_dataloaders(json_file: str,
         random_state=random_state,
         cache_dir=cache_dir,
         feature_stats=feature_stats,
+        multimodal_df=multimodal_df,
+        index_df=index_df,
         **dataset_kwargs
     )
 
@@ -882,6 +1034,8 @@ def create_stellar_dataloaders(json_file: str,
         random_state=random_state,
         cache_dir=cache_dir,
         feature_stats=feature_stats,
+        multimodal_df=multimodal_df,
+        index_df=index_df,
         **dataset_kwargs
     )
 

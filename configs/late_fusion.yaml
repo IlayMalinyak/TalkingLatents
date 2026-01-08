@@ -9,10 +9,11 @@ llm:
   llm_precision: fp16
 
 data:
-  json_file: /home/ilay.kamai/work/TalkingLatents/data/dataset/stellar_qa_hybrid.json
+  dataset_type: hybrid
+  json_file: /home/ilay.kamai/work/TalkingLatents/data/dataset/stellar_descriptions_questions.json
   features_file: None
   tokenizer_path: /home/ilay.kamai/work/.llama/Llama3.1-8B/tokenizer.model
-  batch_size: 2
+  batch_size: 4
   num_workers: 2
   train_ratio: 0.7
   val_ratio: 0.15
@@ -44,8 +45,8 @@ model:
       param_regression: 1.0
     modality_dropout:
       enabled: true
-      drop_text_prob: 0.3
-      drop_spectra_prob: 0.3
+      drop_text_prob: 0.5
+      drop_spectra_prob: 0.5
 
 spectral_model:
   enabled: true
@@ -54,13 +55,13 @@ training:
   distributed: True
   num_epochs: 1000
   optimizer:
-    type: adamw
+    type: paged_adamw_8bit
     lr: 0.0002
     weight_decay: 0.001
     betas: [0.9, 0.999]
   scheduler:
     type: cosine
-    t_max: 2
+    t_max: 40
     min_lr: 1.0e-6
   accumulation_steps: 1
   grad_clip: true

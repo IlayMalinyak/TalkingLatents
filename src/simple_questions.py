@@ -23,8 +23,10 @@ ROOT_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.append(ROOT_DIR)
 print("running from ", ROOT_DIR) 
 
+os.system('pip install fairscale')
+
 from nn.llm import MultimodalLlamaModel
-from nn.spectra_model import MultiTaskRegressor
+from nn.spectra_model import MultiTaskRegressor, SpectralViT
 from llama3.llama.model import Transformer, ModelArgs
 from data.dataset_interpert import StellarQuestionsDataset, create_stellar_dataloaders, collate_fn
 from data.transforms import *
@@ -40,6 +42,9 @@ MODEL_PATH = "/home/ilay.kamai/work/.llama/Llama3.1-8B"
 TOKENIZER_PATH = "/home/ilay.kamai/work/.llama/Llama3.1-8B"
 SPECTRA_CONFIG_PATH = "/home/ilay.kamai/work/DESA/logs/spec_decode2_2025-02-16/MultiTaskRegressor_spectra__decode_4_complete_config.yaml"
 SPECTRA_WEIGHTS_PATH = "/home/ilay.kamai/work/DESA/logs/spec_decode2_2025-02-16/MultiTaskRegressor_spectra_decode_4.pth"
+SPECTRA_CONFIG_PATH_v2 = '/home/ilay.kamai/work/MultiDESA/configs/lamost.yaml'
+SPECTRA_WEIGHTS_PATH_v2 = 'pretrained_models/spectra.pth'
+
 
 print("number of gpus: ", torch.cuda.device_count())
 # os.environ['PYTORCH_CUDA_ALLOC_CONF'] = 'expandable_segments:True'
@@ -61,42 +66,45 @@ def setup():
     """
     import torch.distributed as dist
 
-    # Derive distributed env from SLURM or torchrun
-    world_size = int(os.environ.get("WORLD_SIZE", os.environ.get("SLURM_NTASKS", 1)))
-    rank = int(os.environ.get("RANK", os.environ.get("SLURM_PROCID", 0)))
-    local_rank = int(os.environ.get("LOCAL_RANK", os.environ.get("SLURM_LOCALID", 0)))
-    jobid = int(os.environ.get("SLURM_JOBID", 0))
-
-    # Ensure master addr/port are present (even for single process)
-    os.environ.setdefault("MASTER_ADDR", os.environ.get("MASTER_ADDR", "127.0.0.1"))
-    # Choose a port deterministically from job id when available
-    default_port = 12910 + (jobid % 20000) if jobid else 12910
-    os.environ.setdefault("MASTER_PORT", str(default_port))
+    # Initialize process group (works for world_size==1 as well)
+    # If using torchrun, these vars are set. If not, fallback to SLURM.
+    if "RANK" in os.environ and "WORLD_SIZE" in os.environ:
+        local_rank = int(os.environ.get("LOCAL_RANK", 0))
+        torch.cuda.set_device(local_rank)
+        if not dist.is_initialized():
+            dist.init_process_group(backend="nccl", init_method="env://")
+        rank = dist.get_rank()
+        world_size = dist.get_world_size()
+    else:
+        # Fallback for direct srun or local
+        world_size = int(os.environ.get("WORLD_SIZE", os.environ.get("SLURM_NTASKS", 1)))
+        rank = int(os.environ.get("RANK", os.environ.get("SLURM_PROCID", 0)))
+        local_rank = int(os.environ.get("LOCAL_RANK", os.environ.get("SLURM_LOCALID", 0)))
+        
+        # Ensure master addr/port are present
+        os.environ.setdefault("MASTER_ADDR", os.environ.get("MASTER_ADDR", "127.0.0.1"))
+        jobid = int(os.environ.get("SLURM_JOBID", 0))
+        default_port = 12910 + (jobid % 20000) if jobid else 12910
+        os.environ.setdefault("MASTER_PORT", str(default_port))
+        
+        torch.cuda.set_device(local_rank)
+        if not dist.is_initialized():
+            dist.init_process_group(backend="nccl", rank=rank, world_size=world_size, init_method="env://")
 
     gpus_per_node = torch.cuda.device_count()
-    print('jobid ', jobid)
-    print('gpus per node ', gpus_per_node)
-    print(
-        f"Hello from rank {rank} of {world_size} where there are {gpus_per_node} allocated GPUs per node.",
-        flush=True,
-    )
-
-    # Initialize process group (works for world_size==1 as well)
-    if not dist.is_initialized():
-        dist.init_process_group(backend="nccl", rank=rank, world_size=world_size, init_method="env://")
-
     if rank == 0:
-        print(f"Group initialized? {dist.is_initialized()}", flush=True)
+        print(f"Hello from rank {rank} of {world_size} where there are {gpus_per_node} allocated GPUs per node.", flush=True)
 
-    # Map this process to its local GPU
-    torch.cuda.set_device(local_rank)
-    print(f"rank: {rank}, local_rank: {local_rank}")
+    # Device is already set above
+    # torch.cuda.set_device(local_rank) 
+    if rank == 0:
+        print(f"rank: {rank}, local_rank: {local_rank}, device: {torch.cuda.current_device()}")
 
-    # Initialize fairscale model parallel if available (required for LLaMA even on 1 GPU)
+    # Initialize fairscale model parallel if available
     try:
         import fairscale.nn.model_parallel.initialize as fs_init
         if not fs_init.model_parallel_is_initialized():
-            fs_init.initialize_model_parallel(1)  # 1 = no model parallel split
+            fs_init.initialize_model_parallel(1)
             if rank == 0:
                 print("Fairscale model parallel initialized", flush=True)
     except Exception as _:
@@ -457,7 +465,7 @@ def _load_spectra_model_cpu():
     """Load spectral model directly to CPU to save memory"""
     print("Loading spectral model...")
     config = yaml.safe_load(open(SPECTRA_CONFIG_PATH, 'r'))
-    # config['model_args']['avg_output'] = False
+    config['model_args']['avg_output'] = False
     
     model = MultiTaskRegressor(Container(**config['model_args']), Container(**config['conformer_args']))
     
@@ -471,6 +479,33 @@ def _load_spectra_model_cpu():
     model.eval()
 
     print("spectra model loaded succsfully!")
+    
+    return model
+
+def _load_spectra_model_cpu_v2():
+    print("loading spectra model v2...")
+    # config is already a dict from yaml.safe_load
+    config = yaml.safe_load(open(SPECTRA_CONFIG_PATH_v2, 'r'))
+    # Check for SpectralViT config first
+    if 'SpectralViT' in config:
+        print("Loading SpectralViT model...")
+        model_args = Container(**config['SpectralViT'])
+        # In MultiDESA/src/lamost.py, transformer_args uses Conformer config
+        conformer_args = Container(**config['Conformer'])
+        
+        model = SpectralViT(model_args, transformer_args=conformer_args)
+        
+        # Load checkpoint
+        ckpt_path = model_args.checkpoint_path
+        print(f"Loading checkpoint from {ckpt_path}")
+        if os.path.exists(ckpt_path):
+            state_dict = torch.load(ckpt_path, map_location='cpu')
+            # Handle DDP prefix if present
+            new_state_dict = OrderedDict()
+            for k, v in state_dict.items():
+                name = k[7:] if k.startswith('module.') else k
+                new_state_dict[name] = v
+            model.load_state_dict(new_state_dict)
     
     return model
 
@@ -501,7 +536,9 @@ def _load_llm_model_cpu(args) -> Transformer:
     return model
 
 # Update the existing functions to use CPU loading
-def _load_spectra_model():
+def _load_spectra_model(args):
+    if args.v2:
+        return _load_spectra_model_cpu_v2()
     return _load_spectra_model_cpu()
 
 def _load_hf_llm_model(args):
@@ -540,6 +577,7 @@ def _load_hf_llm_model(args):
         "trust_remote_code": getattr(args, "hf_trust_remote_code", False),
         "cache_dir": getattr(args, "hf_cache_dir", None),
         "token": getattr(args, "hf_auth_token", None),
+        "attn_implementation": getattr(args, "hf_attn_implementation", None),
     }
 
     hf_revision = getattr(args, "hf_revision", None)
@@ -794,7 +832,8 @@ def create_optimizer_and_scheduler(model, args, train_loader):
     named_params = list(model.named_parameters())
     for name, param in named_params:
         if 'base_model' in name and args.freeze_llm:
-            param.requires_grad = False
+            if 'lora' not in name:
+                param.requires_grad = False
         if 'fm_model' in name and args.freeze_spectral:
             param.requires_grad = False
 
@@ -822,7 +861,25 @@ def create_optimizer_and_scheduler(model, args, train_loader):
         return 0.5 * (1 + np.cos(np.pi * (step - max(0, warmup_steps)) / denom))
     
     scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
-    scaler = GradScaler(enabled=args.use_amp)
+    
+    # Disable GradScaler for bfloat16 as it doesn't need/support it
+    use_scaler = args.use_amp
+    precision = getattr(args, 'llm_precision', 'unknown')
+    
+    # Check actual parameter dtypes
+    param_dtypes = {p.dtype for p in opt_params}
+    if torch.bfloat16 in param_dtypes:
+        use_scaler = False
+        if dist.get_rank() == 0:
+            print("DEBUG: Detected bfloat16 parameters in optimizer. Disabling GradScaler.")
+            
+    if precision in ['bf16', 'bfloat16']:
+        use_scaler = False
+        
+    if dist.get_rank() == 0:
+        print(f"DEBUG: Optimizer creation - Precision: {precision}, Use AMP: {args.use_amp}, Enable Scaler: {use_scaler}")
+
+    scaler = GradScaler(enabled=use_scaler)
 
     return optimizer, scheduler, scaler
 

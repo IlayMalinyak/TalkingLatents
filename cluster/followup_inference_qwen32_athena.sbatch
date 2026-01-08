@@ -2,10 +2,10 @@
 #SBATCH --job-name=TL_qwen_inference
 #SBATCH --nodes=1
 #SBATCH --ntasks=1                   
-#SBATCH --gres=gpu:nvidia_l40s:1
+#SBATCH --gres=gpu:nvidia_h200:1
 #SBATCH --cpus-per-task=32
 #SBATCH --mem=180G                    # Increased from 128G to handle 32B model loading
-#SBATCH --partition=l40s-shared
+#SBATCH --partition=h200-shared
 #SBATCH --qos=12h_4g
 #SBATCH -t 12:00:00
 
@@ -37,7 +37,7 @@ OUTDIR=${OUTDIR:-/home/ilay.kamai/work/TalkingLatents/logs}
 
 # Training hyper-parameters
 
-EXP=${EXP:-qwen32_4bit_fup_v2}
+EXP=${EXP:-qwen32_fup_lora_6}
 EPOCHS=${EPOCHS:-30}
 BATCH=${BATCH:-8}
 MAXLEN=${MAXLEN:-256}
@@ -51,7 +51,7 @@ LAMBDA=${LAMBDA:-1.0}
 srun --ntasks=$SLURM_NNODES --ntasks-per-node=1 \
     --output=/home/ilay.kamai/athena/logs/%x_%j_%N_%t.out \
   --error=/home/ilay.kamai/athena/logs/%x_%j_%N_%t.err \
-  --container=/rg/perets_prj/ilay.kamai/containers/torch2.7-tf2.20-cu128.sif \
+  --container=/apps/apptainer/images/pytorch/latest/torch2.7-tf2.20-cu128.sif \
   python -u /home/ilay.kamai/work/TalkingLatents/src/follow_up_inference.py \
-  --checkpoint_path /home/ilay.kamai/work/TalkingLatents/logs/qwen_32b_best_2025-11-29-22-53/qwen32_4bit_fup_resume_best.pth \
-  --max_samples 200
+  --checkpoint_path /home/ilay.kamai/work/TalkingLatents/logs/regular_loss1p0_2026-01-03-16-07/fup_qwen32_lora_6_resume_best.pth \
+  --max_samples 100

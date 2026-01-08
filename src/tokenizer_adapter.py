@@ -18,7 +18,7 @@ class TokenizerAdapter:
     def encode(self, text: str, bos: bool = True, eos: bool = False) -> List[int]:
         raise NotImplementedError
 
-    def decode(self, tokens: List[int]) -> str:
+    def decode(self, tokens: List[int], skip_special_tokens: bool = True) -> str:
         raise NotImplementedError
 
 
@@ -38,7 +38,14 @@ class LlamaTokenizerAdapter(TokenizerAdapter):
     def encode(self, text: str, bos: bool = True, eos: bool = False) -> List[int]:
         return self._tokenizer.encode(text, bos=bos, eos=eos)
 
-    def decode(self, tokens: List[int]) -> str:
+    def decode(self, tokens: List[int], skip_special_tokens: bool = True) -> str:
+        # LLaMA tokenizer implementation might not support skip_special_tokens arg directly
+        # but we add it to the signature for compatibility.
+        # If underlying tokenizer supports it, pass it. Otherwise, assume default behavior.
+        # Checking typical llama3 code, decode usually just takes tokens.
+        # For safety, we keep calling it as is, or we could try/except.
+        # But for this user running Qwen (HF), this class isn't used. 
+        # We just need signature compatibility if they use polymorphism.
         return self._tokenizer.decode(tokens)
 
 
@@ -93,8 +100,8 @@ class HFAutoTokenizerAdapter(TokenizerAdapter):
             tokens = tokens + [self.eos_id]
         return tokens
 
-    def decode(self, tokens: List[int]) -> str:
-        return self._tokenizer.decode(tokens, skip_special_tokens=True)
+    def decode(self, tokens: List[int], skip_special_tokens: bool = True) -> str:
+        return self._tokenizer.decode(tokens, skip_special_tokens=skip_special_tokens)
 
     @property
     def tokenizer(self):

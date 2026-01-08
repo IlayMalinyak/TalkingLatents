@@ -1,13 +1,13 @@
 #!/bin/bash
 #SBATCH --job-name=TL_fup_qwen
 #SBATCH --nodes=1
-#SBATCH --ntasks=1                   
-#SBATCH --gres=gpu:nvidia_l40s:4
+#SBATCH --ntasks=2                   
+#SBATCH --gres=gpu:nvidia_h200:2
 #SBATCH --cpus-per-task=32
 #SBATCH --mem=180G                    # Increased from 128G to handle 32B model loading
-#SBATCH --partition=l40s-public
-#SBATCH --qos=24h_4g
-#SBATCH -t 24:00:00
+#SBATCH --partition=h200-shared
+#SBATCH --qos=2h_2g
+#SBATCH -t 2:00:00
 
 set -euo pipefail
 
@@ -33,13 +33,16 @@ mkdir -p $HF_HOME $TRANSFORMERS_CACHE $HF_DATASETS_CACHE $HUGGINGFACE_HUB_CACHE
 JSON_FILE=/home/ilay.kamai/work/TalkingLatents/data/dataset/stellar_descriptions_questions_short.json
 JSON_FOLLOWUP=/home/ilay.kamai/work/TalkingLatents/data/dataset/stellar_descriptions_questions.json
 
+FEATURE_STATS=/home/ilay.kamai/work/TalkingLatents/logs/2025-07-29/feature_stats.npz
+
+
 OUTDIR=${OUTDIR:-/home/ilay.kamai/work/TalkingLatents/logs}
 
 # Training hyper-parameters
 
-EXP=${EXP:-qwen32_4bit_fup_v2}
+EXP=${EXP:-fup_qwen32_lora_6_raw_spec}
 EPOCHS=${EPOCHS:-30}
-BATCH=${BATCH:-4}
+BATCH=${BATCH:-16}
 MAXLEN=${MAXLEN:-128}
 WORKERS=${WORKERS:-4}
 LR=${LR:-1e-4}
@@ -51,15 +54,14 @@ LAMBDA=${LAMBDA:-1.0}
 srun --ntasks=$SLURM_NNODES --ntasks-per-node=1 \
     --output=/home/ilay.kamai/athena/logs/%x_%j_%N_%t.out \
   --error=/home/ilay.kamai/athena/logs/%x_%j_%N_%t.err \
-  --container=/rg/perets_prj/ilay.kamai/containers/torch2.7-tf2.20-cu128.sif \
+  --container=/apps/apptainer/images/pytorch/latest/torch2.7-tf2.20-cu128.sif \
   python -u /home/ilay.kamai/work/TalkingLatents/src/simple_questions_multitok.py \
   --llm_backend qwen \
   --hf_model_name Qwen/Qwen2.5-32B-Instruct \
-  --hf_quantization 4bit \
-  --hf_max_memory_gb 30 \
-  --hf_device_map '{"": 0}' \
+  --hf_device_map "auto" \
   --hf_trust_remote_code \
   --json_file "${JSON_FILE}" \
+  --feature_stats_file "${FEATURE_STATS}" \
   --mode single_star \
   --single_dataset_type regular \
   --output_dir "${OUTDIR}" \
@@ -78,4 +80,4 @@ srun --ntasks=$SLURM_NNODES --ntasks-per-node=1 \
   --disable_classification \
   --enable_followup_augmentation \
   --followup_prob 0.7 \
-  --max_followup_turns 2 \
+  --max_followup_turns 1 \

@@ -424,9 +424,9 @@ class ConformerBlock(nn.Module):
             if isinstance(m.module, MHA_rotary):
                 x = m(x, RoPE=RoPE, key_padding_mask=key_padding_mask)
             else:
-                x = m(x)
-            # if torch.isnan(x).any():
-                # print('nans in block', m)
+                x = m(x) 
+            if torch.isnan(x).any():
+                exit()            
         return x
 
 

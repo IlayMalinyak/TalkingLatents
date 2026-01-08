@@ -188,8 +188,11 @@ class MultimodalBackboneBase(nn.Module):
         feature_loss_weight: float = 1.0,
         embedding_dim: Optional[int] = None,
         vocab_size: Optional[int] = None,
+        feature_stats: Optional[Dict[str, Any]] = None,
+        pooling_type: str = 'mean',
     ):
         super().__init__()
+        self.pooling_type = pooling_type
         stellar_params = stellar_params or ['Teff', 'logg', 'FeH']
         quantiles = quantiles or [0.159, 0.5, 0.841]
 
@@ -208,6 +211,8 @@ class MultimodalBackboneBase(nn.Module):
         self.feature_dim = feature_dim
         self.feature_loss_weight = feature_loss_weight
         self.num_spectral_features = int(num_spectral_features)
+
+        self._init_feature_normalization(feature_stats)
 
         self.embedding_dim = embedding_dim
         if self.embedding_dim is None:
@@ -246,18 +251,18 @@ class MultimodalBackboneBase(nn.Module):
     # Initialization helpers
     # ------------------------------------------------------------------ #
     def _init_projectors(self, latent_dim: int, hidden_dim: int) -> None:
-        self.projector_a = SpectralTokensProjector(
-            latent_dim=latent_dim,
-            d_model=self.embedding_dim,
-            hidden_dim=hidden_dim,
-            num_tokens=self.num_spectral_features,
-        )
-        self.projector_b = SpectralTokensProjector(
-            latent_dim=latent_dim,
-            d_model=self.embedding_dim,
-            hidden_dim=hidden_dim,
-            num_tokens=self.num_spectral_features,
-        )
+        # self.projector_a = SpectralTokensProjector(
+        #     latent_dim=latent_dim,
+        #     d_model=self.embedding_dim,
+        #     hidden_dim=hidden_dim,
+        #     num_tokens=self.num_spectral_features,
+        # )
+        # self.projector_b = SpectralTokensProjector(
+        #     latent_dim=latent_dim,
+        #     d_model=self.embedding_dim,
+        #     hidden_dim=hidden_dim,
+        #     num_tokens=self.num_spectral_features,
+        # )
         self.projector = SpectralTokensProjector(
             latent_dim=latent_dim,
             d_model=self.embedding_dim,
@@ -289,6 +294,7 @@ class MultimodalBackboneBase(nn.Module):
         )
 
     def _init_classification_head(self) -> None:
+        print("creating classification head... ")
         if not self.enable_classification:
             self.classification_head = None
             return
@@ -309,6 +315,26 @@ class MultimodalBackboneBase(nn.Module):
             hidden_dim=self.embedding_dim,
             feature_dim=self.feature_dim,
         ).float()
+
+    def _init_feature_normalization(self, feature_stats: Optional[Dict[str, Any]]) -> None:
+        """Initialize normalization buffers if provided"""
+        self.register_buffer('feature_mean', None)
+        self.register_buffer('feature_std', None)
+        
+        if feature_stats is not None:
+            if 'mean' in feature_stats:
+                mean_val = feature_stats['mean']
+                if not isinstance(mean_val, torch.Tensor):
+                    mean_val = torch.tensor(mean_val)
+                self.feature_mean = mean_val
+                
+            if 'std' in feature_stats:
+                std_val = feature_stats['std']
+                if not isinstance(std_val, torch.Tensor):
+                    std_val = torch.tensor(std_val)
+                self.feature_std = std_val
+                
+            print(f"Initialized feature normalization with mean shape {self.feature_mean.shape} and std shape {self.feature_std.shape}")
 
     # ------------------------------------------------------------------ #
     # Shared utilities
@@ -389,18 +415,55 @@ class MultimodalBackboneBase(nn.Module):
         if self.fm_model is not None:
             self.fm_model.eval()
             with torch.no_grad():
-                _, _, latent_features = self.fm_model(spectra)
-                if latent_features.dim() == 3:
+                out = self.fm_model(spectra, return_all=True)
+            if isinstance(out, dict):
+                # Prioritize CLS token if available (matches feature extraction script)
+                if 'cls' in out:
+                    latent_features = out['cls']
+                else:
+                    latent_features = out['tokens']
+            else:
+                latent_features = out[-1]
+            if torch.isnan(latent_features).any():
+                print("DEBUG: NaN detected in fm_model output (latent_features)")
+            
+            # If still 3D (e.g. tokens), pool it
+            if latent_features.dim() == 3:
+                if self.pooling_type == 'sum':
+                    latent_features = latent_features.sum(dim=1)
+                else:
                     latent_features = latent_features.mean(dim=1)
+                
+            # Apply feature normalization if available
+            if self.feature_mean is not None and self.feature_std is not None:
+                # Ensure correct device/dtype
+                if self.feature_mean.device != latent_features.device:
+                    self.feature_mean = self.feature_mean.to(latent_features.device)
+                if self.feature_std.device != latent_features.device:
+                    self.feature_std = self.feature_std.to(latent_features.device)
+                    
+                # Normalize: (x - mean) / (std + epsilon)
+                # Ensure types match
+                mean = self.feature_mean.to(dtype=latent_features.dtype)
+                std = self.feature_std.to(dtype=latent_features.dtype)
+                
+                latent_features = (latent_features - mean) / (std + 1e-6)
         else:
             latent_features = spectra.float()
         return latent_features
 
     def _project_spectra(self, spectra: torch.Tensor, projector: nn.Module) -> torch.Tensor:
         latent = self._encode_latent_features(spectra)
+        if torch.isnan(latent).any():
+            print("DEBUG: NaN detected in encoded latent features")
+            
         proj_param = next(projector.parameters())
         latent = latent.to(device=proj_param.device, dtype=proj_param.dtype)
-        return projector(latent)
+        
+        output = projector(latent)
+        if torch.isnan(output).any():
+            print(f"DEBUG: NaN detected in projector output (input dtype: {latent.dtype}, param dtype: {proj_param.dtype})")
+        return output
 
     def _extract_text_fields(self, batch_data: Dict[str, Any], batch_idx: int) -> Tuple[str, str]:
         input_text = ''
@@ -462,7 +525,8 @@ class MultimodalLlamaModelMultiTokens(MultimodalBackboneBase):
                  use_checkpoint: bool = True, mode: str = "single_star", use_cfm=True, cfm_weight=0.1,
                  predict_stellar_params: bool = True, stellar_params: List[str] = ['Teff', 'logg', 'FeH'],
                  quantiles: List[float] = [0.159, 0.5, 0.841], enable_classification: bool = True,
-                 predict_features: bool = False, feature_dim: int = 2048, feature_loss_weight: float = 1.0):
+                 predict_features: bool = False, feature_dim: int = 2048, feature_loss_weight: float = 1.0, 
+                 feature_stats: Optional[Dict[str, Any]] = None, pooling_type: str = 'mean'):
         super().__init__(
             base_model=base_model,
             fm_model=fm_model,
@@ -479,10 +543,14 @@ class MultimodalLlamaModelMultiTokens(MultimodalBackboneBase):
             enable_classification=enable_classification,
             predict_features=predict_features,
             feature_dim=feature_dim,
-            feature_loss_weight=feature_loss_weight,
+            embedding_dim=None,
+            vocab_size=None,
+            feature_stats=feature_stats,
+            pooling_type=pooling_type,
         )
         print("self.embedding dim: ", self.embedding_dim)
 
+    
     def forward(self, batch: Dict[str, Any]) -> Dict[str, torch.Tensor]:
         """
         Unified forward pass that handles both single-star and two-star samples in one pass.
@@ -505,8 +573,9 @@ class MultimodalLlamaModelMultiTokens(MultimodalBackboneBase):
             if single_indices.numel() > 0:
                 single_spectra = batch['masked_spectra'].index_select(0, single_indices)
                 single_positions = batch['feature_start_indices'].index_select(0, single_indices)
-                
                 spec_tokens = self._project_spectra(single_spectra, self.projector)
+                if torch.isnan(spec_tokens).any():
+                    print("DEBUG: NaN detected in spec_tokens (single_star)")
                 
                 # Insert tokens at specified positions
                 for i, global_idx in enumerate(single_indices):
@@ -522,38 +591,38 @@ class MultimodalLlamaModelMultiTokens(MultimodalBackboneBase):
                 cfm_targets.extend([single_spectra[i] for i in range(len(single_indices))])
         
         # Handle two-star samples
-        if 'masked_spectra_a' in batch and batch['masked_spectra_a'] is not None:
-            comp_mask = batch.get('mode_mask_comparative', torch.ones(batch_size, dtype=torch.bool, device=device))
-            comp_indices = torch.nonzero(comp_mask, as_tuple=False).squeeze(-1)
+        # if 'masked_spectra_a' in batch and batch['masked_spectra_a'] is not None:
+        #     comp_mask = batch.get('mode_mask_comparative', torch.ones(batch_size, dtype=torch.bool, device=device))
+        #     comp_indices = torch.nonzero(comp_mask, as_tuple=False).squeeze(-1)
             
-            if comp_indices.numel() > 0:
-                comp_spectra_a = batch['masked_spectra_a'].index_select(0, comp_indices)
-                comp_spectra_b = batch['masked_spectra_b'].index_select(0, comp_indices)
-                comp_indices_a = batch['star_a_feature_indices'].index_select(0, comp_indices)
-                comp_indices_b = batch['star_b_feature_indices'].index_select(0, comp_indices)
+        #     if comp_indices.numel() > 0:
+        #         comp_spectra_a = batch['masked_spectra_a'].index_select(0, comp_indices)
+        #         comp_spectra_b = batch['masked_spectra_b'].index_select(0, comp_indices)
+        #         comp_indices_a = batch['star_a_feature_indices'].index_select(0, comp_indices)
+        #         comp_indices_b = batch['star_b_feature_indices'].index_select(0, comp_indices)
                 
-                spec_tokens_a = self._project_spectra(comp_spectra_a, self.projector)
-                spec_tokens_b = self._project_spectra(comp_spectra_b, self.projector)
+        #         spec_tokens_a = self._project_spectra(comp_spectra_a, self.projector)
+        #         spec_tokens_b = self._project_spectra(comp_spectra_b, self.projector)
                 
-                # Insert tokens at exact positions
-                for i, global_idx in enumerate(comp_indices):
-                    indices_a = comp_indices_a[i]
-                    indices_b = comp_indices_b[i]
+        #         # Insert tokens at exact positions
+        #         for i, global_idx in enumerate(comp_indices):
+        #             indices_a = comp_indices_a[i]
+        #             indices_b = comp_indices_b[i]
                     
-                    # Insert star A tokens
-                    valid_indices_a = indices_a[indices_a < seq_len]
-                    if len(valid_indices_a) > 0:
-                        num_tokens_a = min(len(valid_indices_a), spec_tokens_a.shape[1])
-                        token_embeddings[global_idx, valid_indices_a[:num_tokens_a], :] = spec_tokens_a[i, :num_tokens_a, :].to(token_embeddings.dtype)
+        #             # Insert star A tokens
+        #             valid_indices_a = indices_a[indices_a < seq_len]
+        #             if len(valid_indices_a) > 0:
+        #                 num_tokens_a = min(len(valid_indices_a), spec_tokens_a.shape[1])
+        #                 token_embeddings[global_idx, valid_indices_a[:num_tokens_a], :] = spec_tokens_a[i, :num_tokens_a, :].to(token_embeddings.dtype)
                     
-                    # Insert star B tokens
-                    valid_indices_b = indices_b[indices_b < seq_len]
-                    if len(valid_indices_b) > 0:
-                        num_tokens_b = min(len(valid_indices_b), spec_tokens_b.shape[1])
-                        token_embeddings[global_idx, valid_indices_b[:num_tokens_b], :] = spec_tokens_b[i, :num_tokens_b, :].to(token_embeddings.dtype)
+        #             # Insert star B tokens
+        #             valid_indices_b = indices_b[indices_b < seq_len]
+        #             if len(valid_indices_b) > 0:
+        #                 num_tokens_b = min(len(valid_indices_b), spec_tokens_b.shape[1])
+        #                 token_embeddings[global_idx, valid_indices_b[:num_tokens_b], :] = spec_tokens_b[i, :num_tokens_b, :].to(token_embeddings.dtype)
                 
-                # Store CFM targets (concatenated for two-star)
-                cfm_targets.extend([torch.cat([comp_spectra_a[i], comp_spectra_b[i]], dim=-1) for i in range(len(comp_indices))])
+        #         # Store CFM targets (concatenated for two-star)
+        #         cfm_targets.extend([torch.cat([comp_spectra_a[i], comp_spectra_b[i]], dim=-1) for i in range(len(comp_indices))])
         
         # Single transformer forward pass for all samples
         h = self._transformer_forward(token_embeddings)
@@ -587,6 +656,29 @@ class MultimodalLlamaModelMultiTokens(MultimodalBackboneBase):
             attn = layer.attention
             cache_k = attn.cache_k
             cache_v = attn.cache_v
+
+            # If cache is not initialized, create it with initial size
+            if cache_k is None or cache_v is None:
+                # Initial size: (batch_size, required_len, n_local_heads, head_dim)
+                # n_local_heads and head_dim should be attributes of attn
+                n_local_heads = attn.n_local_kv_heads
+                head_dim = attn.head_dim
+                
+                # Infer dtype from model parameters
+                cache_dtype = torch.float16
+                if hasattr(attn, 'wq'):
+                    cache_dtype = attn.wq.weight.dtype
+                elif hasattr(base_model, 'tok_embeddings'):
+                    cache_dtype = base_model.tok_embeddings.weight.dtype
+                
+                # Force cache to bfloat16 for stability if needed (optional debug step)
+                # cache_dtype = torch.bfloat16
+                
+                new_shape = (batch_size, required_len, n_local_heads, head_dim)
+                attn.cache_k = torch.zeros(new_shape, device=device, dtype=cache_dtype)
+                attn.cache_v = torch.zeros(new_shape, device=device, dtype=cache_dtype)
+                continue
+            
             need_batch = max(batch_size, cache_k.shape[0])
             need_len = max(required_len, cache_k.shape[1])
             if need_batch == cache_k.shape[0] and need_len == cache_k.shape[1]:
@@ -663,13 +755,20 @@ class MultimodalLlamaModelMultiTokens(MultimodalBackboneBase):
             ff_norm = layer.ffn_norm(h_mid)
             return h_mid + layer.feed_forward(ff_norm)
 
-        for layer in self.base_model.layers:
+        for i, layer in enumerate(self.base_model.layers):
             if self.training and self.use_checkpoint:
                 h = checkpoint(layer_block, h, layer, use_reentrant=False)
             else:
                 h = layer_block(h, layer)
+            
+            if torch.isnan(h).any():
+                print(f"DEBUG: NaN detected after layer {i}")
+                # Optional: Break early if NaN
+                # break
 
         h = self.base_model.norm(h)
+        if torch.isnan(h).any():
+            print("DEBUG: NaN detected after base_model.norm")
         return h
 
     def _forward_single_mode(self,
@@ -867,6 +966,16 @@ class MultimodalLlamaModelMultiTokens(MultimodalBackboneBase):
         if mask is not None:
             scores = scores + mask
         probs = F.softmax(scores.float(), dim=-1).type_as(xq)
+        
+        # --- HARD DEBUG PATCH (CONDITIONAL) ---
+        if getattr(attention_layer, 'store_attention', False):
+            try:
+                # print(f"DEBUG: Capturing attention in _attn_no_cache for {id(attention_layer)}")
+                attention_layer.last_attn_scores = probs.detach().cpu()
+            except Exception as e:
+                print(f"Error capturing attention: {e}")
+        # ------------------------
+
         out = torch.matmul(probs, values)
         out = out.transpose(1, 2).contiguous().view(bsz, seqlen, -1)
         return attention_layer.wo(out)
@@ -935,24 +1044,14 @@ class MultimodalLlamaModelMultiTokens(MultimodalBackboneBase):
             )
             current_mode = "two_star" if has_two_star_features else "single_star"
 
-        if current_mode == "two_star":
-            star_a_features = batch_data['masked_spectra_a'][batch_idx:batch_idx+1].to(device)
-            star_b_features = batch_data['masked_spectra_b'][batch_idx:batch_idx+1].to(device)
-            star_a_indices = batch_data['star_a_feature_indices'][batch_idx:batch_idx+1].to(device)
-            star_b_indices = batch_data['star_b_feature_indices'][batch_idx:batch_idx+1].to(device)
-            answer_start_source = batch_data.get('answer_start_indices', [input_ids.shape[1]])
-            answer_start_idx = answer_start_source[batch_idx]
-            if isinstance(answer_start_idx, torch.Tensor):
-                answer_start_idx = answer_start_idx.item()
+        input_spectra = batch_data['masked_spectra'][batch_idx:batch_idx+1].to(device)
+        feature_start_raw = batch_data['feature_start_indices'][batch_idx]
+        if isinstance(feature_start_raw, torch.Tensor):
+            feature_start_idx = feature_start_raw.to(device)
         else:
-            input_spectra = batch_data['masked_spectra'][batch_idx:batch_idx+1].to(device)
-            feature_start_raw = batch_data['feature_start_indices'][batch_idx]
-            if isinstance(feature_start_raw, torch.Tensor):
-                feature_start_idx = feature_start_raw.to(device)
-            else:
-                feature_start_idx = torch.tensor(int(feature_start_raw), device=device, dtype=torch.long)
-            answer_start_raw = batch_data['answer_start_indices'][batch_idx]
-            answer_start_idx = answer_start_raw.item() if isinstance(answer_start_raw, torch.Tensor) else int(answer_start_raw)
+            feature_start_idx = torch.tensor(int(feature_start_raw), device=device, dtype=torch.long)
+        answer_start_raw = batch_data['answer_start_indices'][batch_idx]
+        answer_start_idx = answer_start_raw.item() if isinstance(answer_start_raw, torch.Tensor) else int(answer_start_raw)
 
         input_text, target_text = self._extract_text_fields(batch_data, batch_idx)
 
@@ -1022,24 +1121,17 @@ class MultimodalLlamaModelMultiTokens(MultimodalBackboneBase):
                 
                 return torch.multinomial(probs, 1).item()
 
-        # Prepare features based on current sample mode
-        if current_mode == "two_star":
-            # Ensure features match projector dtype/device
-            proj_param_a = next(self.projector_a.parameters())
-            proj_param_b = next(self.projector_b.parameters())
-            star_a_features = star_a_features.to(device=proj_param_a.device, dtype=proj_param_a.dtype)
-            star_b_features = star_b_features.to(device=proj_param_b.device, dtype=proj_param_b.dtype)
-        else:
-            # Ensure features fed to projector match projector dtype/device
-            proj_param = next(self.projector.parameters())
-            features_vec = input_spectra.view(prompt.size(0), -1).to(device=proj_param.device, dtype=proj_param.dtype)
+        # Ensure features fed to projector match projector dtype/device
+        proj_param = next(self.projector.parameters())
+        features_vec = self._encode_latent_features(input_spectra)
+        features_vec = features_vec.view(prompt.size(0), -1).to(device=proj_param.device, dtype=proj_param.dtype)
 
         for _ in range(max_new_tokens):
-            if current_mode == "two_star":
-                out = self._forward_no_cache_two_star(prompt, star_a_features, star_b_features,
-                                                      star_a_indices, star_b_indices)
-            else:
-                out = self._forward_no_cache(prompt, features_vec, feature_start_idx)
+            out = self._forward_single_mode(prompt, features_vec,
+                                            feature_start_idx,
+                                            start_pos=0,
+                                            use_cache=False,
+                                            )
             logits = out['logits'][:, -1, :].squeeze(0)
             # Log prob of chosen token
             if temperature > 0:
@@ -1061,4 +1153,4 @@ class MultimodalLlamaModelMultiTokens(MultimodalBackboneBase):
                     break
         
         generated_text = tokenizer.decode(gen_ids) if tokenizer is not None else ''
-        return generated_text, input_text, target_text, gen_logps
+        return generated_text, input_text, target_text, gen_logps, gen_ids

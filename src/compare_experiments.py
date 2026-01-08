@@ -219,6 +219,8 @@ def process_experiment(json_path: Path, exp_name: str, snr_map: Dict[str, float]
 
             for p in ['Teff', 'logg', 'FeH']:
                 if stellar_params.get(p) is not None and extracted_params[p] is not None:
+                    if p == 'Teff' and extracted_params[p] < 1000:
+                        continue
                     param_data[f'true_{p}'].append(stellar_params[p])
                     param_data[f'pred_{p}'].append(extracted_params[p])
                     param_data[f'snr_{p}'].append(snr)
@@ -227,10 +229,11 @@ def process_experiment(json_path: Path, exp_name: str, snr_map: Dict[str, float]
                 pred_L = extract_value_from_text(generated, unit='Lsun')
                 true_L = qa.get('true_value')
                 if true_L is not None and pred_L is not None:
-                     # Linear vs Linear Comparison (as requested)
-                     param_data['true_Lstar'].append(float(true_L))
-                     param_data['pred_Lstar'].append(pred_L)
-                     param_data['snr_Lstar'].append(snr)
+                    if pred_L < 1000:
+                        # Linear vs Linear Comparison (as requested)
+                        param_data['true_Lstar'].append(float(true_L))
+                        param_data['pred_Lstar'].append(pred_L)
+                        param_data['snr_Lstar'].append(snr)
             
             if is_mass:
                 pred_M = extract_value_from_text(generated, unit='Msun')
@@ -412,60 +415,92 @@ def main():
     plt.savefig(out_dir / 'parameter_mae_comparison.png', dpi=300)
     print(f"Saved parameter MAE plot to {out_dir / 'parameter_mae_comparison.png'}")
 
-    # 3. Parameter Scatter Plots (Grid of N experiments x 5 parameters)
-    # This might get huge if N is large, so maybe limit or just do it.
-    # Let's do it but handle layout dynamically.
-    
-    n_exps = len(valid_names)
-    fig, axes = plt.subplots(n_exps, 5, figsize=(25, 4 * n_exps))
-    if n_exps == 1:
-        axes = np.array([axes]) # Make it 2D array
-        
-    fig.suptitle('Parameter Prediction Scatter Plots', fontsize=16)
-    
-    for i, name in enumerate(valid_names):
-        params = all_params[i]
-        for j, p in enumerate(param_names):
-            ax = axes[i, j]
-            true_vals = params.get(f'true_{p}', [])
-            pred_vals = params.get(f'pred_{p}', [])
-            snr_vals = params.get(f'snr_{p}', [])
-            
-            if true_vals and pred_vals:
-                # Scatter plot with SNR coloring
-                if snr_vals and len(snr_vals) == len(true_vals):
-                    sc = ax.scatter(true_vals, pred_vals, c=snr_vals, cmap='viridis', alpha=0.5)
-                    # Add colorbar (small one)
-                    cbar = plt.colorbar(sc, ax=ax)
-                    # cbar.set_label('SNR', fontsize=8) 
-                else:
-                    ax.scatter(true_vals, pred_vals, alpha=0.5)
-                
-                min_v = min(min(true_vals), min(pred_vals))
-                max_v = max(max(true_vals), max(pred_vals))
-                ax.plot([min_v, max_v], [min_v, max_v], 'r--')
-                
-                rmse = np.sqrt(mean_squared_error(true_vals, pred_vals))
-                mae = mean_absolute_error(true_vals, pred_vals)
-                ax.set_title(f'{name} - {p}\nRMSE={rmse:.2f}, MAE={mae:.2f}')
-                
-                # Set Log-Log scale for Luminosity and Mass
-                if p in ['Lstar', 'Mstar']:
-                    ax.set_xscale('log')
-                    ax.set_yscale('log')
-                    ax.grid(True, which="both", alpha=0.3)
-                    
-            else:
-                ax.set_title(f'{name} - {p} (No Data)')
-                
-            if i == n_exps - 1:
-                ax.set_xlabel(f'True {p}')
-            if j == 0:
-                ax.set_ylabel(f'Predicted {p}')
+    # 3. Parameter Scatter Plots
+    def plot_scatter_grid(param_subset, filename_suffix, title_suffix):
+        n_params = len(param_subset)
+        if n_params == 0:
+            return
 
-    plt.tight_layout()
-    plt.savefig(out_dir / 'parameter_scatter_comparison.png', dpi=300)
-    print(f"Saved parameter scatter plot to {out_dir / 'parameter_scatter_comparison.png'}")
+        cols = n_params
+        # If we have only 1 parameter, we might just want 1 column. 
+        # But generally we have N cols = N params.
+        
+        n_exps = len(valid_names)
+        
+        # Adjust figure size based on number of params and experiments
+        # width ~ 5 per param, height ~ 4 per experiment
+        fig, axes = plt.subplots(n_exps, cols, figsize=(5 * cols, 4 * n_exps))
+        
+        # Ensure axes is always 2D array [exp, param]
+        if n_exps == 1 and cols == 1:
+            axes = np.array([[axes]])
+        elif n_exps == 1:
+            axes = np.array([axes]) # Shape (1, cols)
+        elif cols == 1:
+            axes = np.array([[ax] for ax in axes]) # Shape (n_exps, 1) -- wait, subplots returns 1D array if cols=1? 
+                                                  # Actually: subplots(2,1) -> array([ax1, ax2]) if default squeeze=True
+                                                  # subplots(1,2) -> array([ax1, ax2])
+                                                  # So let's just be careful with squeezing.
+        
+        # Easier: Just iterate flat if we can, but we need grid structure.
+        # Let's fix squeeze=False so it's always 2D
+        plt.close(fig) # close the one we just made to restart with squeeze=False
+        fig, axes = plt.subplots(n_exps, cols, figsize=(5 * cols, 4 * n_exps), squeeze=False)
+
+        fig.suptitle(f'Parameter Prediction Scatter Plots - {title_suffix}', fontsize=16)
+
+        for i, name in enumerate(valid_names):
+            params = all_params[i]
+            for j, p in enumerate(param_subset):
+                ax = axes[i, j]
+                true_vals = params.get(f'true_{p}', [])
+                pred_vals = params.get(f'pred_{p}', [])
+
+                if true_vals and pred_vals:
+                    # Scatter plot with SNR coloring (placeholder color for now as per original code)
+                    sc = ax.scatter(true_vals, pred_vals, c='blue', alpha=0.6)
+                    
+                    min_v = min(min(true_vals), min(pred_vals))
+                    max_v = max(max(true_vals), max(pred_vals))
+                    
+                    # Ensure decent padding
+                    range_v = max_v - min_v
+                    if range_v == 0: range_v = 1
+                    
+                    # Plot diagonal
+                    ax.plot([min_v, max_v], [min_v, max_v], 'r--', alpha=0.8)
+
+                    rmse = np.sqrt(mean_squared_error(true_vals, pred_vals))
+                    mae = mean_absolute_error(true_vals, pred_vals)
+                    ax.set_title(f'{name} - {p}\nRMSE={rmse:.2f}, MAE={mae:.2f}')
+
+                    # Set Log-Log scale for Luminosity and Mass
+                    if p in ['Lstar', 'Mstar']:
+                        ax.set_xscale('log')
+                        ax.set_yscale('log')
+                        ax.grid(True, which="both", alpha=0.3)
+                    else:
+                        ax.grid(True, alpha=0.3)
+
+                else:
+                    ax.set_title(f'{name} - {p} (No Data)')
+
+                if i == n_exps - 1:
+                    ax.set_xlabel(f'True {p}')
+                if j == 0:
+                    ax.set_ylabel(f'Predicted {p}')
+
+        plt.tight_layout()
+        save_path = out_dir / f'parameter_scatter_{filename_suffix}.png'
+        plt.savefig(save_path, dpi=300)
+        print(f"Saved {filename_suffix} scatter plot to {save_path}")
+
+    # Split parameters
+    basic_params = ['Teff', 'logg', 'FeH']
+    phys_params = ['Lstar', 'Mstar']
+    
+    plot_scatter_grid(basic_params, 'basic', 'Basic Parameters')
+    plot_scatter_grid(phys_params, 'physical', 'Physical Parameters')
 
 if __name__ == "__main__":
     main()

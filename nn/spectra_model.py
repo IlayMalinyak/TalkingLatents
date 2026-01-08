@@ -53,7 +53,6 @@ class ConvBlock(nn.Module):
 class CNNEncoder(nn.Module):
     def __init__(self, args) -> None:
         super().__init__()
-        print("Using CNN encoder wit activation: ", args.activation, 'args avg_output: ', args.avg_output)
         self.activation = get_activation(args)
         self.embedding = nn.Sequential(nn.Conv1d(in_channels = args.in_channels,
                 kernel_size=3, out_channels = args.encoder_dims[0], stride=1, padding = 'same', bias = False),
@@ -87,7 +86,6 @@ class CNNEncoder(nn.Module):
 class CNNDecoder(nn.Module):
     def __init__(self, args) -> None:
         super().__init__()
-        print("Using CNN decoder with activation: ", args.activation)
         
         # Reverse the encoder dimensions for upsampling
         decoder_dims = args.encoder_dims[::-1]
@@ -173,13 +171,14 @@ class MultiTaskRegressor(nn.Module):
             nn.Linear(encoder_dim//2, args.output_dim*args.num_quantiles)
         )
     
-    def forward(self, x, y=None):
+    def forward(self, x, y=None, return_all=False):
         x_enc, x = self.encoder(x)
         if len(x.shape) == 3:
             x = x.permute(0,2,1)
         else:
             x = x.unsqueeze(-1)
-        output_reg = self.regressor(x_enc)
+        # print(x_enc.shape)
+        output_reg = self.regressor(x_enc.sum(dim=1))
         output_dec = self.decoder(x)
         return output_reg, output_dec, x_enc
 
@@ -202,8 +201,9 @@ class MultiEncoder(nn.Module):
             x_enc = backbone_out.unsqueeze(1)
         else:
             x_enc = backbone_out
-        RoPE = self.pe(x_enc, x_enc.shape[1]).nan_to_num(0)
+        RoPE = self.pe(x_enc, x_enc.shape[1])
         x_enc = self.encoder(x_enc, RoPE)
+        # print('avg_output', self.avg_output)
         if (len(x_enc.shape) == 3) and self.avg_output:
             x_enc = x_enc.sum(dim=1)
         return x_enc, backbone_out
@@ -391,7 +391,7 @@ class SpectralViT(nn.Module):
             x = x.unsqueeze(1)
         elif len(x.shape) == 3 and x.shape[-1] == 1:
             x = x.transpose(-1, -2)
-            
+                
         # Patchify: [B, C, L] -> [B, num_patches, dim]
         x = self.patch_embed(x.float())  # [B, dim, num_patches]
         x = x.transpose(1, 2)  # [B, num_patches, dim]

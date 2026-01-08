@@ -1,11 +1,11 @@
 #!/bin/bash
-#SBATCH --job-name=TL_qwen_inference
+#SBATCH --job-name=TL_lama8_inference
 #SBATCH --nodes=1
 #SBATCH --ntasks=1                   
-#SBATCH --gres=gpu:nvidia_l40s:1
+#SBATCH --gres=gpu:nvidia_h200:1
 #SBATCH --cpus-per-task=32
 #SBATCH --mem=180G                    # Increased from 128G to handle 32B model loading
-#SBATCH --partition=l40s-shared
+#SBATCH --partition=h200-shared
 #SBATCH --qos=12h_4g
 #SBATCH -t 12:00:00
 
@@ -37,7 +37,7 @@ OUTDIR=${OUTDIR:-/home/ilay.kamai/work/TalkingLatents/logs}
 
 # Training hyper-parameters
 
-EXP=${EXP:-abl_single_qwen32_4bit_no_fup}
+EXP=${EXP:-qwen32_4bit_fup_v2}
 EPOCHS=${EPOCHS:-30}
 BATCH=${BATCH:-8}
 MAXLEN=${MAXLEN:-256}
@@ -53,7 +53,7 @@ srun --ntasks=$SLURM_NNODES --ntasks-per-node=1 \
   --error=/home/ilay.kamai/athena/logs/%x_%j_%N_%t.err \
   --container=/rg/perets_prj/ilay.kamai/containers/torch2.7-tf2.20-cu128.sif \
   python -u /home/ilay.kamai/work/TalkingLatents/src/follow_up_inference.py \
-  --checkpoint_path /home/ilay.kamai/work/TalkingLatents/logs/qwen_32b_best_2025-11-29-22-53/qwen32_4bit_fup_resume_best.pth \
-  --max_samples 20 \
-  --two_star_test \
-  --output_dir two_star_test_output
+  --checkpoint_path /home/ilay.kamai/work/TalkingLatents/logs/Lama_8B_best_regular_loss1p0_2025-11-27-16-44/fup_single_none_resume_best.pth \
+  --steering_concept_file /home/ilay.kamai/work/TalkingLatents/concepts/concept_directions.pt \
+  --steering_alphas='-2,-1,-0.8,-0.4,0,0.4,0.8,1,2' \
+  --max_samples 20

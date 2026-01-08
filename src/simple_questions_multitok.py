@@ -11,7 +11,8 @@ from torch.nn.parallel import DistributedDataParallel as DDP
 
 ROOT_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.append(ROOT_DIR)
-os.system('pip install tiktoken fairscale fire blobfile torchdiffeq torchcfm transformers bitsandbytes accelerate')
+os.system('pip install tiktoken fairscale fire blobfile torchdiffeq ' \
+ 'torchcfm transformers bitsandbytes accelerate')
 
 from src.simple_questions import (
     setup,
@@ -35,8 +36,19 @@ from data.transforms import GeneralSpectrumPreprocessor, ToTensor, Compose
 import numpy as np
 import torch.distributed as dist
 import gc
+import pandas as pd
 
 from src.llm_backend_config import LLMBackendConfig
+
+
+ # Data paths - use the same defaults from simple_questions.py
+JSON_PATH = '/home/ilay.kamai/work/TalkingLatents/data/dataset/stellar_descriptions_questions_short.json'
+JSON_PATH_LONG = '/home/ilay.kamai/work/TalkingLatents/data/dataset/stellar_descriptions_questions.json'
+ADVANCED_JSON_PATH = '/home/ilay.kamai/work/TalkingLatents/data/dataset/caption_advanced_100k.json'
+FEATURES_PATH = '/home/ilay.kamai/work/TalkingLatents/logs/2025-07-29/features.npy'  # Optional, can be None to load all features on-the-fly
+MULTIMODAL_PATH = '/home/ilay.kamai/work/TalkingLatents/logs/2025-07-29/multimodal_features.npy'
+MULTIMODAL_DF_PATH = '/home/ilay.kamai/work/TalkingLatents/logs/2025-07-29/info_full_multimodal.csv'
+FEATURES_PATH_V2 = '/home/ilay.kamai/work/TalkingLatents/logs/2025-12-16/tokens.npy' # different model
 
 
 def _normalize_backend(backend):
@@ -97,12 +109,9 @@ def parse_args(argv=None):
     """Parse command line arguments"""
     parser = argparse.ArgumentParser(description='Train CLIP Multimodal Stellar Model')
     
-    # Data paths - use the same defaults from simple_questions.py
-    JSON_PATH = '/home/ilay.kamai/work/TalkingLatents/data/dataset/stellar_descriptions_questions_short.json'
-    JSON_PATH_LONG = '/home/ilay.kamai/work/TalkingLatents/data/dataset/stellar_descriptions_questions.json'
-    ADVANCED_JSON_PATH = '/home/ilay.kamai/work/TalkingLatents/data/dataset/caption_advanced_100k.json'
-    FEATURES_PATH = '/home/ilay.kamai/work/TalkingLatents/logs/2025-07-29/features.npy'  # Optional, can be None to load all features on-the-fly
-    # FEATURES_PATH = '/home/ilay.kamai/work/TalkingLatents/logs/2025-12-16/tokens.npy' # different model
+    
+    parser.add_argument('--use_multimodal', action='store_true', default=False,
+                        help='Use multimodal dataframe features and data for follow-up turns')
     
     parser.add_argument('--json_file', type=str, default=JSON_PATH,
                        help='Path to stellar descriptions JSON file')
@@ -110,8 +119,12 @@ def parse_args(argv=None):
                        help='Path to advanced stellar questions JSON file')
     parser.add_argument('--single_dataset_type', type=str, choices=['regular', 'advanced'],
                        default='regular', help='Select which single-star dataset variant to load')
-    parser.add_argument('--features_file', type=str, default=FEATURES_PATH,
+    parser.add_argument('--features_file', type=str, default=None,
                        help='Path to spectral features numpy file')
+    parser.add_argument('--feature_stats_file', type=str, default=None,
+                       help='Path to feature statistics file (npz with mean/std) for on-the-fly normalization')
+    parser.add_argument('--pooling_type', type=str, choices=['mean', 'sum'], default='mean',
+                       help='Type of pooling for spectral features (mean/sum). Use "sum" for 2025-07-29 features, "mean" for 2025-12-16 tokens.')
     parser.add_argument('--output_dir', type=str, default='logs',
                        help='Output directory for logs and models')
     parser.add_argument('--exp_name', type=str, default='interpert',
@@ -154,6 +167,8 @@ def parse_args(argv=None):
                        help='Soft cap (in GB) per device when loading the Hugging Face model.')
     parser.add_argument('--hf_auth_token', type=str, default=os.environ.get('HF_TOKEN'),
                        help='Optional Hugging Face token for gated model downloads.')
+    parser.add_argument('--hf_attn_implementation', type=str, default=None,
+                       help='Hugging Face attention implementation (e.g., eager, flash_attention_2, sdpa)')
     parser.add_argument('--llm_precision', type=str, default='fp16', choices=['fp32','fp16','bf16'],
                        help='Precision to hold LLM weights on GPU (fp16 recommended on V100)')
     parser.add_argument('--spectral_embedding_dim', type=int, default=2048,
@@ -274,7 +289,21 @@ def parse_args(argv=None):
     parser.add_argument('--resume_path', type=str, default=None,
                         help='Path to a full training checkpoint (model+optimizer+scheduler+scaler) to resume')
     
-    return parser.parse_args(argv)
+    parser.add_argument('--v2', action='store_true', default=False,
+                        help='Use V2 features path')
+    
+    args = parser.parse_args(argv)
+    
+    # Handle conflicting flags: disable takes precedence
+    if args.disable_classification:
+        args.enable_classification = False
+        
+    # Handle V2 features override
+    if args.v2 and args.features_file:
+        print(f"Using V2 features path: {FEATURES_PATH_V2}")
+        args.features_file = FEATURES_PATH_V2
+        
+    return args
 
 
 def resolve_resume_directory(args):
@@ -541,22 +570,41 @@ def create_datasets_and_loaders(args, device, backend_config: LLMBackendConfig |
     
     # Only rank 0 loads spectral features to avoid OOM
     spectral_features = None
-    print(args.features_file)
-    if args.features_file and os.path.exists(args.features_file):
-        print(f"Loading spectral features from {args.features_file}")
-        spectral_features = np.load(args.features_file)
+
+    # Handle multimodal override
+    features_file = args.features_file
+    multimodal_df = None
+    if getattr(args, 'use_multimodal', False):
+        print("Using MULTIMODAL mode")
+        
+        features_file = MULTIMODAL_PATH
+        print(f"Loading multimodal dataframe from {MULTIMODAL_DF_PATH}")
+        if os.path.exists(MULTIMODAL_DF_PATH):
+            multimodal_df = pd.read_csv(MULTIMODAL_DF_PATH, index_col=0) # Assuming index is useful
+            # Ensure index is int if possible for obsid matching
+            try:
+                multimodal_df.index = multimodal_df.index.astype(int)
+            except:
+                pass
+        else:
+            print(f"Warning: Multimodal DF path {MULTIMODAL_DF_PATH} not found!")
+
+    print(features_file)
+    if features_file and os.path.exists(features_file):
+        print(f"Loading spectral features from {features_file}")
+        spectral_features = np.load(features_file)
         print(f"Spectral features shape: {spectral_features.shape}")
     else:
         print("No spectral features file provided or file not found. Will use raw spectra on-the-fly.")
     dataset_type = getattr(args, "single_dataset_type", "regular")
-    if dataset_type == "advanced":
-        single_dataset_cls = AdvancedStellarQuestionsDataset
-        single_json_file = getattr(args, "advanced_json_file", None) or args.json_file
-    else:
-        single_dataset_cls = StellarQuestionsDataset
-        single_json_file = args.json_file
+    # if dataset_type == "advanced":
+    #     single_dataset_cls = AdvancedStellarQuestionsDataset
+    #     single_json_file = getattr(args, "advanced_json_file", None) or args.json_file
+    # else:
+    single_dataset_cls = StellarQuestionsDataset
+    single_json_file = args.json_file
 
-    args.json_file = single_json_file
+    # args.json_file = single_json_file
 
     followup_kwargs = dict(
         enable_followup=getattr(args, 'enable_followup_augmentation', False),
@@ -591,101 +639,36 @@ def create_datasets_and_loaders(args, device, backend_config: LLMBackendConfig |
     cache_dir = cache_dir_base if rank == 0 else f"{cache_dir_base}_r{rank}"
     os.makedirs(cache_dir, exist_ok=True)
 
-    if hasattr(args, 'predict_features') and args.predict_features:
-        if args.mode != 'single_star':
-            raise ValueError("predict_features mode is only supported in single_star mode")
-    
-        if rank == 0:
-            print(f"Creating feature prediction dataloaders from {single_json_file}...")
-        
-        # Features array is required for feature prediction
-        if spectral_features is None:
-            raise ValueError("Feature prediction requires features_file to be provided")
-        
-        
-        train_loader, val_loader, test_loader = create_feature_prediction_dataloaders(
-            json_file=single_json_file,
-            features_array=spectral_features,
-            batch_size=args.batch_size,
-            train_ratio=args.train_ratio,
-            val_ratio=args.val_ratio,
-            test_ratio=args.test_ratio,
-            random_state=args.random_seed,
-            num_workers=args.num_workers // world_size if world_size > 1 else args.num_workers,
-            cache_dir=cache_dir,
-            world_size=world_size,
-            device=str(device),
-            tokenizer_path=tokenizer_path,
-            tokenizer=tokenizer_adapter,
-            max_length=args.max_seq_length,
-            num_spectral_features=args.num_spectral_features,
-            random_pairing=random_pairing,
-            enable_followup=followup_kwargs['enable_followup'],
-            followup_prob=followup_kwargs['followup_prob'],
-            max_followup_turns=followup_kwargs['max_followup_turns'],
-            followup_seed=followup_kwargs['followup_seed'],
-            followup_json_file=followup_kwargs['followup_json_file']
+            
+    if rank == 0:
+        print(f"Creating {dataset_type} single-star datasets from {single_json_file}...")
 
-            
-        )
-    else:
-    
-        if args.mode == "two_star":
-            if rank == 0:
-                print(f"Creating two-star comparative datasets from {args.comparative_json_file}...")
-            
-            train_loader, val_loader, test_loader = create_comparative_dataloaders(
-                json_file=args.comparative_json_file,
-                features_array=spectral_features,
-                batch_size=args.batch_size,
-                train_ratio=args.train_ratio,
-                val_ratio=args.val_ratio,
-                test_ratio=args.test_ratio,
-                random_state=args.random_seed,
-                num_workers=args.num_workers // world_size if world_size > 1 else args.num_workers,
-                cache_dir=cache_dir,
-                tokenizer_path=tokenizer_path,
-                tokenizer=tokenizer_adapter,
-                max_length=args.max_seq_length,
-                num_spectral_features=args.num_spectral_features,
-                world_size=world_size,
-                device=str(local_rank),
-            )
-            
-        elif args.mode == "combined":
-            raise NotImplementedError('combined dataset no longer implemented!')
-
-        else:
-            # Check if we should create feature prediction dataloaders
-            
-            if rank == 0:
-                print(f"Creating {dataset_type} single-star datasets from {single_json_file}...")
-
-            train_loader, val_loader, test_loader = create_stellar_dataloaders(
-                json_file=single_json_file,
-                features_array=spectral_features,
-                spectral_transforms=transf,
-                train_ratio=args.train_ratio,
-                val_ratio=args.val_ratio,
-                test_ratio=args.test_ratio,
-                random_state=args.random_seed,
-                num_spectral_features=args.num_spectral_features,
-                cache_dir=cache_dir,
-                tokenizer_path=tokenizer_path,
-                tokenizer=tokenizer_adapter,
-                tokenizer_backend=tokenizer_backend,
-                max_length=args.max_seq_length,
-                batch_size=args.batch_size,
-                num_workers=args.num_workers // world_size if world_size > 1 else args.num_workers,
-                world_size=world_size,
-                device=device,
-                dataset_cls=single_dataset_cls,
-                enable_followup=followup_kwargs['enable_followup'],
-                followup_prob=followup_kwargs['followup_prob'],
-                max_followup_turns=followup_kwargs['max_followup_turns'],
-                followup_seed=followup_kwargs['followup_seed'],
-                followup_json_file=followup_kwargs['followup_json_file']
-                )
+    train_loader, val_loader, test_loader = create_stellar_dataloaders(
+        json_file=single_json_file,
+        features_array=spectral_features,
+        spectral_transforms=transf,
+        train_ratio=args.train_ratio,
+        val_ratio=args.val_ratio,
+        test_ratio=args.test_ratio,
+        random_state=args.random_seed,
+        num_spectral_features=args.num_spectral_features,
+        cache_dir=cache_dir,
+        tokenizer_path=tokenizer_path,
+        tokenizer=tokenizer_adapter,
+        tokenizer_backend=tokenizer_backend,
+        max_length=args.max_seq_length,
+        batch_size=args.batch_size,
+        num_workers=args.num_workers // world_size if world_size > 1 else args.num_workers,
+        world_size=world_size,
+        device=device,
+        dataset_cls=single_dataset_cls,
+        enable_followup=followup_kwargs['enable_followup'],
+        followup_prob=followup_kwargs['followup_prob'],
+        max_followup_turns=followup_kwargs['max_followup_turns'],
+        followup_seed=followup_kwargs['followup_seed'],
+        followup_json_file=followup_kwargs['followup_json_file'],
+        multimodal_df=multimodal_df
+    )
 
     # # Synchronize all processes after dataset creation
     # if dist.is_initialized():
@@ -698,12 +681,17 @@ def create_datasets_and_loaders(args, device, backend_config: LLMBackendConfig |
     return train_loader, val_loader, test_loader
 
 
-def build_model_multitok(args, device, world_size=1, backend_config: LLMBackendConfig | None = None):
-
-    print("loading fm model...")
-    fm = None if (args.features_file and args.features_file != 'None') else _load_spectra_model()
+def build_model_multitok(args, local_rank, world_size=1, backend_config: LLMBackendConfig | None = None, feature_stats: Optional[Dict[str, Any]] = None):
+    """Build the multimodal model with components"""
+    pooling_type = getattr(args, 'pooling_type', 'mean')
+    if args.use_multimodal:
+        print("multimodal setting. Instead of explicit fm model, using features_file")
+        fm = None
+    else:
+        print("loading fm model...")
+        fm = None if (args.features_file and args.features_file != 'None') else _load_spectra_model(args)
     if fm is not None:
-        fm = fm.to(device)
+        fm = fm.to(local_rank)
     
     backend_config = backend_config or ensure_backend_config(args)
     backend = _normalize_backend(backend_config.backend)
@@ -738,7 +726,7 @@ def build_model_multitok(args, device, world_size=1, backend_config: LLMBackendC
         print("Warning: Disabling gradient checkpointing for multi-GPU training to avoid DDP conflicts")
 
     if not is_hf_backend:
-        llm = llm.to(device)
+        llm = llm.to(local_rank)
 
     enable_cls = getattr(args, 'enable_classification', False)
     model_cls = MultimodalLlamaModelMultiTokens if not is_hf_backend else HuggingFaceMultimodalModel
@@ -762,6 +750,8 @@ def build_model_multitok(args, device, world_size=1, backend_config: LLMBackendC
         predict_features=args.predict_features,
         feature_dim=args.feature_dim,
         feature_loss_weight=args.feature_loss_weight,
+        feature_stats=feature_stats,
+        pooling_type=pooling_type,
     )
 
     def _move_auxiliary_modules(mod: torch.nn.Module, target_device: torch.device) -> None:
@@ -784,15 +774,62 @@ def build_model_multitok(args, device, world_size=1, backend_config: LLMBackendC
             (hf_device_map is not None and str(hf_device_map).lower() not in {'', 'none', 'cpu'})
         )
         if requires_manual_placement:
-            _move_auxiliary_modules(model, device)
-            print(f"Keeping HF backbone on its device map; moved auxiliary heads to {device}.")
+            _move_auxiliary_modules(model, local_rank)
+            print(f"Keeping HF backbone on its device map; moved auxiliary heads to {local_rank}.")
         else:
-            model = model.to(device)
+            model = model.to(local_rank)
     else:
-        model = model.to(device)
+        model = model.to(local_rank)
     
     # Note: stellar predictor, stellar transformer, and feature predictor will be set to FP32 after DDP wrapping
     return model
+
+
+def _apply_lora_with_regex(model, lora_config, local_rank=0):
+    if local_rank == 0:
+        print("Applying LoRA layers (pre-DDP/optimizer)...")
+        
+    # Get supported linear layer types
+    try:
+        from fairscale.nn.model_parallel.layers import RowParallelLinear, ColumnParallelLinear
+        linear_types = (torch.nn.Linear, RowParallelLinear, ColumnParallelLinear)
+    except ImportError:
+        linear_types = (torch.nn.Linear,)
+
+    # Identify all linear modules
+    all_modules = []
+    for name, module in model.named_modules():
+        if isinstance(module, linear_types):
+            all_modules.append(name)
+
+    # Resolve wildcards
+    target_modules = []
+    import re
+    patterns = lora_config.get('lora_target_modules', [])
+    
+    for pattern in patterns:
+        if '*' in pattern:
+            pattern_regex = pattern.replace('.', r'\.').replace('*', r'[^.]+')
+            pattern_regex = f"^{pattern_regex}$"
+            for name in all_modules:
+                if re.match(pattern_regex, name):
+                    target_modules.append(name)
+        else:
+            if pattern in all_modules:
+                target_modules.append(pattern)
+
+    # Apply LoRA
+    from nn.lora import apply_lora_to_model
+    applied = apply_lora_to_model(
+        model,
+        target_modules,
+        rank=lora_config.get('lora_rank', 16),
+        alpha=lora_config.get('lora_alpha', 16.0),
+        dropout=lora_config.get('lora_dropout', 0.1)
+    )
+    if local_rank == 0:
+        print(f"Pre-applied LoRA to {len(applied)} modules")
+    return applied
 
 
 def main():
@@ -844,6 +881,50 @@ def main():
 
     print("Creating datasets and dataloaders...")
     train_loader, val_loader, test_loader = create_datasets_and_loaders(args, local_rank, backend_config)
+
+    # Extract feature statistics for normalization
+    feature_stats = None
+    if local_rank == 0:
+        # 1. Try to get stats from dataset (if features_file was provided, this is already populated)
+        feature_stats = train_loader.dataset.get_feature_normalization_stats()
+        
+        # 2. If not in dataset (i.e. using on-the-fly), try loading from stats file
+        if feature_stats is None and args.feature_stats_file:
+            print(f"Loading feature stats from {args.feature_stats_file}")
+            try:
+                stats = np.load(args.feature_stats_file)
+                feature_stats = {
+                    'mean': stats['mean'],
+                    'std': stats['std']
+                }
+                print("✓ Loaded feature stats from file")
+            except Exception as e:
+                print(f"Error loading feature stats file: {e}")
+        
+        # 3. If likely needed but missing, print warning (computation is complex due to fm_model dependency)
+        if feature_stats is None and args.features_file is None:
+             print("Warning: No feature stats found for on-the-fly generation. Features will NOT be normalized.")
+             # NOTE: Implementing full on-the-fly computation here is tricky because fm_model is not loaded yet.
+             # Ideally one would load fm_model, run a pass on train_loader, compute stats, and then build full model.
+             # For now, we rely on the user providing a stats file if they want normalization.
+    
+    # Broadcast stats to other ranks if needed (simple approximation for now: just pass None on non-zero ranks
+    # or rely on model doing its own things. But properly we should broadcast. 
+    # For now, build_model_multitok runs on all ranks, so all ranks need the stats.
+    # However, create_datasets_and_loaders logic for stats is cleaner on rank 0.
+    # Let's simple pass feature_stats to build_model_multitok and let it handle distribution or just pass on all ranks if available.
+    # Since dataset is created on all ranks (with different samplers), train_loader.dataset should have access to stats
+    # IF features_loader was used. If features_loader was NOT used, then train_loader.dataset.get_feature_normalization_stats() is None.
+    # So if we loaded from file on rank 0, we might need to broadcast or just load on all ranks.
+    # Given args are same, all ranks can load from args.feature_stats_file.
+    
+    if feature_stats is None and args.feature_stats_file and os.path.exists(args.feature_stats_file):
+         # Redundant load for all ranks if not already handled
+         try:
+             stats = np.load(args.feature_stats_file)
+             feature_stats = {'mean': stats['mean'], 'std': stats['std']}
+         except: pass
+
     
     # Clear memory after dataset creation
     gc.collect()
@@ -858,7 +939,7 @@ def main():
         tokenizer = train_loader.dataset.tokenizer
 
     print("Creating multitoken multimodal model...")
-    model = build_model_multitok(args, local_rank, world_size, backend_config)
+    model = build_model_multitok(args, local_rank, world_size, backend_config, feature_stats=feature_stats)
 
     # Clear memory after model creation
     gc.collect()
@@ -889,6 +970,35 @@ def main():
         torch.cuda.empty_cache()
         
     print_detailed_memory()
+
+    # Freeze large submodules BEFORE wrapping with DDP...
+    # (already done above)
+    
+    # Load tuned LoRA config (attention-only by default)
+    # Moved here to apply LoRA BEFORE DDP wrapping
+    tuned_cfg_path = os.path.join(ROOT_DIR, 'src', 'llm_config_tuned.json')
+    if os.path.isfile(tuned_cfg_path):
+        with open(tuned_cfg_path, 'r') as f:
+            tuned_cfg = json.load(f)
+        lora_params = tuned_cfg.get('lora_params', {})
+    else:
+        # Fallback to base config if tuned not found
+        base_cfg_path = os.path.join(ROOT_DIR, 'src', 'llm_config.json')
+        with open(base_cfg_path, 'r') as f:
+            base_cfg = json.load(f)
+        lora_params = base_cfg.get('lora_params', {})
+
+    # Apply LoRA before DDP wrapping if enabled
+    if lora_params and lora_params.get('freeze_strategy') == 'lora':
+         print(f"Applying LoRA at init (start_epoch={lora_params.get('lora_start_epoch')}) to ensure parameter tracking.")
+         _ = _apply_lora_with_regex(model, lora_params, local_rank)
+             
+    # Clear memory after LoRA application
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+
+    print("fm model in final model: ", model.fm_model)
 
     if world_size > 1:
         print(f"Wrapping with DDP (world_size={world_size})")
@@ -921,21 +1031,19 @@ def main():
     # Note: Classification head remains in model precision (FP16/BF16) for memory efficiency
     if hasattr(base_model, 'classification_head') and base_model.classification_head is not None:
         print("✓ Classification head using model precision for memory efficiency")
+        
+    # Ensure projectors are in float32 for stability if they exist
+    for proj_name in ['projector', 'projector_a', 'projector_b']:
+        if hasattr(base_model, proj_name) and getattr(base_model, proj_name) is not None:
+            mod = getattr(base_model, proj_name)
+            mod.float()
+            # for p in mod.parameters():
+            #     p.requires_grad = True
+            print(f"✓ {proj_name} set to float32")
 
     print("Preparing trainer configuration...")
-    # Load tuned LoRA config (attention-only by default)
-    tuned_cfg_path = os.path.join(ROOT_DIR, 'src', 'llm_config_tuned.json')
-    if os.path.isfile(tuned_cfg_path):
-        with open(tuned_cfg_path, 'r') as f:
-            tuned_cfg = json.load(f)
-        lora_params = tuned_cfg.get('lora_params', {})
-    else:
-        # Fallback to base config if tuned not found
-        base_cfg_path = os.path.join(ROOT_DIR, 'src', 'llm_config.json')
-        with open(base_cfg_path, 'r') as f:
-            base_cfg = json.load(f)
-        lora_params = base_cfg.get('lora_params', {})
-
+    # LoRA params already loaded above
+    
     optimizer, scheduler, scaler, trainer, start_epoch, initial_min_loss, initial_best_acc = prepare_training_with_resume(
         args=args,
         model=model,

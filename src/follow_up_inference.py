@@ -23,6 +23,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
+import pandas as pd
 import numpy as np
 import torch
 from tqdm import tqdm
@@ -258,7 +259,18 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument('--steering_concept_file', type=str, default=None, help='Path to concept directions (.pt)')
     parser.add_argument('--steering_alphas', type=str, default='0', help='Comma-sep alphas (e.g. -5,0,5)')
     
+    parser.add_argument('--v2', action='store_true', default=False,
+                        help='Use V2 features path')
+    parser.add_argument('--use_multimodal', action='store_true', default=False,
+                        help='Use multimodal dataframe features')
+
     return parser.parse_args()
+
+
+# Constants for features
+FEATURES_PATH_V2 = '/home/ilay.kamai/work/TalkingLatents/logs/2025-12-16/features.npy'
+MULTIMODAL_PATH = '/home/ilay.kamai/work/TalkingLatents/logs/2025-07-29/multimodal_features.npy'
+MULTIMODAL_DF_PATH = '/home/ilay.kamai/work/TalkingLatents/logs/2025-07-29/info_full_multimodal.csv'
 
 
 def load_config_from_checkpoint_dir(checkpoint_path: str) -> Dict[str, Any]:
@@ -286,7 +298,8 @@ def create_args_from_config(config: Dict[str, Any], inference_args: argparse.Nam
     override_keys = [
         'llm_backend', 'hf_model_name', 'hf_revision', 'hf_trust_remote_code',
         'hf_device_map', 'hf_quantization', 'hf_cache_dir', 'hf_max_memory_gb',
-        'hf_auth_token', 'llm_precision', 'gradient_checkpointing'
+        'hf_auth_token', 'llm_precision', 'gradient_checkpointing',
+        'use_multimodal'
     ]
     for key in override_keys:
         cli_value = getattr(inference_args, key, None)
@@ -308,7 +321,22 @@ def load_model(checkpoint_path: str,
     backend_config = ensure_backend_config(args)
 
     if model is None:
-        model = build_model_multitok(args, device, world_size=1, backend_config=backend_config)
+        # Load feature stats if provided (critical for normalization)
+        feature_stats = None
+        norm_stats_file = getattr(args, 'norm_stats_file', None)
+        if norm_stats_file and os.path.exists(norm_stats_file):
+            print(f"Loading feature stats from {norm_stats_file}")
+            try:
+                stats = np.load(norm_stats_file)
+                feature_stats = {
+                    'mean': stats['mean'],
+                    'std': stats['std']
+                }
+                print("✓ Loaded feature stats")
+            except Exception as e:
+                print(f"Error loading stats file: {e}")
+
+        model = build_model_multitok(args, device, world_size=1, backend_config=backend_config, feature_stats=feature_stats)
     else:
         model.to(device)
 
@@ -1051,6 +1079,28 @@ def main():
         config = load_config_from_checkpoint_dir(cli_args.checkpoint_path)
 
     args = create_args_from_config(config, cli_args)
+    
+    # Handle overrides
+    if cli_args.v2:
+        print(f"Using V2 features path: {FEATURES_PATH_V2}")
+        args.features_file = FEATURES_PATH_V2
+        
+    if getattr(args, 'use_multimodal', False):
+        print("Using MULTIMODAL mode")
+        args.features_file = MULTIMODAL_PATH
+        
+    multimodal_df = None
+    if getattr(args, 'use_multimodal', False):
+        print(f"Loading multimodal dataframe from {MULTIMODAL_DF_PATH}")
+        if os.path.exists(MULTIMODAL_DF_PATH):
+            multimodal_df = pd.read_csv(MULTIMODAL_DF_PATH, index_col=0)
+            try:
+                multimodal_df.index = multimodal_df.index.astype(int)
+            except:
+                pass
+        else:
+            print(f"Warning: Multimodal DF path {MULTIMODAL_DF_PATH} not found!")
+
     device, _, _ = setup()
     print(f"Using device: {device}")
 
@@ -1121,7 +1171,8 @@ def main():
             tokenizer_path=tokenizer_path,
             tokenizer_backend=tokenizer_backend,
             tokenizer=tokenizer,
-            num_spectral_features=getattr(args, 'num_spectral_features', 4)
+            num_spectral_features=getattr(args, 'num_spectral_features', 4),
+            multimodal_df=multimodal_df
         )
         if test_loader is not None and hasattr(test_loader, "dataset"):
             setattr(test_loader.dataset, "backend_config", backend_config)
@@ -1157,6 +1208,7 @@ def main():
             device=device,
             enable_followup=False, # We do inference manually
             num_spectral_features=getattr(args, 'num_spectral_features', 4),
+            multimodal_df=multimodal_df
         )
         # Ensure backend config attached
         if test_loader is not None and hasattr(test_loader, "dataset"):
@@ -1246,7 +1298,6 @@ def main():
                  concept_vec = concept_vec.to(device)
                  # v_norm = v / sigma logic
                  v_norm_space = concept_vec / sigma
-            
             for alpha in alphas:
                  print(concept_name, alpha)
                  # Initialize sample entries for this alpha group

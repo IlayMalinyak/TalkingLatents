@@ -14,6 +14,7 @@ from collections import defaultdict
 import seaborn as sns
 import os
 import sys
+import math
 ROOT_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.append(ROOT_DIR)
 from src.snr_lookup import load_snr_lookup
@@ -489,6 +490,7 @@ def analyze_followup_stellar_type(
 
         # Process each sample
         for idx ,sample in enumerate(samples):
+            # print(f"\nProcessing sample {idx}")
             # Handle both old format (followup_qa) and new format (follow_up_answers)
             followup_qa = sample.get('followup_qa', sample.get('follow_up_answers', []))
             
@@ -509,6 +511,7 @@ def analyze_followup_stellar_type(
             original_answer = sample.get('model_answer', '')
             
             for idx, qa in enumerate(followup_qa):
+                pred_L = None
                 # Only look at stellar type questions OR luminosity/mass
                 question = qa.get('question', '')
                 q_type = qa.get('type', '')
@@ -520,7 +523,7 @@ def analyze_followup_stellar_type(
 
                 # Check if this is a stellar type question (not just any "type" question)
                 is_stellar_type_q = 'type' in q_type.lower()
-                print(idx, " type: ", q_type, is_stellar_type_q)
+                # print(idx, " type: ", q_type, is_stellar_type_q)
 
                 if not is_stellar_type_q:
                     # Check for Lstar/Mstar questions
@@ -632,9 +635,11 @@ def analyze_followup_stellar_type(
 
                 # Collect parameter data for scatter plots
                 if stellar_params.get('Teff') is not None and extracted_params['Teff'] is not None:
-                    param_data['true_Teff'].append(stellar_params['Teff'])
-                    param_data['pred_Teff'].append(extracted_params['Teff'])
-                    param_data['snr_Teff'].append(snr)
+                    # print("teff: ", extracted_params['Teff'], "true: ", stellar_params['Teff'])
+                    if extracted_params['Teff'] > 1000: # remove invalid values
+                        param_data['true_Teff'].append(stellar_params['Teff'])
+                        param_data['pred_Teff'].append(extracted_params['Teff'])
+                        param_data['snr_Teff'].append(snr)
                 if stellar_params.get('logg') is not None and extracted_params['logg'] is not None:
                     param_data['true_logg'].append(stellar_params['logg'])
                     param_data['pred_logg'].append(extracted_params['logg'])
@@ -649,12 +654,12 @@ def analyze_followup_stellar_type(
                     pred_L = extract_value_from_text(generated, unit='Lsun')
                     true_L = qa.get('true_value')
                     if true_L is not None and pred_L is not None:
-                        # Linear vs Linear Comparison (as requested)
-                        # Linear vs Linear Comparison (as requested)
-                        import math # Keep import just in case, but unused for linear compare
-                        param_data['true_Lstar'].append(float(true_L))
-                        param_data['pred_Lstar'].append(pred_L)
-                        param_data['snr_Lstar'].append(snr)
+                        if pred_L < 1000:
+                            # Linear vs Linear Comparison (as requested)
+                            # Linear vs Linear Comparison (as requested)
+                            param_data['true_Lstar'].append(float(true_L))
+                            param_data['pred_Lstar'].append(pred_L)
+                            param_data['snr_Lstar'].append(snr)
                         
                         stats['lum_valid_responses'] += 1
                         
@@ -677,15 +682,18 @@ def analyze_followup_stellar_type(
                 # Expected full subclass (normalize to uppercase)
                 expected_subclass = subclass.upper() if subclass and isinstance(subclass, str) else None
 
-                print(f"==========={idx}==========")
-                print(f"Generated: {generated}")
-                print(f"Generated evol type: {generated_evol_type}")
-                print(f"Generated spectral: {generated_spectral}")
-                print(f"Generated subclass: {generated_subclass}")
-                print(f"Expected: {expected}")
-                print(f"Expected evol type: {expected_evol_class}")
-                print(f"Expected spectral: {expected_spectral}")
-                print(f"Expected subclass: {expected_subclass}")
+                if pred_L is not None and pred_L > 1000:
+                    print(f"==========={idx}==========")
+                    print(f"Generated: {generated}")
+                    print(f"Generated evol type: {generated_evol_type}")
+                    print(f"Generated spectral: {generated_spectral}")
+                    print(f"Generated subclass: {generated_subclass}")
+                    print(f"Expected: {expected}")
+                    print(f"Expected evol type: {expected_evol_class}")
+                    print(f"Expected spectral: {expected_spectral}")
+                    print(f"Expected subclass: {expected_subclass}")
+                    print("extracted Lsun: ", pred_L)
+                    print("true Lsun: ", true_L)
 
                 # Check matches at three levels
                 # Level 1 (High): Evolutionary class (dwarf/giant/etc)
@@ -782,23 +790,23 @@ def analyze_followup_stellar_type(
         experiment_examples[exp_name] = examples
 
         # Print summary
-        print(f"\nStellar Type Questions: {stats['total_stellar_type_questions']}")
-        print(f"Valid Responses: {stats['valid_responses']} ({valid_rate:.1f}%)")
-        print(f"Invalid/Gibberish Responses: {stats['invalid_responses']}")
-        print(f"Overall Correct Matches (any level): {stats['correct_matches']}")
-        print(f"Incorrect Matches: {stats['incorrect_matches']}")
-        print(f"Extraction Failures: {stats['extraction_failures']}")
-        print(f"Overall Accuracy (of valid responses): {accuracy:.1f}%")
-        print(f"\nThree-Level Breakdown:")
-        print(f"  High-Level (Evol. Class - dwarf/giant/etc.): {stats['evol_class_correct']}/{stats['total_stellar_type_questions']} ({evol_acc:.1f}%)")
-        print(f"  Mid-Level (Spectral Letter - G/F/K/etc.): {stats['spectral_letter_correct']}/{stats['total_stellar_type_questions']} ({spectral_acc:.1f}%)")
-        print(f"  Mid-Level (Spectral Letter - G/F/K/etc.): {stats['spectral_letter_correct']}/{stats['total_stellar_type_questions']} ({spectral_acc:.1f}%)")
-        print(f"  Fine-Grained (Full Subclass - G3/F0/K2/etc.): {stats['full_subclass_correct']}/{stats['total_stellar_type_questions']} ({subclass_acc:.1f}%)")
+        # print(f"\nStellar Type Questions: {stats['total_stellar_type_questions']}")
+        # print(f"Valid Responses: {stats['valid_responses']} ({valid_rate:.1f}%)")
+        # print(f"Invalid/Gibberish Responses: {stats['invalid_responses']}")
+        # print(f"Overall Correct Matches (any level): {stats['correct_matches']}")
+        # print(f"Incorrect Matches: {stats['incorrect_matches']}")
+        # print(f"Extraction Failures: {stats['extraction_failures']}")
+        # print(f"Overall Accuracy (of valid responses): {accuracy:.1f}%")
+        # print(f"\nThree-Level Breakdown:")
+        # print(f"  High-Level (Evol. Class - dwarf/giant/etc.): {stats['evol_class_correct']}/{stats['total_stellar_type_questions']} ({evol_acc:.1f}%)")
+        # print(f"  Mid-Level (Spectral Letter - G/F/K/etc.): {stats['spectral_letter_correct']}/{stats['total_stellar_type_questions']} ({spectral_acc:.1f}%)")
+        # print(f"  Mid-Level (Spectral Letter - G/F/K/etc.): {stats['spectral_letter_correct']}/{stats['total_stellar_type_questions']} ({spectral_acc:.1f}%)")
+        # print(f"  Fine-Grained (Full Subclass - G3/F0/K2/etc.): {stats['full_subclass_correct']}/{stats['total_stellar_type_questions']} ({subclass_acc:.1f}%)")
         
-        print(f"\nLuminosity Questions: {stats['luminosity_questions']}")
-        print(f"  Valid Extraction: {stats['lum_valid_responses']}")
-        print(f"Mass Questions: {stats['mass_questions']}")
-        print(f"  Valid Extraction: {stats['mass_valid_responses']}")
+        # print(f"\nLuminosity Questions: {stats['luminosity_questions']}")
+        # print(f"  Valid Extraction: {stats['lum_valid_responses']}")
+        # print(f"Mass Questions: {stats['mass_questions']}")
+        # print(f"  Valid Extraction: {stats['mass_valid_responses']}")
 
     # Create plots
     create_followup_plots(experiment_stats, experiment_examples, param_data, output_dir)

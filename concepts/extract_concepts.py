@@ -7,6 +7,7 @@ import argparse
 from tqdm import tqdm
 import yaml
 from pathlib import Path
+import pandas as pd
 
 # Add root directory to path to allow imports
 ROOT_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -21,6 +22,7 @@ def get_args():
     parser = argparse.ArgumentParser(description="Extract concept directions")
     parser.add_argument("--json_file", type=str, default='/home/ilay.kamai/work/TalkingLatents/data/dataset/stellar_descriptions_questions_short.json')
     parser.add_argument("--features_file", type=str, default='/home/ilay.kamai/work/TalkingLatents/logs/2025-07-29/features.npy')
+    parser.add_argument("--info_file", type=str, default='/home/ilay.kamai/work/TalkingLatents/logs/2025-07-29/info_full.csv', help="Path to info_full.csv for Age/Mass data")
     parser.add_argument("--batch_size", type=int, default=32)
     parser.add_argument("--output_dir", type=str, default='/home/ilay.kamai/work/TalkingLatents/concepts')
     parser.add_argument("--tokenizer_path", type=str, default="/home/ilay.kamai/work/.llama/Llama3.1-8B/tokenizer.model")
@@ -46,12 +48,13 @@ def is_dwarf(teff, logg):
 
 def extract_from_loader(model, loader, device, name="Split"):
     """
-    Extracts latents and parameters from a dataloader.
+    Extracts latents, parameters, and OBSIDs from a dataloader.
     Returns clean tensors (NaNs removed).
     """
     print(f"Extracting latents from {name}...")
     all_latents = []
     all_params = [] 
+    all_obsids = []
     
     with torch.no_grad():
         for batch in tqdm(loader, desc=name):
@@ -69,9 +72,13 @@ def extract_from_loader(model, loader, device, name="Split"):
             # Save cpu tensor
             all_latents.append(x_enc.cpu())
             all_params.append(batch['y_numeric'])
+            
+            # Extract ObsIDs
+            if 'obsids' in batch:
+                all_obsids.extend(batch['obsids'])
 
     if not all_latents:
-         return torch.empty(0), torch.empty(0)
+         return torch.empty(0), torch.empty(0), []
 
     latents = torch.cat(all_latents, dim=0)
     params = torch.cat(all_params, dim=0)
@@ -81,14 +88,233 @@ def extract_from_loader(model, loader, device, name="Split"):
     latents = latents[valid_mask]
     params = params[valid_mask]
     
+    # Filter obsids
+    valid_indices = torch.nonzero(valid_mask).squeeze().tolist()
+    # Handle single element or empty case
+    if isinstance(valid_indices, int): valid_indices = [valid_indices]
+    
+    final_obsids = [all_obsids[i] for i in valid_indices]
+    
     print(f"  [{name}] Extracted {latents.shape[0]} valid samples.")
-    return latents, params
+    return latents, params, final_obsids
 
-def compute_directions(latents, params, numeric_bounds):
+def compute_mass_concept(latents, obsids, info_df):
+    """
+    Computes Mass concept direction controlling for Age and FeH.
+    """
+    print("Computing Mass Concept (Stratified)...")
+    
+    # Match latents with info_df using obsids
+    # Create DataFrame for current latents
+    latent_df = pd.DataFrame({'obsid': obsids})
+    # Ensure obsid types match (int vs float vs str)
+    # info_df usually has int or float obsid. latent_df has whatever was in metadata.
+    # Let's try to align types.
+    try:
+        latent_df['obsid'] = latent_df['obsid'].astype(int)
+        info_df['obsid'] = info_df['obsid'].astype(int) 
+    except:
+        pass
+    
+    # Drop duplicates in info_df to prevent expanding rows
+    info_df = info_df.drop_duplicates(subset='obsid')
+        
+    merged = latent_df.merge(info_df, on='obsid', how='left')
+    
+    # Check for missing data
+    # We need Age, Mstar, FeH
+    # Mstar might be named differently
+    cols = {'Age': 'Age', 'Mstar': 'Mstar', 'FeH': 'FeH'}
+    for k, v in cols.items():
+        if v not in merged.columns and k.lower() in merged.columns:
+            cols[k] = k.lower() # fallback to lowercase
+            
+    # Filter valid
+    valid_idx = merged.dropna(subset=cols.values()).index
+    
+    if len(valid_idx) < 100:
+        print("  Not enough data with matching Age/Mass/FeH for Mass Concept.")
+        return None
+        
+    df_clean = merged.loc[valid_idx].reset_index(drop=True)
+    # Filter latents
+    clean_latents = latents[torch.tensor(valid_idx.values)]
+    
+    # Binning
+    age_col = cols['Age']
+    mass_col = cols['Mstar']
+    feh_col = cols['FeH']
+    
+    # Filter bad values
+    mask_good = (df_clean[age_col] > 0) & (df_clean[mass_col] > 0)
+    df_clean = df_clean[mask_good]
+    # Update latents again
+    # We need to be careful with indexing.
+    # Let's align boolean mask
+    clean_latents = clean_latents[torch.tensor(mask_good.values)]
+    
+    age_min, age_max = df_clean[age_col].min(), df_clean[age_col].max()
+    feh_min, feh_max = df_clean[feh_col].min(), df_clean[feh_col].max()
+    
+    # Age bins: 1 Gyr width
+    age_bins = np.arange(np.floor(age_min), np.ceil(age_max) + 1.0, 1.0)
+    # FeH bins: 0.2 dex width
+    feh_bins = np.arange(np.floor(feh_min*5)/5, np.ceil(feh_max*5)/5 + 0.2, 0.2)
+    
+    concept_vectors = []
+    total_weight = 0
+    stats = []
+    MIN_SAMPLES = 5
+    
+    for i in range(len(age_bins)-1):
+        for j in range(len(feh_bins)-1):
+            a_low, a_high = age_bins[i], age_bins[i+1]
+            f_low, f_high = feh_bins[j], feh_bins[j+1]
+            
+            mask_bin = (
+                (df_clean[age_col] >= a_low) & (df_clean[age_col] < a_high) &
+                (df_clean[feh_col] >= f_low) & (df_clean[feh_col] < f_high)
+            )
+            
+            if mask_bin.sum() < MIN_SAMPLES * 2:
+                continue
+            
+            bin_latents = clean_latents[torch.tensor(mask_bin.values)]
+            bin_masses = df_clean.loc[mask_bin, mass_col].values
+            
+            q25 = np.percentile(bin_masses, 25)
+            q75 = np.percentile(bin_masses, 75)
+            
+            mask_low = bin_masses <= q25
+            mask_high = bin_masses >= q75
+            
+            n_low = mask_low.sum()
+            n_high = mask_high.sum()
+            
+            if n_low >= MIN_SAMPLES and n_high >= MIN_SAMPLES:
+                vec_low = bin_latents[mask_low].mean(dim=0)
+                vec_high = bin_latents[mask_high].mean(dim=0)
+                
+                # High Mass - Low Mass
+                diff = vec_high - vec_low
+                weight = n_low + n_high
+                
+                concept_vectors.append(diff * weight)
+                total_weight += weight
+                
+                stats.append({'n_samples': weight})
+                
+    if total_weight == 0:
+        print("  Failed to compute Mass concept: No sufficient bins.")
+        return None
+        
+    final_concept = torch.stack(concept_vectors).sum(dim=0) / total_weight
+    print(f"  Computed Mass Concept from {len(stats)} bins (N={total_weight})")
+    return final_concept
+
+def compute_age_concept(latents, obsids, info_df):
+    """
+    Computes Age concept direction controlling for Mass and FeH.
+    """
+    print("Computing Age Concept (Stratified)...")
+    
+    # Match latents with info_df using obsids
+    latent_df = pd.DataFrame({'obsid': obsids})
+    try:
+        latent_df['obsid'] = latent_df['obsid'].astype(int)
+        info_df['obsid'] = info_df['obsid'].astype(int) 
+    except:
+        pass
+    
+    info_df = info_df.drop_duplicates(subset='obsid')
+    merged = latent_df.merge(info_df, on='obsid', how='left')
+    
+    cols = {'Age': 'Age', 'Mstar': 'Mstar', 'FeH': 'FeH'}
+    for k, v in cols.items():
+        if v not in merged.columns and k.lower() in merged.columns:
+            cols[k] = k.lower()
+            
+    valid_idx = merged.dropna(subset=cols.values()).index
+    
+    if len(valid_idx) < 100:
+        print("  Not enough data with matching Age/Mass/FeH for Age Concept.")
+        return None
+        
+    df_clean = merged.loc[valid_idx].reset_index(drop=True)
+    clean_latents = latents[torch.tensor(valid_idx.values)]
+    
+    age_col = cols['Age']
+    mass_col = cols['Mstar']
+    feh_col = cols['FeH']
+    
+    mask_good = (df_clean[age_col] > 0) & (df_clean[mass_col] > 0)
+    df_clean = df_clean[mask_good]
+    clean_latents = clean_latents[torch.tensor(mask_good.values)]
+    
+    mass_min, mass_max = df_clean[mass_col].min(), df_clean[mass_col].max()
+    feh_min, feh_max = df_clean[feh_col].min(), df_clean[feh_col].max()
+    
+    # Mass bins: 0.1 Msun width
+    mass_bins = np.arange(np.floor(mass_min*10)/10, np.ceil(mass_max*10)/10 + 0.1, 0.1)
+    # FeH bins: 0.2 dex width
+    feh_bins = np.arange(np.floor(feh_min*5)/5, np.ceil(feh_max*5)/5 + 0.2, 0.2)
+    
+    concept_vectors = []
+    total_weight = 0
+    stats = []
+    MIN_SAMPLES = 5
+    
+    for i in range(len(mass_bins)-1):
+        for j in range(len(feh_bins)-1):
+            m_low, m_high = mass_bins[i], mass_bins[i+1]
+            f_low, f_high = feh_bins[j], feh_bins[j+1]
+            
+            mask_bin = (
+                (df_clean[mass_col] >= m_low) & (df_clean[mass_col] < m_high) &
+                (df_clean[feh_col] >= f_low) & (df_clean[feh_col] < f_high)
+            )
+            
+            if mask_bin.sum() < MIN_SAMPLES * 2:
+                continue
+            
+            bin_latents = clean_latents[torch.tensor(mask_bin.values)]
+            bin_ages = df_clean.loc[mask_bin, age_col].values
+            
+            q25 = np.percentile(bin_ages, 25)
+            q75 = np.percentile(bin_ages, 75)
+            
+            mask_low = bin_ages <= q25  # Young
+            mask_high = bin_ages >= q75 # Old
+            
+            n_low = mask_low.sum()
+            n_high = mask_high.sum()
+            
+            if n_low >= MIN_SAMPLES and n_high >= MIN_SAMPLES:
+                vec_low = bin_latents[mask_low].mean(dim=0)
+                vec_high = bin_latents[mask_high].mean(dim=0)
+                
+                # Old - Young
+                diff = vec_high - vec_low
+                weight = n_low + n_high
+                
+                concept_vectors.append(diff * weight)
+                total_weight += weight
+                stats.append({'n_samples': weight})
+                
+    if total_weight == 0:
+        print("  Failed to compute Age concept: No sufficient bins.")
+        return None
+        
+    final_concept = torch.stack(concept_vectors).sum(dim=0) / total_weight
+    print(f"  Computed Age Concept from {len(stats)} bins (N={total_weight})")
+    return final_concept
+
+
+def compute_directions(latents, params, numeric_bounds, obsids=None, info_df=None):
     """
     Computes concept directions from latents and params.
     """
-    print("Computing concept directions...")
+    print("Computing numeric concept directions...")
     
     # Denormalize params
     teff_norm = params[:, 0]
@@ -142,6 +368,16 @@ def compute_directions(latents, params, numeric_bounds):
         mu_rich = latents[mask_rich].mean(dim=0)
         mu_poor = latents[mask_poor].mean(dim=0)
         concepts['feh_rich_minus_poor'] = mu_rich - mu_poor
+        
+    # --- Mass (Stratified) ---
+    if obsids is not None and info_df is not None:
+        mass_vec = compute_mass_concept(latents, obsids, info_df)
+        if mass_vec is not None:
+            concepts['mass_high_minus_low'] = mass_vec
+            
+        age_vec = compute_age_concept(latents, obsids, info_df)
+        if age_vec is not None:
+            concepts['age_old_minus_young'] = age_vec
 
     return concepts
 
@@ -207,11 +443,28 @@ def main():
     )
     
     numeric_bounds = train_loader.dataset.numeric_bounds
+    
+    # Load Info Dataframe for Mass Concept
+    info_df = None
+    if os.path.exists(args.info_file):
+        print(f"Loading metadata from {args.info_file}...")
+        try:
+            info_df = pd.read_csv(args.info_file)
+        except Exception as e:
+            print(f"Warning: Failed to load info_file: {e}")
+    else:
+        print(f"Warning: info_file not found at {args.info_file}")
 
     # 3. Phase 1: Directions from Training Data
     print("\n--- Phase 1: Computing Directions from Training Data ---")
-    train_latents, train_params = extract_from_loader(model, train_loader, device, name="Train")
-    concepts = compute_directions(train_latents, train_params, numeric_bounds)
+    
+    # We used Train split for basic calc, but for Mass Stratified we might want more data?
+    # extract_from_loader respects split. 
+    # BUT, if we use info_df and obsids, we match what is in the split.
+    # So Mass concept will be computed from Training data only. This is correct to prevent leakage.
+    
+    train_latents, train_params, train_obsids = extract_from_loader(model, train_loader, device, name="Train")
+    concepts = compute_directions(train_latents, train_params, numeric_bounds, train_obsids, info_df)
     
     # Save Directions
     save_path = os.path.join(args.output_dir, 'concept_directions.pt')
@@ -221,13 +474,14 @@ def main():
     # 4. Phase 2: Extract Test Data for Analysis
     print("\n--- Phase 2: Extracting Unseen Test Data for Analysis ---")
     # Using TEST set for analysis to ensure no leakage
-    test_latents, test_params = extract_from_loader(model, test_loader, device, name="Test")
+    test_latents, test_params, test_obsids = extract_from_loader(model, test_loader, device, name="Test")
     
     # Save Data for Analysis (Test Split)
     data_save_path = os.path.join(args.output_dir, 'concept_data.pt')
     torch.save({
         'latents': test_latents,
         'params': test_params,
+        'obsids': test_obsids,
         'concepts': concepts
     }, data_save_path)
     print(f"Saved TEST split latents and params to {data_save_path}")

@@ -2,10 +2,10 @@
 #SBATCH --job-name=TL_late_fusion
 #SBATCH --nodes=1
 #SBATCH --ntasks=1                   
-#SBATCH --gres=gpu:nvidia_l40s:4
+#SBATCH --gres=gpu:nvidia_h200:4
 #SBATCH --cpus-per-task=16
 #SBATCH --mem=192G
-#SBATCH --partition=l40s-shared
+#SBATCH --partition=h200-shared
 #SBATCH --qos=24h_4g
 #SBATCH --time=24:00:00
 
@@ -36,4 +36,3 @@ srun --ntasks=$SLURM_NNODES --ntasks-per-node=1 \
        --master_addr=${MASTER_ADDR} \
        --master_port=${MASTER_PORT} \
        /home/ilay.kamai/work/TalkingLatents/src/late_fusion.py \
-       --resume /home/ilay.kamai/work/TalkingLatents/logs/late_fusion/late_fusion/late_fusion_resume_best.pth

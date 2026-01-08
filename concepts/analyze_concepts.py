@@ -5,6 +5,7 @@ import matplotlib.pyplot as plt
 import seaborn as sns
 import os
 import sys
+import pandas as pd
 
 # Set plotting style
 sns.set_theme(style="whitegrid")
@@ -41,7 +42,7 @@ def project_latents(latents, direction):
     # Project: x . d
     return torch.matmul(latents, direction)
 
-def plot_histograms(latents, params, concepts, numeric_bounds, save_dir):
+def plot_histograms(latents, params, concepts, numeric_bounds, save_dir, mass_vals=None, age_vals=None):
     # params: [Teff, logg, FeH] (normalized)
     
     # Define ground truth masks again for validation visualization
@@ -75,6 +76,22 @@ def plot_histograms(latents, params, concepts, numeric_bounds, save_dir):
         'logg_high_minus_low': ('logg', logg > 3.5, ['High logg', 'Low logg']),
         'feh_rich_minus_poor': ('FeH', feh > 0.0, ['Metal-Rich', 'Metal-Poor'])
     }
+    
+    if mass_vals is not None:
+        # User requested 75/25 percentiles
+        q75 = np.nanpercentile(mass_vals, 75)
+        q25 = np.nanpercentile(mass_vals, 25)
+        mask_high = torch.from_numpy(mass_vals >= q75)
+        mask_low = torch.from_numpy(mass_vals <= q25)
+        groups['mass_high_minus_low'] = ('Mass', (mask_high, mask_low), ['High Mass', 'Low Mass'])
+        
+    if age_vals is not None:
+        q75 = np.nanpercentile(age_vals, 75)
+        q25 = np.nanpercentile(age_vals, 25)
+        mask_old = torch.from_numpy(age_vals >= q75)
+        mask_young = torch.from_numpy(age_vals <= q25)
+        # Direction is Old - Young, so Old is Positive
+        groups['age_old_minus_young'] = ('Age', (mask_old, mask_young), ['Old', 'Young'])
 
     for name, direction in concepts.items():
         print(name, direction.shape)
@@ -82,23 +99,28 @@ def plot_histograms(latents, params, concepts, numeric_bounds, save_dir):
         
         # Determine labels for plotting
         if name in groups:
-            concept_type, mask, labels = groups[name]
-            # mask is logical vector. 
-            # For Evolution: mask is True for Dwarf. But direction is Giant - Dwarf.
-            # So Dwarf (True) should be negative side ideally, Giant (False) positive.
-            # Let's plot distribution.
+            concept_type, mask_info, labels = groups[name]
             
             plt.figure(figsize=(10, 6))
             
-            # Split data
-            if name == 'evolution_giant_minus_dwarf':
-                # mask is is_dwarf. 
+            # Resolve masks
+            if isinstance(mask_info, tuple):
+                # Explicit (pos_mask, neg_mask)
+                mask_pos, mask_neg = mask_info
+                data_pos = projections[mask_pos]
+                data_neg = projections[mask_neg]
+                label_pos = labels[0]
+                label_neg = labels[1]
+            elif name == 'evolution_giant_minus_dwarf':
+                # Special legacy case: mask is is_dwarf (Negative side)
+                mask = mask_info
                 data_neg = projections[mask] # Dwarf
                 data_pos = projections[~mask] # Giant
                 label_neg = 'Dwarf'
                 label_pos = 'Giant'
             else:
-                # Generic split based on simple threshold for viz
+                # Standard case: mask is Positive side
+                mask = mask_info
                 data_pos = projections[mask]
                 data_neg = projections[~mask]
                 label_pos = labels[0]
@@ -180,11 +202,63 @@ def main():
             'FeH': (-3.0, 0.5),
         }
 
+    
+    # Load Info Dataframe for Mass/Age Concept (hardcoded path as per extract_concepts.py default)
+    info_file = '/home/ilay.kamai/work/TalkingLatents/logs/2025-07-29/info_full.csv'
+    mass_vals = None
+    age_vals = None
+    
+    if os.path.exists(info_file):
+        print(f"Loading metadata from {info_file}...")
+        try:
+            info_df = pd.read_csv(info_file)
+            obsids = data['obsids']
+            
+            # Align mass values
+            # Create DataFrame for current obsids
+            obs_df = pd.DataFrame({'obsid': obsids})
+             # Ensure obsid types match
+            try:
+                obs_df['obsid'] = obs_df['obsid'].astype(int)
+                info_df['obsid'] = info_df['obsid'].astype(int) 
+            except:
+                pass
+            
+            # Drop duplicates in info_df
+            info_df = info_df.drop_duplicates(subset='obsid')
+            
+            merged = obs_df.merge(info_df, on='obsid', how='left')
+            
+            # Find mass column
+            mass_col = 'Mstar'
+            if mass_col not in merged.columns and 'mstar' in merged.columns:
+                 mass_col = 'mstar'
+            
+            if mass_col in merged.columns:
+                 mass_vals = merged[mass_col].values
+            else:
+                 print("Warning: Mstar column not found in info file.")
+
+            # Find Age column
+            age_col = 'Age'
+            if age_col not in merged.columns and 'age' in merged.columns:
+                age_col = 'age'
+                
+            if age_col in merged.columns:
+                 age_vals = merged[age_col].values
+            else:
+                 print("Warning: Age column not found in info file.")
+            
+        except Exception as e:
+            print(f"Warning: Failed to load info_file or align data: {e}")
+    else:
+        print(f"Warning: info_file not found at {info_file}")
+
     print("Generating Cosine Similarity Matrix...")
     plot_cosine_matrix(concepts, os.path.join(output_dir, 'cosine_similarity.png'))
     
     print("Generating Histograms...")
-    plot_histograms(latents, params, concepts, numeric_bounds, output_dir)
+    plot_histograms(latents, params, concepts, numeric_bounds, output_dir, mass_vals=mass_vals, age_vals=age_vals)
     
     print("Generating 2D Projections...")
     plot_2d_projections(latents, concepts, output_dir)

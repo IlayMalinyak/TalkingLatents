@@ -138,7 +138,10 @@ def main():
         os.environ['WORLD_SIZE'] = '1'
         torch.distributed.init_process_group(backend='nccl' if torch.cuda.is_available() else 'gloo')
     
-    from fairscale.nn.model_parallel.initialize import initialize_model_parallel
+    try:
+        from fairscale.nn.model_parallel.initialize import initialize_model_parallel
+    except ImportError:
+        pass
     if not torch.distributed.is_initialized() or torch.distributed.get_world_size() == 1:
         # Initialize with 1 GPU for inference
         try:
