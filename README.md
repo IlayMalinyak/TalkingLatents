@@ -1,8 +1,8 @@
 # TalkingLatents: Converting LLMs into Astronomers
 
-[![Paper](https://img.shields.io/badge/Paper-ICLR%202026-blue)](Talking_with_the_latent%20(27).pdf)
+<!-- [![Paper](https://img.shields.io/badge/Paper-ICLR%202026-blue)](Talking_with_the_latent%20(27).pdf)
 [![Python 3.8+](https://img.shields.io/badge/python-3.8+-blue.svg)](https://www.python.org/downloads/)
-[![PyTorch](https://img.shields.io/badge/PyTorch-2.0+-ee4c2c.svg)](https://pytorch.org/)
+[![PyTorch](https://img.shields.io/badge/PyTorch-2.0+-ee4c2c.svg)](https://pytorch.org/) -->
 
 **TalkingLatents** is a framework for aligning scientific foundation models with large language models (LLMs), enabling natural language interfaces to complex scientific latent spaces. Using stellar astrophysics as a case study, we demonstrate how LLMs can effectively reason over high-dimensional physical data and perform multiple downstream tasks through simple text prompts.
 
