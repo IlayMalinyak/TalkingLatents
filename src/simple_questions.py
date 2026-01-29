@@ -300,6 +300,11 @@ def create_datasets_and_loaders(args, device):
                                             cache_dir=cache_dir,
                                             tokenizer_path=tokenizer_path,  
                                             max_length=args.max_seq_length,
+                                            num_neighbor_samples=args.num_neighbor_samples,
+                                            neighbor_metric=args.neighbor_metric,
+                                            neighbor_cache_path=args.neighbor_cache,
+                                            physics_keys=tuple(args.physics_keys),
+                                            normalize_physics=args.normalize_physics,
                                             batch_size=args.batch_size,
                                             num_workers=args.num_workers,)
 

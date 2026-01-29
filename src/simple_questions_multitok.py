@@ -1036,7 +1036,7 @@ def main():
             bucket_cap_mb=25,
         )
     else:
-        print("Single GPU - no DDP")
+        print("Single process - no DDP")
 
     # Keep stellar predictor, transformer, and feature predictor in FP32 for numerical stability (after DDP wrapping)
     base_model = model.module if isinstance(model, DDP) else model

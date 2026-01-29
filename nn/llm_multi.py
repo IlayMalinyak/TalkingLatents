@@ -737,11 +737,8 @@ class MultimodalLlamaModelMultiTokens(MultimodalBackboneBase):
         freqs = torch.outer(t, freqs)
         freqs_cis = torch.polar(torch.ones_like(freqs), freqs)
 
-        # Causal mask
+        # Mask handled inside _attn_no_cache to accommodate dynamic lengths
         mask = None
-        if seqlen > 1:
-            mask = torch.full((seqlen, seqlen), float("-inf"), device=device, dtype=h.dtype)
-            mask = torch.triu(mask, diagonal=1)
 
         if attention_mask is not None:
             # Broadcast attention_mask to match heads: (B, S, S) -> (B, 1, S, S)
@@ -1005,8 +1002,15 @@ class MultimodalLlamaModelMultiTokens(MultimodalBackboneBase):
         keys = keys.transpose(1, 2)
         values = values.transpose(1, 2)
         scores = torch.matmul(xq, keys.transpose(2, 3)) / math.sqrt(attention_layer.head_dim)
-        if mask is not None:
-            scores = scores + mask
+        qlen, klen = scores.size(-2), scores.size(-1)
+        if mask is None:
+            causal = torch.full((qlen, klen), float('-inf'), device=scores.device, dtype=scores.dtype)
+            causal = torch.triu(causal, diagonal=1)
+            scores = scores + causal
+        else:
+            mask_to_add = mask.to(dtype=scores.dtype, device=scores.device)
+            mask_to_add = mask_to_add[..., :qlen, :klen]
+            scores = scores + mask_to_add
         probs = F.softmax(scores.float(), dim=-1).type_as(xq)
         
         # --- HARD DEBUG PATCH (CONDITIONAL) ---

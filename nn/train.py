@@ -3,6 +3,7 @@ import torch.nn.functional as F
 import numpy as np
 import time
 
+import csv
 import os
 import json
 import glob
@@ -837,6 +838,20 @@ class LLMTrainer(Trainer):
         self.loss_lambda = float(loss_lambda)
         
         self._apply_freeze_strategy(self.freeze_strategy)
+        # Prepare loss tracking/logging structures
+        self._loss_term_tracker = {
+            'train': {'total': 0.0, 'lm': 0.0, 'feat': 0.0, 'text': 0.0, 'retr': 0.0, 'phys': 0.0, 'count': 0},
+            'val': {'total': 0.0, 'lm': 0.0, 'feat': 0.0, 'text': 0.0, 'retr': 0.0, 'phys': 0.0, 'count': 0},
+        }
+        self._loss_log_path = None
+        if self.log_path:
+            os.makedirs(self.log_path, exist_ok=True)
+            log_filename = f"{self.exp_name}_loss_terms.csv" if self.exp_name else "loss_terms.csv"
+            self._loss_log_path = os.path.join(self.log_path, log_filename)
+            if self._is_main_process() and not os.path.exists(self._loss_log_path):
+                with open(self._loss_log_path, 'w', newline='') as f:
+                    writer = csv.writer(f)
+                    writer.writerow(['phase', 'epoch', 'batches', 'total_loss', 'lm_loss', 'feat_loss', 'text_loss', 'retr_loss', 'physics_loss'])
 
     def _update_curriculum(self):
         """Update single_sample_prob according to curriculum schedule"""
@@ -981,6 +996,70 @@ class LLMTrainer(Trainer):
             else:
                 print("Warning: No new parameters found to add to optimizer after LoRA application")
 
+    def _is_main_process(self) -> bool:
+        return (not dist.is_initialized()) or dist.get_rank() == 0
+
+    def _reset_loss_tracker(self, phase: str) -> None:
+        tracker = self._loss_term_tracker[phase]
+        tracker['total'] = 0.0
+        tracker['lm'] = 0.0
+        tracker['feat'] = 0.0
+        tracker['text'] = 0.0
+        tracker['retr'] = 0.0
+        tracker['phys'] = 0.0
+        tracker['count'] = 0
+
+    def _update_loss_tracker(self, phase: str, *, total: float, lm: float, feat: float, text: float,
+                              retr: float = 0.0, phys: float = 0.0) -> None:
+        tracker = self._loss_term_tracker[phase]
+        tracker['total'] += float(total)
+        tracker['lm'] += float(lm)
+        tracker['feat'] += float(feat)
+        tracker['text'] += float(text)
+        tracker['retr'] += float(retr)
+        tracker['phys'] += float(phys)
+        tracker['count'] += 1
+
+    def _finalize_loss_tracker(self, phase: str, epoch: int) -> None:
+        tracker = self._loss_term_tracker[phase]
+        if tracker['count'] == 0:
+            return
+
+        count = tracker['count']
+        avg_total = tracker['total'] / count
+        avg_lm = tracker['lm'] / count
+        avg_feat = tracker['feat'] / count
+        avg_text = tracker['text'] / count
+        avg_retr = tracker['retr'] / count
+        avg_phys = tracker['phys'] / count
+
+        if self._is_main_process():
+            print(
+                f"[{phase.upper()}][epoch {epoch}] total={avg_total:.4f} "
+                f"lm={avg_lm:.4f} feat={avg_feat:.4f} text={avg_text:.4f} "
+                f"retr={avg_retr:.4f} phys={avg_phys:.4f} (batches={count})"
+            )
+            self._append_loss_log(
+                phase=phase,
+                epoch=epoch,
+                batches=count,
+                avg_total=avg_total,
+                avg_lm=avg_lm,
+                avg_feat=avg_feat,
+                avg_text=avg_text,
+                avg_retr=avg_retr,
+                avg_phys=avg_phys,
+            )
+
+    def _append_loss_log(self, *, phase: str, epoch: int, batches: int,
+                         avg_total: float, avg_lm: float, avg_feat: float, avg_text: float,
+                         avg_retr: float, avg_phys: float) -> None:
+        if not self._loss_log_path:
+            return
+        with open(self._loss_log_path, 'a', newline='') as f:
+            writer = csv.writer(f)
+            writer.writerow([phase, epoch, batches, avg_total, avg_lm, avg_feat, avg_text, avg_retr, avg_phys])
+
     def _apply_freeze_strategy(self, strategy: str):
         """Apply different freezing strategies to the model"""
         print(f"Applying freeze strategy: {strategy}")
@@ -1067,7 +1146,10 @@ class LLMTrainer(Trainer):
                 self.model.mode = "combined"
         
         self._apply_freeze_strategy(self.freeze_strategy)
-        return super().train_epoch(device, epoch)
+        self._reset_loss_tracker('train')
+        result = super().train_epoch(device, epoch)
+        self._finalize_loss_tracker('train', epoch)
+        return result
 
     def get_loss(self, logits, target_ids, attention_mask=None):
         # Shift for autoregressive prediction
@@ -1881,6 +1963,7 @@ class LLMTrainer(Trainer):
                     'generated_answer': generated_text,
                     'teacher_forcing_perplexity': tf_perplexity,
                     'generation_perplexity': gen_perplexity,
+                    'retrieval_ok': retrieval_ok,
                     'num_generated_tokens': len(generation_log_probs)
                 }
                 epoch_results['samples'].append(sample_result)
@@ -1912,6 +1995,12 @@ class LLMTrainer(Trainer):
         print(f"Avg Generation Perplexity: {epoch_results['avg_generation_perplexity']:.2f}")
         print(f"Valid TF Samples: {valid_tf_count}/{sample_count}")
         print(f"Valid Gen Samples: {valid_gen_count}/{sample_count}")
+        # Summarize retrieval exact-match if any
+        if any(s.get('retrieval_ok') is not None for s in epoch_results['samples']):
+            total_ret = sum(1 for s in epoch_results['samples'] if s.get('retrieval_ok') is not None)
+            correct_ret = sum(int(s.get('retrieval_ok') or 0) for s in epoch_results['samples'])
+            rate = correct_ret / max(1, total_ret)
+            print(f"Retrieval exact-match on samples: {correct_ret}/{total_ret} ({100*rate:.1f}%)")
         print(f"{'='*60}")
         
         # Store results

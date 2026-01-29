@@ -30,6 +30,8 @@ from src.follow_up_templates import create_follow_up_specs
 
 
 class StellarQuestionsDataset(Dataset):
+    _GLOBAL_NEIGHBOR_CACHE: Dict[Tuple[int, int, str], Tuple[np.ndarray, Optional[np.ndarray]]] = {}
+    _GLOBAL_PHYS_STATS: Dict[Tuple[int, Tuple[str, ...]], Tuple[np.ndarray, np.ndarray]] = {}
     """
     PyTorch Dataset for stellar descriptions and optional spectral features
     Now includes tokenization for LLaMA
@@ -163,6 +165,7 @@ class StellarQuestionsDataset(Dataset):
         
         # Load and process data
         self._load_data()
+        self._prepare_physics_and_neighbors()
         self._create_splits(train_ratio, val_ratio, test_ratio, cache_dir)
         self._initialize_feature_normalizer(feature_stats)
         
@@ -494,7 +497,104 @@ class StellarQuestionsDataset(Dataset):
                 self.df_indices.append(df_idx)
             else:
                 print(f"Warning: Sample missing dataframe index: {sample.get('obsid', 'unknown')}")
-                
+
+
+    def _prepare_physics_and_neighbors(self) -> None:
+        """Compute physics statistics and build (or load) neighbor graph."""
+        if not self.physics_keys:
+            return
+
+        phys_vectors = []
+        for sample in self.raw_data:
+            df_idx = sample.get('index')
+            stellar_data = sample.get('stellar_data', {}) or {}
+            if df_idx is None:
+                continue
+            self.df_index_to_obsid[df_idx] = int(sample.get('obsid', -1))
+            values = []
+            valid = True
+            for key in self.physics_keys:
+                val = stellar_data.get(key)
+                if val is None or (isinstance(val, float) and np.isnan(val)):
+                    valid = False
+                    break
+                values.append(float(val))
+            if valid:
+                vec = np.asarray(values, dtype=np.float32)
+                self.df_index_to_phys[df_idx] = vec
+                phys_vectors.append(vec)
+
+        if phys_vectors:
+            stats_key = None
+            if self._features_key is not None:
+                stats_key = (self._features_key, self.physics_keys)
+                cached_stats = self._GLOBAL_PHYS_STATS.get(stats_key)
+                if cached_stats is not None:
+                    self.physics_mean, self.physics_std = cached_stats
+            if self.physics_mean is None:
+                if self.normalize_physics:
+                    stacked = np.stack(phys_vectors, axis=0)
+                    mean = stacked.mean(axis=0)
+                    std = stacked.std(axis=0) + 1e-6
+                else:
+                    mean = np.zeros(len(self.physics_keys), dtype=np.float32)
+                    std = np.ones(len(self.physics_keys), dtype=np.float32)
+                self.physics_mean = mean.astype(np.float32)
+                self.physics_std = std.astype(np.float32)
+                if stats_key is not None:
+                    self._GLOBAL_PHYS_STATS[stats_key] = (self.physics_mean, self.physics_std)
+
+        if self.physics_mean is not None:
+            self.physics_mean_tensor = torch.from_numpy(self.physics_mean.copy())
+            self.physics_std_tensor = torch.from_numpy(self.physics_std.copy())
+
+        if self.num_neighbor_samples <= 0 or self.features_array is None:
+            return
+
+        cache_key = None
+        if self._features_key is not None:
+            cache_key = (self._features_key, self.num_neighbor_samples, self.neighbor_metric)
+            cached = self._GLOBAL_NEIGHBOR_CACHE.get(cache_key)
+            if cached is not None:
+                self._neighbor_indices, self._neighbor_distances = cached
+                return
+
+        indices, distances = self._build_neighbor_graph()
+        if indices is not None:
+            self._neighbor_indices = indices
+            self._neighbor_distances = distances
+            if cache_key is not None:
+                self._GLOBAL_NEIGHBOR_CACHE[cache_key] = (indices, distances)
+
+    def _build_neighbor_graph(self) -> Tuple[Optional[np.ndarray], Optional[np.ndarray]]:
+        """Construct k-NN graph over feature embeddings."""
+        try:
+            from sklearn.neighbors import NearestNeighbors
+            nn = NearestNeighbors(
+                n_neighbors=min(self.num_neighbor_samples + 1, len(self.features_array)),
+                metric=self.neighbor_metric,
+                algorithm='auto'
+            )
+            nn.fit(self.features_array)
+            distances, indices = nn.kneighbors(self.features_array)
+        except Exception as e:
+            print(f"Warning: unable to build neighbor graph via sklearn ({e}). Disabling neighbor supervision.")
+            return None, None
+
+        distances = distances.astype(np.float32)
+        indices = indices.astype(np.int64)
+
+        if self.neighbor_cache_path:
+            try:
+                Path(self.neighbor_cache_path).parent.mkdir(parents=True, exist_ok=True)
+                np.savez_compressed(self.neighbor_cache_path,
+                                    indices=indices,
+                                    distances=distances)
+            except Exception as e:
+                print(f"Warning: failed to save neighbor cache to {self.neighbor_cache_path}: {e}")
+
+        return indices, distances
+
             
     def parse_description_text(self, description_text: str) -> Dict[str, str]:
         """
@@ -1173,6 +1273,17 @@ def collate_fn(batch: List[Dict[str, Any]]) -> Dict[str, Any]:
 
     y_numeric, y_numeric_present = _stack_numeric(y_numeric_list)
     
+    physics_target = torch.stack([item['physics_target'] for item in batch]) if batch[0]['physics_target'].numel() > 0 else torch.empty(len(batch), 0)
+    physics_target_norm = torch.stack([item['physics_target_norm'] for item in batch]) if batch[0]['physics_target_norm'].numel() > 0 else torch.empty(len(batch), 0)
+    physics_mask = torch.stack([item['physics_mask'] for item in batch])
+
+    neighbor_latents = torch.stack([item['neighbor_latents'] for item in batch]) if batch[0]['neighbor_latents'].numel() > 0 else torch.empty(len(batch), 0, 0)
+    neighbor_physics = torch.stack([item['neighbor_physics'] for item in batch]) if batch[0]['neighbor_physics'].numel() > 0 else torch.empty(len(batch), 0, 0)
+    neighbor_obsids = torch.stack([item['neighbor_obsids'] for item in batch]) if batch[0]['neighbor_obsids'].numel() > 0 else torch.empty(len(batch), 0, dtype=torch.long)
+    neighbor_mask = torch.stack([item['neighbor_mask'] for item in batch]) if batch[0]['neighbor_mask'].numel() > 0 else torch.empty(len(batch), 0)
+    neighbor_distances = torch.stack([item['neighbor_distances'] for item in batch]) if batch[0]['neighbor_distances'].numel() > 0 else torch.empty(len(batch), 0)
+    neighbor_targets = torch.stack([item['neighbor_target_idx'] for item in batch])
+
     return {
         'input_ids':  input_ids,                    # [batch, seq_len]
         'target_ids': target_ids,                    # [batch, seq_len]
