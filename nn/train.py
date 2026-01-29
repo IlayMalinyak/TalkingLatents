@@ -20,8 +20,13 @@ import gc
 import inspect
 
 
-from nn.state_space_llm import apply_lora_to_model
-from fairscale.nn.model_parallel.layers import RowParallelLinear, ColumnParallelLinear
+from nn.lora import apply_lora_to_model, LoRALinear
+from nn.optim import CQR
+try:
+    from fairscale.nn.model_parallel.layers import RowParallelLinear, ColumnParallelLinear
+except ImportError:
+    RowParallelLinear = None
+    ColumnParallelLinear = None
 
 
 def print_tensor_memory(tensor, name="tensor"):
@@ -51,7 +56,8 @@ class Trainer(object):
                  scheduler=None, val_dataloader=None,   max_iter=-1, scaler=None, use_amp=False,
                   grad_clip=False, max_grad_norm=1, log_path=None, exp_name=None, plot_every=None,
                    cos_inc=False, range_update=None, accumulation_step=1, wandb_log=False, num_quantiles=1,
-                   update_func=lambda x: x):
+                   update_func=lambda x: x, save_full_every_epoch=True):
+        import torch as _torch
         self.model = model
         self.optimizer = optimizer
         self.criterion = criterion
@@ -67,11 +73,19 @@ class Trainer(object):
         self.train_sampler = self.get_sampler_from_dataloader(train_dataloader)
         self.val_sampler = self.get_sampler_from_dataloader(val_dataloader)
         self.max_iter = max_iter
-        self.device = device
+
+        # Normalize device to torch.device for internal use
+        if isinstance(device, int):
+            self.device = _torch.device(f'cuda:{device}' if _torch.cuda.is_available() else 'cpu')
+        elif isinstance(device, str):
+            self.device = _torch.device(device)
+        else:
+            self.device = device  # assume torch.device
+
         self.world_size = world_size
-        self.exp_name = exp_name
-        self.log_path = log_path
-        self.best_state_dict = self.model.state_dict()
+        self.exp_name = exp_name or "experiment"
+        self.log_path = log_path or "./logs"
+        self.best_state_dict = None
         self.plot_every = plot_every
         self.logger = None
         self.range_update = range_update
@@ -80,35 +94,144 @@ class Trainer(object):
         self.num_quantiles = num_quantiles
         self.update_func = update_func
         self.epoch = 0
-        # if log_path is not None:
-        #     self.logger =SummaryWriter(f'{self.log_path}/exp{self.exp_num}')
-        #     # print(f"logger path: {self.log_path}/exp{self.exp_num}")
 
-        # print("logger is: ", self.logger)
-    
+        # NEW: control saving of a full resume checkpoint each epoch
+        self.save_full_every_epoch = save_full_every_epoch
+
+    def _unwrap_model(self):
+        """Return the underlying model (handle DDP/DataParallel wrappers)."""
+        return self.model.module if hasattr(self.model, "module") else self.model
+
+    def _collect_trainable_state_names(self, model):
+        """Collect parameter and buffer names needed to resume trainable components."""
+        trainable_param_names = {
+            name for name, param in model.named_parameters() if param.requires_grad
+        }
+
+        buffer_names = set()
+        if trainable_param_names:
+            for buffer_name, _ in model.named_buffers():
+                prefix = buffer_name.rsplit('.', 1)[0] if '.' in buffer_name else ''
+                if prefix:
+                    if any(name.startswith(f"{prefix}.") or name == prefix for name in trainable_param_names):
+                        buffer_names.add(buffer_name)
+                else:
+                    if any('.' not in name for name in trainable_param_names):
+                        buffer_names.add(buffer_name)
+        return trainable_param_names, buffer_names
+
+    def _get_trainable_state_dict(self):
+        """Return a state_dict containing only trainable parameters (and required buffers)."""
+        from collections import OrderedDict
+        model = self._unwrap_model()
+        trainable_names, buffer_names = self._collect_trainable_state_names(model)
+        keep_names = trainable_names | buffer_names
+
+        if not keep_names:
+            print("Warning: no trainable parameters found for checkpoint; returning empty state dict")
+            return OrderedDict()
+
+        current_state = model.state_dict()
+        filtered_state = OrderedDict()
+        for name in keep_names:
+            if name in current_state:
+                filtered_state[name] = current_state[name].detach().cpu()
+        return filtered_state
+
+    # NEW: full resume checkpoint payload
+    def _build_resume_checkpoint(self, epoch, min_loss, best_acc):
+        unwrapped = self._unwrap_model()
+        return {
+            "epoch": int(epoch),
+            "model_state_dict": unwrapped.state_dict(),  # full model, not filtered
+            "optimizer": self.optimizer.state_dict() if self.optimizer is not None else None,
+            "scheduler": self.scheduler.state_dict() if self.scheduler is not None else None,
+            "scaler": self.scaler.state_dict() if self.scaler is not None else None,
+            "min_loss": float(min_loss) if min_loss is not None else None,
+            "best_acc": float(best_acc) if best_acc is not None else None,
+            "exp_name": self.exp_name,
+            "backend_config": getattr(self, "backend_metadata", None),
+        }
+
+    # NEW: atomic save helper (rank-0 only)
+    def _atomic_save(self, obj, path):
+        import os, torch, tempfile
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        tmp = f"{path}.tmp"
+        torch.save(obj, tmp)
+        os.replace(tmp, path)
+
+    # NEW: public save wrapper; writes both weights-only and full resume if requested
+    def _save_all_checkpoints(self, is_best, epoch, min_loss, best_acc):
+        import os
+        rank0 = (not torch.distributed.is_initialized()) or torch.distributed.get_rank() == 0
+        if not rank0:
+            return
+
+        # 1) Weights-only (trainable params/buffers) → {exp}.pth (for inference/fine-tune)
+        # DISABLED: Only save best checkpoint to save disk space
+        # weights_only_path = os.path.join(self.log_path, f"{self.exp_name}.pth")
+        # try:
+        #     best_state = self._get_trainable_state_dict()
+        # except Exception as e:
+        #     print(f"Warning collecting trainable state dict: {e}; falling back to full model state")
+        #     best_state = self._unwrap_model().state_dict()
+        # try:
+        #     self.best_state_dict = best_state
+        #     self._atomic_save(best_state, weights_only_path)
+        #     print(f"✓ Weights-only checkpoint saved to {weights_only_path}")
+        # except Exception as e:
+        #     print(f"Warning saving weights-only checkpoint: {e}")
+
+        # 2) Full resume checkpoint
+        resume_ckpt = self._build_resume_checkpoint(epoch, min_loss, best_acc)
+
+        # DISABLED: Don't save rolling "last" checkpoint to save disk space
+        # always keep a rolling "last" (useful for preemption)
+        # resume_last_path = os.path.join(self.log_path, f"{self.exp_name}_resume_last.pth")
+        # try:
+        #     self._atomic_save(resume_ckpt, resume_last_path)
+        #     print(f"✓ Resume (last) checkpoint saved to {resume_last_path}")
+        # except Exception as e:
+        #     print(f"Warning saving resume_last checkpoint: {e}")
+
+        # save a stable "best" file only when improved
+        if is_best:
+            resume_best_path = os.path.join(self.log_path, f"{self.exp_name}_resume_best.pth")
+            try:
+                self._atomic_save(resume_ckpt, resume_best_path)
+                print(f"✓ Resume (best) checkpoint saved to {resume_best_path}")
+            except Exception as e:
+                print(f"Warning saving resume_best checkpoint: {e}")
+
     def get_sampler_from_dataloader(self, dataloader):
         if hasattr(dataloader, 'sampler'):
             if isinstance(dataloader.sampler, torch.utils.data.DistributedSampler):
                 return dataloader.sampler
             elif hasattr(dataloader.sampler, 'sampler'):
                 return dataloader.sampler.sampler
-        
+
         if hasattr(dataloader, 'batch_sampler') and hasattr(dataloader.batch_sampler, 'sampler'):
             return dataloader.batch_sampler.sampler
-        
+
         return None
-    
+
     def fit(self, num_epochs, device,  early_stopping=None, start_epoch=0, best='loss', conf=False,
             initial_min_loss=None, initial_best_acc=None):
         """
         Fits the model for the given number of epochs.
         """
+        # Ignore the passed-in device and use normalized self.device
+        _ = device  # kept for backward compatibility
+
+        import json, os, time, numpy as np, torch, torch.distributed as dist
+
         min_loss = float(initial_min_loss) if initial_min_loss is not None else np.inf
         best_acc = float(initial_best_acc) if initial_best_acc is not None else 0.0
-        train_loss, val_loss,  = [], []
+        train_loss, val_loss = [], []
         train_acc, val_acc = [], []
-        lrs = []
-        epochs = []
+        lrs, epochs = [], []
+
         self.train_aux_loss_1 = []
         self.train_aux_loss_2 = []
         self.train_aux_loss_3 = []
@@ -119,36 +242,40 @@ class Trainer(object):
         self.train_logits_std = []
         self.val_logits_mean = []
         self.val_logits_std = []
-        # self.optim_params['lr_history'] = []
+
         epochs_without_improvement = 0
-        main_proccess = (torch.distributed.is_initialized() and torch.distributed.get_rank() == 0) or self.device == 'cpu'
+        main_process = (torch.distributed.is_initialized() and torch.distributed.get_rank() == 0) or self.device.type == 'cpu'
 
         print(f"Starting training for {num_epochs} epochs")
-        print("is main process: ", main_proccess, flush=True)
+        print("is main process: ", main_process, flush=True)
         global_time = time.time()
         self.epoch = 0
+
         for epoch in range(start_epoch, start_epoch + num_epochs):
             epochs.append(epoch)
             self.epoch = epoch
             start_time = time.time()
             plot = (self.plot_every is not None) and (epoch % self.plot_every == 0)
-            t_loss, t_acc = self.train_epoch(device, epoch=epoch)
+
+            # ---- train ----
+            t_loss, t_acc = self.train_epoch(self.device, epoch=epoch)
             t_loss_mean = np.nanmean(t_loss)
             train_loss.extend(t_loss)
             global_train_accuracy, global_train_loss = self.process_loss(t_acc, t_loss_mean)
-            if main_proccess:  # Only perform this on the master GPU
+            if main_process:
                 train_acc.append(global_train_accuracy.mean().item())
-                
-            v_loss, v_acc = self.eval_epoch(device, epoch=epoch)
+
+            # ---- val ----
+            v_loss, v_acc = self.eval_epoch(self.device, epoch=epoch)
             v_loss_mean = np.nanmean(v_loss)
             val_loss.extend(v_loss)
             global_val_accuracy, global_val_loss = self.process_loss(v_acc, v_loss_mean)
-            if main_proccess:  # Only perform this on the master GPU                
+            if main_process:
                 val_acc.append(global_val_accuracy.mean().item())
-                
+
+                # ---- choose objective & track best ----
                 current_objective = global_val_loss if best == 'loss' else global_val_accuracy.mean()
                 improved = False
-                
                 if best == 'loss':
                     if current_objective < min_loss:
                         min_loss = current_objective
@@ -157,106 +284,86 @@ class Trainer(object):
                     if current_objective > best_acc:
                         best_acc = current_objective
                         improved = True
-                
-                if improved and (not dist.is_initialized() or dist.get_rank() == 0):
-                    # Save best composite checkpoint (rank 0 only)
-                    model_name = f'{self.log_path}/{self.exp_name}.pth'
-                    resume_best = f'{self.log_path}/{self.exp_name}_resume_best.pth'
-                    print(f"saving model at {model_name}...")
-                    try:
-                        # atomic save: write temp then move
-                        tmp_model = model_name + '.tmp'
-                        torch.save(self.model.state_dict(), tmp_model)
-                        os.replace(tmp_model, model_name)
-                        self.best_state_dict = self.model.state_dict()
-                    except Exception as e:
-                        print(f"Warning saving state_dict only: {e}")
-                    try:
-                        tmp_best = resume_best + '.tmp'
-                        torch.save({
-                            'epoch': epoch,
-                            'model': self.model.state_dict(),
-                            'optimizer': self.optimizer.state_dict() if self.optimizer is not None else None,
-                            'scheduler': self.scheduler.state_dict() if self.scheduler is not None else None,
-                            'scaler': self.scaler.state_dict() if self.scaler is not None else None,
-                            'min_loss': float(min_loss) if isinstance(min_loss, np.generic) else min_loss,
-                            'best_acc': float(best_acc) if isinstance(best_acc, np.generic) else best_acc,
-                        }, tmp_best)
-                        os.replace(tmp_best, resume_best)
-                    except Exception as e:
-                        print(f"Warning saving best composite checkpoint: {e}")
-                    # model_path, output_filename = save_compressed_checkpoint(
-                    #                            self.model, model_name, res, use_zip=True )
-                    epochs_without_improvement = 0
-                else:
-                    epochs_without_improvement += 1
 
-                res = {"epochs": epochs, "train_loss": train_loss, "val_loss": val_loss,
-                        "train_acc": train_acc, "val_acc": val_acc, "train_aux_loss_1": self.train_aux_loss_1,
-                        "train_aux_loss_2":self.train_aux_loss_2, "train_aux_loss_3":self.train_aux_loss_3,
-                         "val_aux_loss_1":self.val_aux_loss_1, "val_aux_loss_2": self.val_aux_loss_2,
-                          "val_aux_loss_3": self.val_aux_loss_3, "train_logits_mean": self.train_logits_mean,
-                         "train_logits_std": self.train_logits_std, "val_logits_mean": self.val_logits_mean,
-                          "val_logits_std": self.val_logits_std, "lrs": lrs}
-
-                current_lr = self.optimizer.param_groups[0]['lr'] if self.scheduler is None \
-                            else self.scheduler.get_last_lr()[0]
-                
-                lrs.append(current_lr)
-                
+                # ---- save checkpoints (rank-0) ----
                 if (not dist.is_initialized()) or dist.get_rank() == 0:
+                    # Always keep JSON metrics up to date
+                    res = {
+                        "epochs": epochs, "train_loss": train_loss, "val_loss": val_loss,
+                        "train_acc": train_acc, "val_acc": val_acc,
+                        "train_aux_loss_1": self.train_aux_loss_1, "train_aux_loss_2": self.train_aux_loss_2,
+                        "train_aux_loss_3": self.train_aux_loss_3, "val_aux_loss_1": self.val_aux_loss_1,
+                        "val_aux_loss_2": self.val_aux_loss_2, "val_aux_loss_3": self.val_aux_loss_3,
+                        "train_logits_mean": self.train_logits_mean, "train_logits_std": self.train_logits_std,
+                        "val_logits_mean": self.val_logits_mean, "val_logits_std": self.val_logits_std,
+                        "lrs": lrs
+                    }
                     output_filename = f'{self.log_path}/{self.exp_name}.json'
+                    os.makedirs(os.path.dirname(output_filename), exist_ok=True)
                     tmp_json = output_filename + '.tmp'
                     with open(tmp_json, "w") as f:
                         json.dump(res, f, indent=2)
                     os.replace(tmp_json, output_filename)
                     print(f"saved results at {output_filename}")
-                
-                print(f'Epoch {epoch}, lr {current_lr}, Train Loss: {global_train_loss:.6f}, Val Loss:'\
-                
-                        f'{global_val_loss:.6f}, Train Acc: {global_train_accuracy.round(decimals=4).tolist()}, '\
-                f'Val Acc: {global_val_accuracy.round(decimals=4).tolist()},'\
-                  f'Time: {time.time() - start_time:.2f}s, Total Time: {(time.time() - global_time)/3600} hr', flush=True)
-                if ((not dist.is_initialized()) or dist.get_rank() == 0) and (epoch % 10 == 0):
-                    print(os.system('nvidia-smi'))
 
-                if epochs_without_improvement == early_stopping:
+                    # Save resume-last every epoch (optional toggle), and resume-best on improvement
+                    if self.save_full_every_epoch or improved:
+                        self._save_all_checkpoints(is_best=improved, epoch=epoch, min_loss=min_loss, best_acc=best_acc)
+
+                # ---- LR logging ----
+                try:
+                    if self.scheduler is None:
+                        current_lr = self.optimizer.param_groups[0]['lr']
+                    else:
+                        # get_last_lr() returns list for most schedulers
+                        lr_list = getattr(self.scheduler, "get_last_lr", lambda: [self.optimizer.param_groups[0]['lr']])()
+                        current_lr = lr_list[0] if isinstance(lr_list, (list, tuple)) else lr_list
+                except Exception:
+                    current_lr = self.optimizer.param_groups[0]['lr']
+                lrs.append(current_lr)
+
+                # ---- progress line ----
+                print(
+                    f'Epoch {epoch}, lr {current_lr:.6g}, '
+                    f'Train Loss: {global_train_loss:.6f}, Val Loss: {global_val_loss:.6f}, '
+                    f'Train Acc: {global_train_accuracy.round(decimals=4).tolist()}, '
+                    f'Val Acc: {global_val_accuracy.round(decimals=4).tolist()}, '
+                    f'Time: {time.time() - start_time:.2f}s, Total Time: {(time.time() - global_time)/3600:.2f} hr',
+                    flush=True
+                )
+                if ((not dist.is_initialized()) or dist.get_rank() == 0) and (epoch % 10 == 0):
+                    try:
+                        os.system('nvidia-smi')
+                    except Exception:
+                        pass
+
+                # ---- early stop / wall time ----
+                epochs_without_improvement = 0 if improved else (epochs_without_improvement + 1)
+                if early_stopping is not None and epochs_without_improvement == early_stopping:
                     print('early stopping!', flush=True)
                     break
-                if time.time() - global_time > (23.83 * 3600):
-                    print("time limit reached")
-                    break 
+                # if time.time() - global_time > (23.83 * 3600):
+                #     print("time limit reached")
+                #     break
 
-            # Always save last composite checkpoint to allow exact resume (rank 0 only)
-            if (not dist.is_initialized()) or dist.get_rank() == 0:
-                try:
-                    last_path = f'{self.log_path}/{self.exp_name}_resume_last.pth'
-                    tmp_last = last_path + '.tmp'
-                    torch.save({
-                        'epoch': epoch,
-                        'model': self.model.state_dict(),
-                        'optimizer': self.optimizer.state_dict() if self.optimizer is not None else None,
-                        'scheduler': self.scheduler.state_dict() if self.scheduler is not None else None,
-                        'scaler': self.scaler.state_dict() if self.scaler is not None else None,
-                        'min_loss': float(min_loss) if isinstance(min_loss, np.generic) else min_loss,
-                        'best_acc': float(best_acc) if isinstance(best_acc, np.generic) else best_acc,
-                    }, tmp_last)
-                    os.replace(tmp_last, last_path)
-                except Exception as e:
-                    print(f"Warning saving last composite checkpoint: {e}")
+        return {
+            "epochs": epochs, "train_loss": train_loss, "val_loss": val_loss,
+            "train_acc": train_acc, "val_acc": val_acc,
+            "train_aux_loss_1": self.train_aux_loss_1, "train_aux_loss_2": self.train_aux_loss_2,
+            "train_aux_loss_3": self.train_aux_loss_3, "val_aux_loss_1": self.val_aux_loss_1,
+            "val_aux_loss_2": self.val_aux_loss_2, "val_aux_loss_3": self.val_aux_loss_3,
+            "train_logits_mean": self.train_logits_mean, "train_logits_std": self.train_logits_std,
+            "val_logits_mean": self.val_logits_mean, "val_logits_std": self.val_logits_std,
+            "lrs": lrs
+        }
 
-        return {"epochs":epochs, "train_loss": train_loss,
-                 "val_loss": val_loss, "train_acc": train_acc,
-                "val_acc": val_acc, "train_aux_loss_1": self.train_aux_loss_1,
-                "train_aux_loss_2":self.train_aux_loss_2, "train_aux_loss_3":self.train_aux_loss_3,
-                    "val_aux_loss_1":self.val_aux_loss_1, "val_aux_loss_2": self.val_aux_loss_2,
-                    "val_aux_loss_3": self.val_aux_loss_3, "train_logits_mean": self.train_logits_mean,
-                 "train_logits_std": self.train_logits_std, "val_logits_mean": self.val_logits_mean,
-                  "val_logits_std": self.val_logits_std, "lrs": lrs}
 
     def process_loss(self, acc, loss_mean):
-        if  torch.cuda.is_available() and torch.distributed.is_initialized():
-            global_accuracy = torch.tensor(acc).cuda()  # Convert accuracy to a tensor on the GPU
+        if torch.cuda.is_available() and torch.distributed.is_initialized():
+            if isinstance(acc, torch.Tensor):
+                global_accuracy = acc.detach().clone().cuda()
+            else:
+                global_accuracy = torch.tensor(acc).cuda()  # Convert accuracy to a tensor on the GPU
             torch.distributed.reduce(global_accuracy, dst=0, op=torch.distributed.ReduceOp.SUM)
             global_loss = torch.tensor(loss_mean).cuda()  # Convert loss to a tensor on the GPU
             torch.distributed.reduce(global_loss, dst=0, op=torch.distributed.ReduceOp.SUM)
@@ -362,15 +469,24 @@ class Trainer(object):
         pass
 
 class MaskedRegressorTrainer(Trainer):
-    def __init__(self, w_name, w_init_val, ssl_criterion, ssl_weight=0.5, **kwargs):
+    def __init__(self, w_name, ssl_criterion, ssl_weight=0.5, use_meta=False, meta_names=[], **kwargs):
         super().__init__(**kwargs)
         self.w_name = w_name
+        self.use_meta = use_meta
+        self.meta_names = meta_names
         self.ssl_criterion = ssl_criterion
-        self.w_init_val = w_init_val
         self.ssl_weight = ssl_weight  # Weight to balance between SSL and regression
         self.drop_first_y = False
         
     def train_batch(self, batch, batch_idx, device):
+        if batch is None:
+            return None, None, None
+        if len(batch) == 2:
+            batch, indices = batch
+            if batch_idx % 50 == 0:
+                print(f"heartbeat step={batch_idx} min_idx={int(indices.min())} max_idx={int(indices.max())}")
+            elif batch_idx == 1404:
+                print("index 1404 indices: ", indices)
         x_masked, x, y, mask, _, info= batch
         x_masked, x, y, mask = x_masked.to(device), x.to(device), y.to(device), mask.to(device)
         b = x_masked.shape[0]
@@ -379,29 +495,40 @@ class MaskedRegressorTrainer(Trainer):
             w = torch.ones(x_masked.size(0)).to(device)
         else:
             w = torch.tensor([i[self.w_name] for i in info]).to(device)
-        # Forward pass for both tasks
-        reg_out,ssl_out,features = self.model(x_masked, x)
+        
+        if self.use_meta is not None:
+            meta = torch.tensor([
+                [item[name] for name in self.meta_names] 
+                for item in info
+            ]).to(device).unsqueeze(-1).nan_to_num(0)
+        else:
+            meta = None
+        
+        if torch.isnan(x).any():
+            print('nans in x input!')
+        if torch.isnan(meta).any():
+            print('nans in meta input!')
+        
+        reg_out,ssl_out,_  = self.model(x_masked, x, meta=meta)
 
-        # Calculate SSL loss (masked filling)
         if (len(x.shape) == 3) and (x.shape[1] > 1):
             x = x[:, 0, :]
         ssl_loss = self.ssl_criterion(ssl_out, x)
-        ssl_acc = self.mask_accuracy(ssl_out, x, mask)
+        # ssl_acc = self.mask_accuracy(ssl_out, x, mask) # currently not working
+        ssl_acc = 0
 
-        
-        # Calculate regression loss
         reg_out = reg_out.view(b, -1, self.num_quantiles)
-        out_diff = int(y.shape[1] - reg_out.shape[1])
-        y = y[:, out_diff:]
-        if self.drop_first_y:
-            reg_out = reg_out[:, 1:]
-            y = y[:, 1:]
+
         reg_loss = self.criterion(reg_out, y)
-        reg_loss = (reg_loss * w.unsqueeze(-1)).mean()
+        reg_loss = (reg_loss * w.unsqueeze(-1)).nan_to_num(0).mean()
         out_median = reg_out[..., reg_out.shape[-1]//2]
         reg_acc = (torch.abs(out_median - y) < y * 0.1).sum(0)
-        self.train_aux_loss_1.append(ssl_loss.item())
-        self.train_aux_loss_2.append(reg_loss.item())
+        if self.save_aux_loss:
+            print("saving aux")
+            self.train_aux_loss_1.append(ssl_loss.item())
+            self.train_aux_loss_2.append(reg_loss.item())
+        if batch_idx % 100 == 0:
+            print(f"Batch {batch_idx}: SSL Loss: {ssl_loss.item()}, Regression Loss: {reg_loss.item()}")
         # Combine losses
         loss = (self.ssl_weight * ssl_loss) + ((1 - self.ssl_weight) * reg_loss)
         
@@ -425,11 +552,15 @@ class MaskedRegressorTrainer(Trainer):
                 self.optimizer.step()
                 if self.scheduler is not None:
                     self.scheduler.step()
-                self.check_gradients()  # Monitor gradients
+                # self.check_gradients()  # Monitor gradients
                 
         return loss, reg_acc, x
 
     def eval_batch(self, batch, batch_idx, device):
+        if batch is None:
+            return None, None, None
+        if len(batch) == 2:
+            batch, indices = batch
         x_masked, x, y, mask, _, info = batch
         x_masked, x, y, mask = x_masked.to(device), x.to(device), y.to(device), mask.to(device)
         b = x_masked.shape[0]
@@ -438,28 +569,35 @@ class MaskedRegressorTrainer(Trainer):
             w = torch.ones(x_masked.size(0)).to(device)
         else:
             w = torch.tensor([i[self.w_name] for i in info]).to(device)
-
+        
+        if self.use_meta is not None:
+            meta = torch.tensor([
+                [item[name] for name in self.meta_names] 
+                for item in info
+            ]).to(device).unsqueeze(-1).nan_to_num(0)
+        else:
+            meta = None
+        
         with torch.no_grad():
-            reg_out,ssl_out,features = self.model(x_masked, x)  # Masked filling task
+            reg_out,ssl_out,_  = self.model(x_masked, x, meta=meta)  # Masked filling task
             
-            ssl_loss = self.ssl_criterion(ssl_out, x)
-            ssl_acc = self.mask_accuracy(ssl_out, x, mask)
+        ssl_loss = self.ssl_criterion(ssl_out, x)
+        # ssl_acc = self.mask_accuracy(ssl_out, x, mask)
+        ssl_acc = 0
 
-            reg_out = reg_out.view(b, -1, self.num_quantiles)
-            reg_out = reg_out.view(b, -1, self.num_quantiles)
-            out_diff = int(y.shape[1] - reg_out.shape[1])
-            y = y[:, out_diff:]
-            if self.drop_first_y:
-                reg_out = reg_out[:, 1:]
-                y = y[:, 1:]
-            reg_loss = self.criterion(reg_out, y)
-            reg_loss = (reg_loss * w.unsqueeze(-1)).mean()
-            out_median = reg_out[..., reg_out.shape[-1]//2]
-            reg_acc = (torch.abs(out_median - y) < y * 0.1).sum(0)
+        reg_out = reg_out.view(b, -1, self.num_quantiles)
+
+        reg_loss = self.criterion(reg_out, y)
+        reg_loss = (reg_loss * w.unsqueeze(-1)).nan_to_num(0).mean()
+        out_median = reg_out[..., reg_out.shape[-1]//2]
+        reg_acc = (torch.abs(out_median - y) < y * 0.1).sum(0)
+        if self.save_aux_loss:
             self.val_aux_loss_1.append(ssl_loss.item())
             self.val_aux_loss_2.append(reg_loss.item())
 
-            total_loss = (self.ssl_weight * ssl_loss) + ((1 - self.ssl_weight) * reg_loss)
+        total_loss = (self.ssl_weight * ssl_loss) + ((1 - self.ssl_weight) * reg_loss)
+        if batch_idx % 1000 == 0:
+            print(f"Batch {batch_idx}: SSL Loss: {ssl_loss.item()}, Regression Loss: {reg_loss.item()}")
             
         return total_loss, reg_acc, x
         
@@ -472,18 +610,148 @@ class MaskedRegressorTrainer(Trainer):
     def predict(self, test_dataloader, device):
         """
         Returns the predictions of the model on the given dataset.
+        If output_dir is provided, saves 'tokens.npy' directly to disk using memmap to save memory.
         """
         self.model.eval()
-        preds = np.zeros((0, self.output_dim, self.num_quantiles))
-        targets = np.zeros((0, self.output_dim))
-        all_features = []
-        all_xs = []
-        all_decodes = []
-        all_wv = []
+        preds = []     # List of numpy arrays, concatenate at end
+        targets = []
+        tot_features = []
+        tot_tokens = [] 
+        tot_recon = []
+        tot_xs = []
+        tot_loss = []
         aggregated_info = {}
+        
+        # Pre-calculation for memmap
+        total_samples = len(test_dataloader.dataset)
+        tokens_memmap = None
+        current_idx = 0
+
         pbar = tqdm(test_dataloader)
 
-        for i,(x_masked, x, y, mask, _ , info) in enumerate(pbar):
+        for i,batch in enumerate(pbar):
+            if len(batch)==2:
+                batch, indices = batch
+            x_masked, x, y, mask, _ , info = batch
+            x_masked, x, y, mask = x_masked.to(device), x.to(device), y.to(device), mask.to(device)
+            b = x_masked.shape[0]
+            if self.w_name is None:
+                w = torch.ones(x_masked.size(0)).to(device)
+            else:
+                w = torch.tensor([i[self.w_name] for i in info]).to(device)
+            if self.use_meta is not None:
+                meta = torch.tensor([
+                    [item[name] for name in self.meta_names] 
+                    for item in info
+                ]).to(device).unsqueeze(-1).nan_to_num(0)
+            else:
+                meta = None
+            for item in info:
+                for key, value in item.items():
+                    # Check if value is a scalar (not an array/tensor)
+                    if np.isscalar(value):
+                        if key not in aggregated_info:
+                            aggregated_info[key] = []
+                        aggregated_info[key].append(value)
+            with torch.no_grad():
+                out = self.model(x_masked, x, meta=meta, return_all=True)
+                y_pred = out['regression']
+                ssl_out = out['reconstruction']
+                features = out['cls']
+                tokens = out['tokens']
+                patched_tokens = out['patch_tokens']
+                # y_pred, ssl_out, features = self.model(x_masked, x, meta=meta)
+
+                y_pred = y_pred.view(b, -1, self.num_quantiles)
+            
+            ssl_loss = self.ssl_criterion(ssl_out, x)
+            # ssl_acc = self.mask_accuracy(ssl_out, x, mask) # currently not working
+            ssl_acc = 0
+
+            reg_out = y_pred.view(b, -1, self.num_quantiles)
+
+            reg_loss = self.criterion(reg_out, y)
+            reg_loss = (reg_loss * w.unsqueeze(-1)).nan_to_num(0).mean()
+            out_median = reg_out[..., reg_out.shape[-1]//2]
+            reg_acc = (torch.abs(out_median - y) < y * 0.1).sum(0)
+            out_diff = int(y.shape[1] - y_pred.shape[1])
+            y = y[:, out_diff:]
+            if self.drop_first_y:
+                reg_out = reg_out[:, 1:]
+                y = y[:, 1:]
+            total_loss = (self.ssl_weight * ssl_loss) + ((1 - self.ssl_weight) * reg_loss)
+            pbar.set_description(f'loss:{total_loss:.5f} acc:{reg_acc}')
+            tot_loss.append(total_loss.item())
+            # Save results
+            preds.append(y_pred.cpu().numpy())
+            targets.append(y.cpu().numpy())
+            tot_features.append(features.cpu().numpy())
+            tot_recon.append(ssl_out.cpu().numpy())
+            tot_xs.append(x.cpu().numpy())
+            tot_tokens.append(tokens.mean(1).cpu().numpy()) # take average token
+
+            # # Handle tokens memory efficiently
+            # tokens_np = tokens.cpu().numpy()
+            # if output_dir is not None:
+            #     if tokens_memmap is None:
+            #         # Initialize memmap on first batch
+            #         os.makedirs(output_dir, exist_ok=True)
+            #         token_shape = (total_samples,) + tokens_np.shape[1:]
+            #         tokens_mmap_path = os.path.join(output_dir, 'tokens.npy')
+            #         tokens_memmap = np.memmap(tokens_mmap_path, dtype=tokens_np.dtype, mode='w+', shape=token_shape)
+                
+            #     # Write to memmap
+            #     if current_idx + b <= total_samples:
+            #         tokens_memmap[current_idx : current_idx + b] = tokens_np
+            #     else:
+            #         # Handle potential size mismatch if dataset len was estimate or drop_last behavior?
+            #         # valid for safety
+            #         safe_len = total_samples - current_idx
+            #         if safe_len > 0:
+            #             tokens_memmap[current_idx : current_idx + safe_len] = tokens_np[:safe_len]
+            # else:
+            #     tot_tokens_list.append(tokens_np)
+            
+            # current_idx += b
+
+            if (self.max_iter is not None) and (i > self.max_iter):
+                break
+        
+        print("target len: ", len(targets) * b if len(targets) > 0 else 0, "dataset: ", len(test_dataloader.dataset))
+        
+        # Consolidate results
+        final_preds = np.concatenate(preds, axis=0)
+        final_targets = np.concatenate(targets, axis=0)
+        final_features = np.concatenate(tot_features, axis=0)
+        final_recon = np.concatenate(tot_recon, axis=0)
+        final_xs = np.concatenate(tot_xs, axis=0)
+        final_tokens = np.concatenate(tot_tokens, axis=0)
+        
+        # if output_dir is not None:
+        #      # Flush memmap
+        #      if tokens_memmap is not None:
+        #          tokens_memmap.flush()
+        #      final_tokens = tokens_memmap # Return the memmap object
+        # else:
+        #      final_tokens = np.concatenate(tot_tokens_list, axis=0)
+
+        return (final_preds, final_targets, final_features,
+         final_tokens,  final_recon,
+         final_xs, aggregated_info, np.mean(tot_loss))
+    
+    def generate_samples(self, test_dataloader, device, num_samples=10):
+        xs = []
+        ys = []
+        wvs = []
+        losses = []
+        ssl_criterion = torch.nn.MSELoss(reduction='none')
+        aggregated_info = {}
+        tot_samples = 0
+        pbar = tqdm(test_dataloader)
+        for i, batch in enumerate(pbar):
+            if len(batch)==2:
+                batch, indices = batch
+            x_masked, x, y, mask, _ , info = batch
             x_masked, x, y, mask = x_masked.to(device), x.to(device), y.to(device), mask.to(device)
             b = x_masked.shape[0]
             for item in info:
@@ -493,61 +761,55 @@ class MaskedRegressorTrainer(Trainer):
                         if key not in aggregated_info:
                             aggregated_info[key] = []
                         aggregated_info[key].append(value)
-            if self.w_name is None:
-                w = torch.ones(x_masked.size(0)).to(device)
+                    elif 'wavelength' in key:
+                        print('wv exists')
+                        if len(wvs) and (wvs[0].shape[-1] != len(value)):
+                            val = wvs[0]
+                        else:
+                            val = value[None] if len(value.shape) == 1 else value
+                        wvs.append(val)
+            if self.use_meta is not None:
+                meta = torch.tensor([
+                    [item[name] for name in self.meta_names] 
+                    for item in info
+                ]).to(device).unsqueeze(-1).nan_to_num(0)
             else:
-                w = torch.tensor([i[self.w_name] for i in info]).to(device)
+                meta = None
             with torch.no_grad():
-                y_pred, decod_out, features = self.model(x_masked, x)
-                y_pred = y_pred.view(b, -1, self.num_quantiles)
-            out_diff = int(y.shape[1] - y_pred.shape[1])
-            y = y[:, out_diff:]
-            if self.drop_first_y:
-                reg_out = reg_out[:, 1:]
-                y = y[:, 1:]
-            ssl_loss = self.ssl_criterion(decod_out, x)
-            reg_loss = self.criterion(y_pred, y)
-            reg_loss = (reg_loss * w.unsqueeze(-1)).mean()
-            out_median = y_pred[..., y_pred.shape[-1]//2]
-            reg_acc = (torch.abs(out_median - y) < y * 0.1).sum(0) / b
-            total_loss = (self.ssl_weight * ssl_loss) + ((1 - self.ssl_weight) * reg_loss)
-
-            pbar.set_description(f"test_loss: {total_loss.item():.4f}, test_acc %: {reg_acc}")
-
-            # if i % 100 == 0:
-            #     decode_sample = decod_out[0].cpu().numpy()
-            #     plt.plot(x[0].cpu().numpy(), alpha=0.5, label='Original Sample')
-            #     plt.plot(decode_sample, alpha=0.3, label='Decoded Sample')
-            #     plt.legend()
-            #     plt.savefig(f'images/masked_regressor_decode_sample_{i}.png')
-            #     plt.close()
-            #
-            preds = np.concatenate((preds, y_pred.cpu().numpy()))
-            targets = np.concatenate((targets, y.cpu().numpy()))
-            all_features.append(features.cpu().numpy())
-            all_xs.append(x.cpu().numpy())
-            all_decodes.append(decod_out.cpu().numpy())
-            
-            if (self.max_iter is not None) and (self.max_iter >= 0) and (i > self.max_iter):
+                y_pred, ssl_out, features = self.model(x_masked, x, meta=meta)
+            xs.append(x.cpu().numpy())
+            ys.append(ssl_out.cpu().numpy())
+            ssl_loss = ssl_criterion(ssl_out, x).mean(-1)
+            print(ssl_loss.shape)
+            losses.append(ssl_loss.cpu().numpy())
+            tot_samples += b
+            if tot_samples > num_samples:
                 break
-        print("target len: ", len(targets), "dataset: ", len(test_dataloader.dataset))
-        return preds, targets, np.concatenate(all_features, axis=0),\
-        np.concatenate(all_xs, axis=0), np.concatenate(all_decodes, axis=0), \
-            aggregated_info
+        return np.concatenate(xs, axis=0), np.concatenate(ys, axis=0), np.concatenate(wvs, axis=0), aggregated_info, np.concatenate(losses, axis=0)
 
 
 class LLMTrainer(Trainer):
 
-    def __init__(self, lora_params, alpha=1, beta=1, gamma=1, max_chunk_size=128, tokenizer=None, **kwargs):
-        # Pop custom kwargs before calling base Trainer.__init__
-        self.lambda_feat = kwargs.pop('lambda_feat', 0.0)
-        self.lambda_text = kwargs.pop('lambda_text', 0.0)
-        self.lambda_retrieval = kwargs.pop('lambda_retrieval', 0.0)
-        self.lambda_physics = kwargs.pop('lambda_physics', 0.0)
+    def __init__(self, lora_params, alpha=1, beta=1, gamma=1,
+                 cfm_weight=0.01, max_chunk_size=128, tokenizer=None, mode="single_star", 
+                 curriculum_decay_steps=1000, quantiles=None, loss_lambda=1.0,
+                 backend_config=None, **kwargs):
+        if quantiles is None:
+            quantiles = [0.159, 0.5, 0.841]  # Default: ~1-sigma + median
         super(LLMTrainer, self).__init__(**kwargs)
+        if backend_config is not None:
+            if hasattr(backend_config, "to_dict"):
+                self.backend_metadata = backend_config.to_dict()
+            elif isinstance(backend_config, dict):
+                self.backend_metadata = backend_config
+            else:
+                self.backend_metadata = {"backend": str(backend_config)}
+        else:
+            self.backend_metadata = None
         self.alpha = alpha
         self.beta = beta
         self.gamma = gamma
+        self.cfm_weight = cfm_weight
         self.max_chunk_size = max_chunk_size
         self.tokenizer = tokenizer
         self.mode = mode  # "single_star" or "two_star"
@@ -558,6 +820,23 @@ class LLMTrainer(Trainer):
         self.lora_target_modules = lora_params['lora_target_modules']
         self.lora_start_epoch = lora_params['lora_start_epoch']
         self.lora_modules = None
+        
+        # Curriculum learning parameters
+        self.curriculum_decay_steps = curriculum_decay_steps
+        self.global_step = 0
+        self.initial_single_sample_prob = None  # Will be set from dataloader
+        
+        # Loss tracking arrays
+        self.ce_losses = []
+        self.stellar_losses = []
+        self.cfm_losses = []
+        
+        # CQR loss for stellar parameters
+        self.stellar_cqr_loss = CQR(quantiles=quantiles, reduction='mean')
+        self.quantiles = quantiles
+        self.num_quantiles = len(quantiles)
+        self.loss_lambda = float(loss_lambda)
+        
         self._apply_freeze_strategy(self.freeze_strategy)
         # Prepare loss tracking/logging structures
         self._loss_term_tracker = {
@@ -574,22 +853,77 @@ class LLMTrainer(Trainer):
                     writer = csv.writer(f)
                     writer.writerow(['phase', 'epoch', 'batches', 'total_loss', 'lm_loss', 'feat_loss', 'text_loss', 'retr_loss', 'physics_loss'])
 
+    def _update_curriculum(self):
+        """Update single_sample_prob according to curriculum schedule"""
+        if (self.curriculum_decay_steps > 0 and 
+            hasattr(self, 'combined_mode') and self.combined_mode and
+            hasattr(self, 'train_dl')):
+            
+            # Initialize initial probability from dataset on first call
+            if self.initial_single_sample_prob is None:
+                if hasattr(self.train_dl.dataset, 'single_sample_prob'):
+                    self.initial_single_sample_prob = self.train_dl.dataset.single_sample_prob
+                    print(f"Initial single_sample_prob: {self.initial_single_sample_prob}")
+                else:
+                    return  # No mixed dataset to update
+            
+            # Calculate how many decay steps have occurred
+            decay_steps_occurred = self.global_step // self.curriculum_decay_steps
+            
+            # Decrease by 0.1 each time, but stop at 0.5
+            target_prob = max(0.5, self.initial_single_sample_prob - (decay_steps_occurred * 0.1))
+            
+            # Update dataset probability if it changed
+            current_prob = self.train_dl.dataset.single_sample_prob
+            if abs(current_prob - target_prob) > 1e-6:  # Only update if there's a significant change
+                self.train_dl.dataset.update_single_probability(target_prob)
+                print(f"Step {self.global_step}: Updated single_sample_prob from {current_prob:.1f} to {target_prob:.1f}")
+        
+        self.global_step += 1
+
+    def fit(self, num_epochs, device, early_stopping=None, start_epoch=0, best='loss', conf=False,
+            initial_min_loss=None, initial_best_acc=None):
+        """Override fit to include loss arrays in results"""
+        # Call parent fit method
+        results = super().fit(num_epochs, device, early_stopping, start_epoch, best, conf,
+                             initial_min_loss, initial_best_acc)
+        
+        # Add loss tracking arrays to results
+        results.update({
+            'ce_losses': self.ce_losses,
+            'stellar_losses': self.stellar_losses,
+            'cfm_losses': self.cfm_losses
+        })
+        
+        return results
+
     def _apply_lora(self):
         """Apply LoRA to the model - fixed version"""
         print("Applying LoRA layers...")
 
         # Get supported linear layer types
-        try:
-            linear_types = (torch.nn.Linear, RowParallelLinear, ColumnParallelLinear)
-            print("Using FairScale parallel layers support")
-        except ImportError:
-            linear_types = (torch.nn.Linear,)
-            print("FairScale not available, using only torch.nn.Linear")
+        linear_types = [torch.nn.Linear]
+        if RowParallelLinear is not None:
+            linear_types.append(RowParallelLinear)
+        if ColumnParallelLinear is not None:
+            linear_types.append(ColumnParallelLinear)
+        linear_types = tuple(linear_types)
+        print(f"Using linear types: {linear_types}")
+
+        # Use unwrapped model to avoid module. prefix issues
+        model_to_search = self._unwrap_model()
+        
+        # Check if LoRA is already applied to the unwrapped model
+        existing_lora = [m for m in model_to_search.modules() if isinstance(m, LoRALinear)]
+        if existing_lora:
+            print(f"✓ LoRA already applied to {len(existing_lora)} modules. Skipping re-application.")
+            self.lora_modules = existing_lora
+            return
 
         # First, let's see what modules actually exist in the model
         print("Available modules in model:")
         all_modules = []
-        for name, module in self.model.named_modules():
+        for name, module in model_to_search.named_modules():
             if isinstance(module, linear_types):
                 all_modules.append(name)
 
@@ -633,7 +967,7 @@ class LLMTrainer(Trainer):
             return
 
         self.lora_modules = apply_lora_to_model(
-            self.model,
+            model_to_search,
             target_modules,
             rank=self.lora_rank,
             alpha=self.lora_alpha,
@@ -641,6 +975,26 @@ class LLMTrainer(Trainer):
         )
 
         print(f"Successfully applied LoRA to {len(self.lora_modules)} modules")
+        
+        # Critical: Update optimizer with new parameters
+        if self.optimizer is not None:
+            # Gather new parameters (requires_grad=True and 'lora' in name)
+            # that are not already in the optimizer
+            existing_params = set()
+            for group in self.optimizer.param_groups:
+                for p in group['params']:
+                    existing_params.add(p)
+            
+            new_params = []
+            for name, p in model_to_search.named_parameters():
+                if p.requires_grad and p not in existing_params:
+                     new_params.append(p)
+            
+            if new_params:
+                print(f"Adding {len(new_params)} new LoRA parameters to optimizer")
+                self.optimizer.add_param_group({'params': new_params})
+            else:
+                print("Warning: No new parameters found to add to optimizer after LoRA application")
 
     def _is_main_process(self) -> bool:
         return (not dist.is_initialized()) or dist.get_rank() == 0
@@ -715,7 +1069,7 @@ class LLMTrainer(Trainer):
             for name, param in self.model.named_parameters():
                 if 'base_model' not in name and 'fm_model' not in name:
                     param.requires_grad = True
-                    print(f"  ✓ Unfrozen: {name}")
+                    # print(f"  ✓ Unfrozen: {name}")
                 else:
                     param.requires_grad = False
 
@@ -723,17 +1077,27 @@ class LLMTrainer(Trainer):
             # Apply LoRA if not already applied
             if not self.lora_modules and self.epoch == self.lora_start_epoch:
                 self._apply_lora()
-
-            # Freeze base model, enable encoder, regressor, AND LoRA parameters
-            for name, param in self.model.named_parameters():
-                if 'base_model' not in name and 'fm_model' not in name:
-                    param.requires_grad = True
-                    print(f"  ✓ Unfrozen : {name}")
-                elif 'lora' in name:
-                    param.requires_grad = True
-                    print(f"  ✓ Unfrozen (LoRA): {name}")
-                else:
-                    param.requires_grad = False
+            
+            # STAGED STRATEGY: 
+            # Phase 1 (Warmup): Train Projector (Aux), Freeze LoRA
+            # Phase 2 (LoRA): Train LoRA, Freeze Projector
+            
+            if self.epoch < self.lora_start_epoch:
+                # Phase 1: Projector/Aux only
+                for name, param in self.model.named_parameters():
+                    is_aux = 'base_model' not in name and 'fm_model' not in name
+                    if is_aux:
+                        param.requires_grad = True
+                    else:
+                        param.requires_grad = False
+            else:
+                # Phase 2: LoRA only
+                for name, param in self.model.named_parameters():
+                    is_lora = 'lora' in name
+                    if is_lora:
+                        param.requires_grad = True
+                    else:
+                        param.requires_grad = False
 
         elif strategy == 'none':
             # Unfreeze everything
@@ -743,12 +1107,13 @@ class LLMTrainer(Trainer):
         self.current_freeze_state = strategy
 
         # Verify critical components are trainable
-        critical_components = ['projector', 'projector_a', 'projector_b']
+        critical_components = ['projector']
         for component in critical_components:
             component_params = [p for name, p in self.model.named_parameters()
                                 if component in name and p.requires_grad]
             if not component_params:
                 print(f"ERROR: No trainable parameters in {component}!")
+                print(f"DEBUG: All params: {[n for n, p in self.model.named_parameters() if p.requires_grad]}")
             else:
                 total_params = sum(p.numel() for p in component_params)
                 print(f"✓ {component}: {len(component_params)} layers, {total_params:,} trainable params")
@@ -769,22 +1134,16 @@ class LLMTrainer(Trainer):
 
         # print(f"Trainable module types: {list(trainable_modules)}")
         print(f"Total trainable parameters: {trainable_count:,}")
+        print(trainable_modules)
     
     def train_epoch(self, device, epoch):
         # Handle mode switching for combined mode
         if hasattr(self, 'combined_mode') and self.combined_mode:
-            if epoch >= self.switch_epoch and self.mode == "single_star":
-                print(f"\n*** SWITCHING MODE FROM single_star TO two_star AT EPOCH {epoch} ***")
-                # Switch to two_star mode
-                self.mode = "two_star"
-                self.train_dl = self.two_star_loaders['train']
-                self.val_dl = self.two_star_loaders['val']
-                # Update model mode
-                if hasattr(self.model, 'module'):
-                    self.model.module.mode = "two_star"
-                else:
-                    self.model.mode = "two_star"
-                print(f"Switched to two_star mode with {len(self.train_dl)} batches per epoch")
+            # Mixed dataset handles mode switching internally based on probability
+            if hasattr(self.model, 'module'):
+                self.model.module.mode = "combined"
+            else:
+                self.model.mode = "combined"
         
         self._apply_freeze_strategy(self.freeze_strategy)
         self._reset_loss_tracker('train')
@@ -796,9 +1155,6 @@ class LLMTrainer(Trainer):
         # Shift for autoregressive prediction
         shift_logits = logits[..., :-1, :].contiguous()
         shift_labels = target_ids[..., 1:].contiguous()
-
-        # shift_logits = logits
-        # shift_labels = target_ids
         
         # Only compute loss on actual answer tokens (not -100)
         active_mask = (shift_labels != -100)
@@ -814,195 +1170,268 @@ class LLMTrainer(Trainer):
         active_logits = flat_logits[flat_mask]
         active_labels = flat_labels[flat_mask]
         
-        # For two_star mode, weight first 2 tokens more heavily
-        if hasattr(self, 'mode') and self.mode == 'two_star':
-            # Create weights for all active tokens
-            weights = torch.ones_like(active_labels, dtype=torch.float, device=logits.device)
-            
-            # Find positions of active tokens for each sample in batch
-            batch_size, seq_len = active_mask.shape
-            weight_multiplier = 3.0  # Make first 2 tokens 3x more important
-            
-            # Count active tokens per sample to identify first 2 tokens
-            for batch_idx in range(batch_size):
-                sample_active_mask = active_mask[batch_idx]
-                if sample_active_mask.any():
-                    # Get indices of active tokens for this sample
-                    active_indices = torch.nonzero(sample_active_mask, as_tuple=False).squeeze(-1)
-                    if len(active_indices) >= 2:
-                        # Weight the first 2 active tokens more heavily
-                        first_two_global_indices = batch_idx * seq_len + active_indices[:2]
-                        # Find these indices in the flattened active_labels
-                        flat_active_indices = torch.nonzero(flat_mask, as_tuple=False).squeeze(-1)
-                        for global_idx in first_two_global_indices:
-                            local_idx = (flat_active_indices == global_idx).nonzero(as_tuple=False)
-                            if len(local_idx) > 0:
-                                weights[local_idx[0]] = weight_multiplier
-            
-            # Compute weighted cross entropy loss
-            loss = F.cross_entropy(active_logits, active_labels, reduction='none')
-            loss = (loss * weights).mean()
-        else:
-            # Standard cross entropy loss for non-two_star modes
-            loss = F.cross_entropy(active_logits, active_labels, reduction='mean')
         
-        # Print diagnostic info
-        # print(f"Active tokens: {active_mask.sum().item()}/{active_mask.numel()} "
-        #     f"({100*active_mask.sum().item()/active_mask.numel():.1f}%)")
+        loss = F.cross_entropy(active_logits, active_labels, reduction='mean')
         
+       
         return loss
     
     def get_logits(self, batch, device, val=False):
-        # DEBUG: Check input tensors
-        input_ids = batch['input_ids'].to(device)
-        target_ids = batch['target_ids'].to(device)
+        batch_device = {}
+        for key, value in batch.items():
+            if isinstance(value, torch.Tensor):
+                batch_device[key] = value.to(device)
+            else:
+                batch_device[key] = value
 
-        neighbor_latents = batch.get('neighbor_latents')
-        neighbor_mask = batch.get('neighbor_mask')
-        if neighbor_latents is not None and neighbor_latents.numel() > 0:
-            neighbor_latents = neighbor_latents.to(device)
-        else:
-            neighbor_latents = None
-        if neighbor_mask is not None and neighbor_mask.numel() > 0:
-            neighbor_mask = neighbor_mask.to(device)
-        else:
-            neighbor_mask = None
+        input_ids = batch_device['input_ids']
+        target_ids = batch_device['target_ids']
 
-        physics_target = batch.get('physics_target_norm')
-        if physics_target is not None and physics_target.numel() > 0:
-            physics_target = physics_target.to(device)
-        else:
-            physics_target = None
-        physics_mask = batch.get('physics_mask')
-        if physics_mask is not None:
-            physics_mask = physics_mask.to(device)
+        mode = getattr(self, 'mode', 'single_star')
 
-        neighbor_targets = batch.get('neighbor_target_idx')
-        if neighbor_targets is not None:
-            neighbor_targets = neighbor_targets.to(device)
-
-        tot_length = batch['input_lengths'] + batch['target_lengths']
-        
-        # Handle different data structures based on mode
-        if self.mode == "two_star":
-            star_a_spectra = batch['masked_spectra_a'].to(device)
-            star_b_spectra = batch['masked_spectra_b'].to(device)
-            star_a_indices = batch['star_a_feature_indices'].to(device)
-            star_b_indices = batch['star_b_feature_indices'].to(device)
-
-        else:
-            special_token_positions = batch['feature_start_indices'].to(device)
-            input_spectra = batch['masked_spectra'].to(device) 
-        
-        # Forward pass with memory tracking and AMP
         mem_before_forward = torch.cuda.memory_allocated(device) / 1024**3
-        with autocast(enabled=getattr(self, 'use_amp', False)):
-            outputs = self.model(
-                input_ids=input_ids,
-                input_spectra=input_spectra,
-                special_token_positions=special_token_positions,
-                question_start_indices=batch['question_start_indices'].to(device),
-                answer_start_indices=batch['answer_start_indices'].to(device),
-                neighbor_latents=neighbor_latents,
-                neighbor_mask=neighbor_mask,
+        with torch.amp.autocast('cuda', enabled=getattr(self, 'use_amp', False)):
+            cm = torch.no_grad() if val else torch.enable_grad()
+            with cm:
+                outputs = self.model(batch_device)
+
+        return outputs
+
+    def _forward_combined(self, batch, device):
+        input_ids = batch['input_ids'].to(device)
+        batch_size, seq_len = input_ids.shape
+
+        full_logits = None
+        full_hidden = None
+        cfm_losses = []
+
+        def _allocate(outputs):
+            nonlocal full_logits, full_hidden
+            if full_logits is None:
+                full_logits = torch.zeros(
+                    (batch_size,) + outputs['logits'].shape[1:],
+                    dtype=outputs['logits'].dtype,
+                    device=outputs['logits'].device,
+                )
+                full_hidden = torch.zeros(
+                    (batch_size,) + outputs['h'].shape[1:],
+                    dtype=outputs['h'].dtype,
+                    device=outputs['h'].device,
+                )
+
+        single_mask = batch['mode_mask_single']
+        comp_mask = batch['mode_mask_comparative']
+
+        single_indices = torch.nonzero(single_mask, as_tuple=False).squeeze(-1)
+        comp_indices = torch.nonzero(comp_mask, as_tuple=False).squeeze(-1)
+
+        if single_indices.numel() > 0:
+            single_indices_device = single_indices.to(device)
+            single_inputs = input_ids.index_select(0, single_indices_device)
+
+            if batch.get('x_raw') is not None and batch['x_raw'] is not None:
+                single_features = batch['x_raw'].index_select(0, single_indices).to(device)
+            elif batch.get('masked_spectra') is not None and batch['masked_spectra'] is not None:
+                single_features = batch['masked_spectra'].index_select(0, single_indices).to(device)
+            else:
+                raise ValueError("Missing spectral features for single-star samples in mixed batch")
+
+            special_positions = batch['feature_start_indices'].index_select(0, single_indices).to(device)
+
+            outputs_single = self.model(
+                input_ids=single_inputs,
+                input_spectra=single_features,
+                special_token_positions=special_positions,
             )
-            
-            logits = outputs['logits']
-            
-            # Compute loss components
-            lm_loss = self.get_loss(logits, target_ids)
+            _allocate(outputs_single)
+            full_logits.index_copy_(0, single_indices_device, outputs_single['logits'])
+            full_hidden.index_copy_(0, single_indices_device, outputs_single['h'])
+            if 'cfm_loss' in outputs_single:
+                cfm_losses.append(outputs_single['cfm_loss'])
+
+        if comp_indices.numel() > 0:
+            comp_indices_device = comp_indices.to(device)
+            comp_inputs = input_ids.index_select(0, comp_indices_device)
+
+            if batch.get('x_raw_a') is not None and batch['x_raw_a'] is not None:
+                star_a = batch['x_raw_a'].index_select(0, comp_indices).to(device)
+            elif batch.get('masked_spectra_a') is not None and batch['masked_spectra_a'] is not None:
+                star_a = batch['masked_spectra_a'].index_select(0, comp_indices).to(device)
+            else:
+                raise ValueError("Missing Star A features for comparative samples in mixed batch")
+
+            if batch.get('x_raw_b') is not None and batch['x_raw_b'] is not None:
+                star_b = batch['x_raw_b'].index_select(0, comp_indices).to(device)
+            elif batch.get('masked_spectra_b') is not None and batch['masked_spectra_b'] is not None:
+                star_b = batch['masked_spectra_b'].index_select(0, comp_indices).to(device)
+            else:
+                raise ValueError("Missing Star B features for comparative samples in mixed batch")
+
+            star_a_indices = batch['star_a_feature_indices'].index_select(0, comp_indices).to(device)
+            star_b_indices = batch['star_b_feature_indices'].index_select(0, comp_indices).to(device)
+            star_a_indices = star_a_indices.clone()
+            star_b_indices = star_b_indices.clone()
+            star_a_indices[star_a_indices < 0] = seq_len
+            star_b_indices[star_b_indices < 0] = seq_len
+
+            outputs_comp = self.model(
+                input_ids=comp_inputs,
+                input_spectra=None,
+                special_token_positions=None,
+                star_a_spectra=star_a,
+                star_b_spectra=star_b,
+                star_a_indices=star_a_indices,
+                star_b_indices=star_b_indices,
+            )
+            _allocate(outputs_comp)
+            full_logits.index_copy_(0, comp_indices_device, outputs_comp['logits'])
+            full_hidden.index_copy_(0, comp_indices_device, outputs_comp['h'])
+            if 'cfm_loss' in outputs_comp:
+                cfm_losses.append(outputs_comp['cfm_loss'])
+
+        if full_logits is None or full_hidden is None:
+            raise ValueError("Mixed batch produced no forward outputs")
+
+        outputs = {"logits": full_logits, "h": full_hidden}
+        if cfm_losses:
+            outputs['cfm_loss'] = torch.stack(cfm_losses).mean()
+        return outputs
+
+
+
+    def train_batch(self, batch, batch_idx, device):
+        """Training step with AMP and detailed memory debugging"""
+        
+        # Update curriculum learning schedule
+        self._update_curriculum()
+        
+        # Memory before forward pass
+        torch.cuda.empty_cache()
+        gc.collect()
+
+
+
+        outputs = self.get_logits(batch, device, val=False)
+        
+        target_ids = batch['target_ids'].to(device)
+        # Compute loss
+        # Compute language modeling loss
+        lm_loss = self.get_loss(outputs['logits'], target_ids)
+
+        # Store CE loss
+        self.ce_losses.append(lm_loss.item())
+
+        # Track stellar loss for weighting
+        stellar_loss_tensor = None
+        stellar_loss_value = None
+
+        # Add CFM loss if available
+        cfm_loss_tensor = None
+        cfm_loss_value = None
+        if 'cfm_loss' in outputs:
+            cfm_loss_tensor = outputs['cfm_loss']
+            cfm_loss_value = cfm_loss_tensor.item()
+
+        # Add stellar parameter loss if available
+        if 'stellar_predictions' in outputs:
+            print("stellar prediction in outputs!")
+            stellar_preds = outputs['stellar_predictions']
+            stellar_loss_candidate = self.compute_stellar_parameter_loss(stellar_preds, batch)
+            if stellar_loss_candidate is not None:
+                # Check for NaN in stellar loss
+                if torch.isnan(stellar_loss_candidate) or torch.isinf(stellar_loss_candidate):
+                    print(f"Warning: NaN/inf detected in stellar parameter loss, skipping")
+                    # Don't add NaN loss to total loss
+                else:
+                    # Convert stellar loss to match model precision if needed
+                    stellar_loss_tensor = stellar_loss_candidate.to(lm_loss.dtype)
+                    stellar_loss_value = stellar_loss_tensor.item()
+
+                    # Log stellar parameter loss for monitoring (every 100 batches)
+                    if batch_idx % 100 == 0:
+                        print(f"Stellar Param Loss: {stellar_loss_tensor.item():.4f}")
+
+        # else:
+        #     print("stellar_prediction do not exists")
+        # Combine CE and stellar losses according to weighting
+        if stellar_loss_tensor is not None:
+            lambda_weight = max(0.0, min(1.0, self.loss_lambda))
+            loss = lambda_weight * lm_loss + (1.0 - lambda_weight) * stellar_loss_tensor
+        else:
             loss = lm_loss
 
-            inv_loss = None
-            if self.lambda_feat > 0:
-                lat_rec = outputs.get('latent_recon_from_tokens', None)
-                lat_tgt = outputs.get('latent_target', None)
-                if lat_rec is not None and lat_tgt is not None:
-                    lat_tgt = lat_tgt.to(device=lat_rec.device, dtype=lat_rec.dtype)
-                    inv_loss = F.mse_loss(lat_rec, lat_tgt, reduction='mean')
-                    loss = loss + self.lambda_feat * inv_loss
+        # Add CFM contribution after core loss combination
+        if cfm_loss_tensor is not None:
+            cfm_loss_scaled = (self.cfm_weight * cfm_loss_tensor).to(loss.dtype)
+            loss = loss + cfm_loss_scaled
+            if batch_idx % 100 == 0:
+                print(f"CFM Loss: {cfm_loss_tensor.item():.4f}", end=', ')
 
-            text_loss = None
-            if self.lambda_text > 0:
-                pred_latent = outputs.get('pred_latent_from_text', None)
-                lat_tgt2 = outputs.get('latent_target', None)
-                if pred_latent is not None and lat_tgt2 is not None:
-                    lat_tgt2 = lat_tgt2.to(device=pred_latent.device, dtype=pred_latent.dtype)
-                    text_loss = F.mse_loss(pred_latent, lat_tgt2, reduction='mean')
-                    loss = loss + self.lambda_text * text_loss
+        # Store CFM loss (None if not available)
+        self.cfm_losses.append(cfm_loss_value)
 
-            retrieval_loss = None
-            if self.lambda_retrieval > 0:
-                neighbor_logits = outputs.get('neighbor_logits', None)
-                neighbor_mask_eff = outputs.get('neighbor_mask', neighbor_mask)
-                if neighbor_logits is not None and neighbor_targets is not None and neighbor_logits.numel() > 0:
-                    if neighbor_mask_eff is not None and neighbor_mask_eff.numel() > 0:
-                        valid_mask = (neighbor_mask_eff.sum(dim=-1) > 0)
-                        if valid_mask.any():
-                            idx = valid_mask.nonzero(as_tuple=True)[0]
-                            if idx.numel() > 0:
-                                retrieval_loss = F.cross_entropy(neighbor_logits[idx], neighbor_targets[idx], reduction='mean')
-                    else:
-                        retrieval_loss = F.cross_entropy(neighbor_logits, neighbor_targets, reduction='mean')
-                    if retrieval_loss is not None:
-                        loss = loss + self.lambda_retrieval * retrieval_loss
-
-            physics_loss = None
-            if self.lambda_physics > 0 and physics_target is not None and physics_target.numel() > 0:
-                physics_pred = outputs.get('physics_pred', None)
-                if physics_pred is not None:
-                    if physics_pred.shape != physics_target.shape:
-                        physics_pred = physics_pred[:, :physics_target.shape[1]]
-                    physics_loss_raw = F.mse_loss(physics_pred, physics_target, reduction='none')
-                    if physics_mask is not None:
-                        mask = physics_mask.view(-1, 1)
-                        denom = mask.sum().clamp_min(1e-6)
-                        physics_loss = (physics_loss_raw * mask).sum() / denom
-                    else:
-                        physics_loss = physics_loss_raw.mean()
-                    loss = loss + self.lambda_physics * physics_loss
-
-        # Record scalar losses for logging/exports
-        lm_loss_val = float(lm_loss.detach().item()) if lm_loss is not None else 0.0
-        inv_loss_val = float(inv_loss.detach().item()) if inv_loss is not None else 0.0
-        text_loss_val = float(text_loss.detach().item()) if text_loss is not None else 0.0
-        total_loss_val = float(loss.detach().item())
-        retrieval_loss_val = float(retrieval_loss.detach().item()) if retrieval_loss is not None else 0.0
-        physics_loss_val = float(physics_loss.detach().item()) if physics_loss is not None else 0.0
-
-        if hasattr(self, 'train_aux_loss_1'):
-            self.train_aux_loss_1.append(lm_loss_val)
-            self.train_aux_loss_2.append(inv_loss_val)
-            self.train_aux_loss_3.append(text_loss_val)
-
-        self._update_loss_tracker('train', total=total_loss_val, lm=lm_loss_val,
-                                   feat=inv_loss_val, text=text_loss_val,
-                                   retr=retrieval_loss_val, phys=physics_loss_val)
+        # Store stellar parameter loss (None if not available)
+        self.stellar_losses.append(stellar_loss_value)
         
-        # Backward pass with AMP
-        if getattr(self, 'use_amp', False) and hasattr(self, 'scaler'):
-            # Scale loss and backward
+        # Add classification loss for comparative samples
+        if 'classification_logits' in outputs and 'pair_labels' in batch:
+            classification_loss_candidate = self.compute_classification_loss(outputs['classification_logits'], batch)
+            if classification_loss_candidate is not None:
+                # Check for NaN in classification loss
+                if torch.isnan(classification_loss_candidate) or torch.isinf(classification_loss_candidate):
+                    print(f"Warning: NaN/inf detected in classification loss, skipping")
+                else:
+                    classification_loss_converted = classification_loss_candidate.to(loss.dtype)
+                    loss = loss + classification_loss_converted
+
+                    # Log classification loss for monitoring (every 100 batches)
+                    if batch_idx % 100 == 0:
+                        print(f"Classification Loss: {classification_loss_candidate.item():.4f}")
+
+        # Add feature prediction loss if available
+        if 'predicted_features' in outputs:
+            predicted_features = outputs['predicted_features']
+            feature_loss_candidate = self.compute_feature_prediction_loss(predicted_features, batch)
+            if feature_loss_candidate is not None:
+                # Check for NaN in feature loss
+                if torch.isnan(feature_loss_candidate) or torch.isinf(feature_loss_candidate):
+                    print(f"Warning: NaN/inf detected in feature prediction loss, skipping")
+                else:
+                    # Get feature loss weight from model if available
+                    feature_weight = getattr(self._unwrap_model(), 'feature_loss_weight', 1.0)
+                    # Scale the feature loss (already in fp16 from fp16 inputs)
+                    feature_loss_scaled = (feature_weight * feature_loss_candidate).to(loss.dtype)
+                    loss = loss + feature_loss_scaled
+
+                    # Log feature prediction loss for monitoring (every 100 batches)
+                    if batch_idx % 100 == 0:
+                        print(f"Feature Prediction Loss: {feature_loss_candidate.item():.4f}")
+
+        # Check for NaN in total loss
+        if torch.isnan(loss) or torch.isinf(loss):
+            print(f"Warning: NaN/inf detected in total loss at batch {batch_idx}")
+            print(f"  LM Loss: {lm_loss.item() if not torch.isnan(lm_loss) else 'NaN'}")
+            if 'cfm_loss' in outputs:
+                print(f"  CFM Loss: {outputs['cfm_loss'].item() if not torch.isnan(outputs['cfm_loss']) else 'NaN'}")
+            # Skip backward pass for this batch - just zero gradients and return
+            self.optimizer.zero_grad()
+            return torch.tensor(1e-6, device=device), 0, outputs['h']
+
+        # Backward pass with gradient scaling for mixed precision compatibility
+        # Loss terms are already aligned to the main loss dtype
+        if self.scaler is not None:
             self.scaler.scale(loss).backward()
-            
-            # Gradient clipping (optional)
-            if hasattr(self, 'max_grad_norm') and self.max_grad_norm > 0:
+            if self.max_grad_norm is not None and self.max_grad_norm > 0:
                 self.scaler.unscale_(self.optimizer)
                 torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.max_grad_norm)
-            
-            # Optimizer step with scaler
             self.scaler.step(self.optimizer)
             self.scaler.update()
         else:
-            # Standard backward pass
             loss.backward()
-            
-            # Gradient clipping (optional)
-            if hasattr(self, 'max_grad_norm') and self.max_grad_norm > 0:
+            if self.max_grad_norm is not None and self.max_grad_norm > 0:
                 torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.max_grad_norm)
-            
-            # Standard optimizer step
             self.optimizer.step()
-        
+       
         # Learning rate scheduler
         if self.scheduler is not None:
             self.scheduler.step()
@@ -1014,137 +1443,404 @@ class LLMTrainer(Trainer):
         outputs = self.get_logits(batch, device, val=True)
 
         target_ids = batch['target_ids'].to(device)
-        neighbor_latents = batch.get('neighbor_latents')
-        neighbor_mask = batch.get('neighbor_mask')
-        if neighbor_latents is not None and neighbor_latents.numel() > 0:
-            neighbor_latents = neighbor_latents.to(device)
+        
+        lm_loss = self.get_loss(outputs['logits'], target_ids)
+        
+        stellar_loss_tensor = None
+
+        # Add CFM loss if available
+        if 'cfm_loss' in outputs:
+            cfm_loss = outputs['cfm_loss']
+        
+        # Add stellar parameter loss if available
+        if 'stellar_predictions' in outputs:
+            stellar_preds = outputs['stellar_predictions']
+            stellar_loss_candidate = self.compute_stellar_parameter_loss(stellar_preds, batch)
+            if stellar_loss_candidate is not None:
+                # Check for NaN in stellar loss
+                if torch.isnan(stellar_loss_candidate) or torch.isinf(stellar_loss_candidate):
+                    print(f"Warning: NaN/inf detected in stellar parameter loss, skipping")
+                else:
+                    stellar_loss_tensor = stellar_loss_candidate
+                    if batch_idx % 10 == 0:
+                        print(f"  Stellar Param Loss: {stellar_loss_tensor.item():.4f}")
+
+        if stellar_loss_tensor is not None:
+            lambda_weight = max(0.0, min(1.0, self.loss_lambda))
+            loss = lambda_weight * lm_loss + (1.0 - lambda_weight) * stellar_loss_tensor
         else:
-            neighbor_latents = None
-        if neighbor_mask is not None and neighbor_mask.numel() > 0:
-            neighbor_mask = neighbor_mask.to(device)
-        else:
-            neighbor_mask = None
-        neighbor_targets = batch.get('neighbor_target_idx')
-        if neighbor_targets is not None:
-            neighbor_targets = neighbor_targets.to(device)
+            loss = lm_loss
 
-        physics_target = batch.get('physics_target_norm')
-        if physics_target is not None and physics_target.numel() > 0:
-            physics_target = physics_target.to(device)
-        else:
-            physics_target = None
-        physics_mask = batch.get('physics_mask')
-        if physics_mask is not None:
-            physics_mask = physics_mask.to(device)
+        if 'cfm_loss' in outputs:
+            loss = loss + self.cfm_weight * outputs['cfm_loss']
+            if batch_idx % 100 == 0:
+                print(f"  LM Loss: {lm_loss.item():.4f}, CFM Loss: {outputs['cfm_loss'].item():.4f}")
+        
+        # Add classification loss for comparative samples
+        if 'classification_logits' in outputs and 'pair_labels' in batch:
+            classification_loss_candidate = self.compute_classification_loss(outputs['classification_logits'], batch)
+            if classification_loss_candidate is not None:
+                # Check for NaN in classification loss
+                if torch.isnan(classification_loss_candidate) or torch.isinf(classification_loss_candidate):
+                    print(f"Warning: NaN/inf detected in classification loss, skipping")
+                else:
+                    loss = loss + classification_loss_candidate
 
-        retrieval_loss = None
-        physics_loss = None
+                    # Log classification loss for monitoring (every 100 batches)
+                    if batch_idx % 100 == 0:
+                        print(f"  Val Classification Loss: {classification_loss_candidate.item():.4f}")
 
-        with torch.no_grad():
-            # WRAP with autocast for validation too
-            with autocast(enabled=getattr(self, 'use_amp', False)):
-                outputs = self.model(
-                    input_ids=input_ids,
-                    input_spectra=input_spectra,
-                    special_token_positions=special_token_positions,
-                    question_start_indices=batch['question_start_indices'].to(device),
-                    answer_start_indices=batch['answer_start_indices'].to(device),
-                    neighbor_latents=neighbor_latents,
-                    neighbor_mask=neighbor_mask,
-                )
-                
-                logits = outputs['logits']
-                lm_loss = self.get_loss(logits, target_ids)
-                loss = lm_loss
+        # Add feature prediction loss if available
+        if 'predicted_features' in outputs:
+            feature_loss_candidate = self.compute_feature_prediction_loss(outputs['predicted_features'], batch)
+            if feature_loss_candidate is not None:
+                # Check for NaN in feature loss
+                if torch.isnan(feature_loss_candidate) or torch.isinf(feature_loss_candidate):
+                    print(f"Warning: NaN/inf detected in feature prediction loss, skipping")
+                else:
+                    # Get feature loss weight from model if available
+                    feature_weight = getattr(self._unwrap_model(), 'feature_loss_weight', 1.0)
+                    # Convert feature loss to match main loss dtype for mixed precision compatibility
+                    feature_loss_converted = (feature_weight * feature_loss_candidate).to(loss.dtype)
+                    loss = loss + feature_loss_converted
 
-                inv_loss = None
-                if self.lambda_feat > 0:
-                    lat_rec = outputs.get('latent_recon_from_tokens', None)
-                    lat_tgt = outputs.get('latent_target', None)
-                    if lat_rec is not None and lat_tgt is not None:
-                        lat_tgt = lat_tgt.to(device=lat_rec.device, dtype=lat_rec.dtype)
-                        inv_loss = F.mse_loss(lat_rec, lat_tgt, reduction='mean')
-                        loss = loss + self.lambda_feat * inv_loss
+                    # Log feature prediction loss for monitoring (every 100 batches)
+                    if batch_idx % 100 == 0:
+                        print(f"  Val Feature Prediction Loss: {feature_loss_candidate.item():.4f}")
 
-                text_loss = None
-                if self.lambda_text > 0:
-                    pred_latent = outputs.get('pred_latent_from_text', None)
-                    lat_tgt2 = outputs.get('latent_target', None)
-                    if pred_latent is not None and lat_tgt2 is not None:
-                        lat_tgt2 = lat_tgt2.to(device=pred_latent.device, dtype=pred_latent.dtype)
-                        text_loss = F.mse_loss(pred_latent, lat_tgt2, reduction='mean')
-                        loss = loss + self.lambda_text * text_loss
-
-                retrieval_loss = None
-                if self.lambda_retrieval > 0:
-                    neighbor_logits = outputs.get('neighbor_logits', None)
-                    neighbor_mask_eff = outputs.get('neighbor_mask', neighbor_mask)
-                    if neighbor_logits is not None and neighbor_targets is not None and neighbor_logits.numel() > 0:
-                        if neighbor_mask_eff is not None and neighbor_mask_eff.numel() > 0:
-                            valid_mask = (neighbor_mask_eff.sum(dim=-1) > 0)
-                            if valid_mask.any():
-                                idx = valid_mask.nonzero(as_tuple=True)[0]
-                                if idx.numel() > 0:
-                                    retrieval_loss = F.cross_entropy(neighbor_logits[idx], neighbor_targets[idx], reduction='mean')
-                        else:
-                            retrieval_loss = F.cross_entropy(neighbor_logits, neighbor_targets, reduction='mean')
-                        if retrieval_loss is not None:
-                            loss = loss + self.lambda_retrieval * retrieval_loss
-
-                physics_loss = None
-                if self.lambda_physics > 0 and physics_target is not None and physics_target.numel() > 0:
-                    physics_pred = outputs.get('physics_pred', None)
-                    if physics_pred is not None:
-                        if physics_pred.shape != physics_target.shape:
-                            physics_pred = physics_pred[:, :physics_target.shape[1]]
-                        physics_loss_raw = F.mse_loss(physics_pred, physics_target, reduction='none')
-                        if physics_mask is not None:
-                            mask = physics_mask.view(-1, 1)
-                            denom = mask.sum().clamp_min(1e-6)
-                            physics_loss = (physics_loss_raw * mask).sum() / denom
-                        else:
-                            physics_loss = physics_loss_raw.mean()
-                        loss = loss + self.lambda_physics * physics_loss
-
-        lm_loss_val = float(lm_loss.detach().item()) if lm_loss is not None else 0.0
-        inv_loss_val = float(inv_loss.detach().item()) if inv_loss is not None else 0.0
-        text_loss_val = float(text_loss.detach().item()) if text_loss is not None else 0.0
-        retrieval_loss_val = float(retrieval_loss.detach().item()) if retrieval_loss is not None else 0.0
-        physics_loss_val = float(physics_loss.detach().item()) if physics_loss is not None else 0.0
-        total_loss_val = float(loss.detach().item())
-
-        if hasattr(self, 'val_aux_loss_1'):
-            self.val_aux_loss_1.append(lm_loss_val)
-            self.val_aux_loss_2.append(inv_loss_val)
-            self.val_aux_loss_3.append(text_loss_val)
-
-        self._update_loss_tracker('val', total=total_loss_val, lm=lm_loss_val,
-                                   feat=inv_loss_val, text=text_loss_val,
-                                   retr=retrieval_loss_val, phys=physics_loss_val)
+        # Check for NaN in total loss
+        if torch.isnan(loss) or torch.isinf(loss):
+            print(f"Warning: NaN/inf detected in total loss at batch {batch_idx}")
+            print(f"  LM Loss: {lm_loss.item() if not torch.isnan(lm_loss) else 'NaN'}")
+            if 'cfm_loss' in outputs:
+                print(f"  CFM Loss: {outputs['cfm_loss'].item() if not torch.isnan(outputs['cfm_loss']) else 'NaN'}")
+            # Skip this batch by returning a small loss
+            loss = torch.tensor(1e-6, device=device, requires_grad=True)
 
         return loss, 0, outputs['h']
+    
+    def compute_stellar_parameter_loss(self, stellar_predictions, batch: Dict[str, Any]) -> Optional[torch.Tensor]:
+        """
+        Compute CQR loss for stellar parameter predictions
+        
+        Args:
+            stellar_predictions: torch.Tensor of shape [batch_size, len(stellar_params) * num_quantiles]
+            batch: Batch containing ground truth stellar parameters
+            
+        Returns:
+            CQR loss or None if no ground truth available
+        """
+        if stellar_predictions is None:
+            print("none from beginning")
+            return None
+            
+        device = stellar_predictions.device
+        batch_size = stellar_predictions.shape[0]
+        num_params = len(self.model.stellar_params) if hasattr(self.model, 'stellar_params') else 3
+        
+        # Reshape predictions to (batch_size, num_params, num_quantiles)
+        try:
+            preds_reshaped = stellar_predictions.view(batch_size, num_params, self.num_quantiles)
+        except Exception as e:
+            print(f"Error reshaping stellar predictions: {e}")
+            print(f"Predictions shape: {stellar_predictions.shape}, expected: ({batch_size}, {self.num_quantiles * num_params})")
+            return None
+        
+        total_loss = torch.tensor(0.0, device=device)
+        loss_count = 0
+
+        # Single-star mode: use y_numeric
+        if 'y_numeric' in batch:
+            gt_params = batch['y_numeric'].to(device)
+            gt_mask = batch['y_numeric_present'].to(device)
+
+            if torch.isnan(gt_params[gt_mask]).any():
+                print("Warning: NaNs detected in y_numeric ground truth")
+                return None
+
+            if gt_mask.any():
+                gt = gt_params[gt_mask]  # Shape: (valid_samples, num_params)
+                preds = preds_reshaped[gt_mask]  # Shape: (valid_samples, num_params, num_quantiles)
+                
+                if len(gt) > 0 and len(preds) > 0:
+                    param_loss = self.stellar_cqr_loss(preds, gt)
+                    total_loss += param_loss
+                    loss_count += 1
+        
+        # Two-star mode: use y_numeric_a and y_numeric_b
+        if 'y_numeric_a' in batch:
+            gt_params_a = batch['y_numeric_a'].to(device)
+            gt_mask_a = batch['y_numeric_a_present'].to(device)
+
+            if torch.isnan(gt_params_a[gt_mask_a]).any():
+                print("Warning: NaNs detected in y_numeric_a ground truth")
+                return None
+                
+            if gt_mask_a.any():
+                gt_a = gt_params_a[gt_mask_a]
+                preds_a = preds_reshaped[gt_mask_a]
+                
+                if len(gt_a) > 0 and len(preds_a) > 0:
+                    param_loss_a = self.stellar_cqr_loss(preds_a, gt_a)
+                    total_loss += param_loss_a
+                    loss_count += 1
+        
+        if 'y_numeric_b' in batch:
+            gt_params_b = batch['y_numeric_b'].to(device)
+            gt_mask_b = batch['y_numeric_b_present'].to(device)
+
+            if torch.isnan(gt_params_b[gt_mask_b]).any():
+                print("Warning: NaNs detected in y_numeric_b ground truth")
+                return None
+                
+            if gt_mask_b.any():
+                gt_b = gt_params_b[gt_mask_b]
+                preds_b = preds_reshaped[gt_mask_b]
+                
+                if len(gt_b) > 0 and len(preds_b) > 0:
+                    param_loss_b = self.stellar_cqr_loss(preds_b, gt_b)
+                    total_loss += param_loss_b
+                    loss_count += 1
+            
+        
+        # Return average loss if any parameters were processed
+        if loss_count > 0:
+            return total_loss / loss_count
+        else:
+            return None
+
+    def compute_feature_prediction_loss(self, predicted_features, batch: Dict[str, Any]) -> Optional[torch.Tensor]:
+        """
+        Compute MSE loss for feature predictions
+
+        Args:
+            predicted_features: torch.Tensor of shape [batch_size, feature_dim] (can be fp16 or fp32)
+            batch: Batch containing ground truth features (features_star2)
+
+        Returns:
+            MSE loss or None if no ground truth available
+        """
+        if predicted_features is None:
+            print("provided predictions are none")
+            return None
+
+        device = predicted_features.device
+        pred_dtype = predicted_features.dtype
+        compute_dtype = torch.float32 if pred_dtype == torch.float16 else pred_dtype
+        predicted_for_loss = predicted_features.to(compute_dtype)
+
+        # Check if target features are available
+        if 'features_star2' not in batch:
+            print("features_star2 are none")
+            return None
+
+        # Match target features dtype to prediction compute dtype for stable loss
+        target_features = batch['features_star2'].to(device, dtype=compute_dtype)  # [batch_size, feature_dim]
+
+        # Check for NaN in targets
+        if torch.isnan(target_features).any() or torch.isinf(target_features).any():
+            print("Warning: NaN/inf detected in target features, skipping feature loss")
+            return None
+
+        # Compute MSE loss in same dtype as predictions
+        feature_loss = F.mse_loss(predicted_for_loss, target_features, reduction='mean')
+
+        # Check for NaN in loss
+        if torch.isnan(feature_loss) or torch.isinf(feature_loss):
+            print("Warning: NaN/inf detected in feature prediction loss")
+            print(feature_loss)
+            return None
+
+        return feature_loss
+
+    def compute_classification_loss(self, classification_logits, batch: Dict[str, Any]) -> Optional[torch.Tensor]:
+        """
+        Compute cross-entropy loss for comparative classification (STAR_A vs STAR_B)
+        
+        Args:
+            classification_logits: torch.Tensor of shape [batch_size, 2] - logits for STAR_A/STAR_B classification
+            batch: Batch containing pair_labels for comparative samples
+            
+        Returns:
+            Classification loss or None if no comparative samples available
+        """
+        if classification_logits is None:
+            return None
+            
+        device = classification_logits.device
+        
+        # Get comparative mask and pair labels
+        if 'pair_labels' not in batch or 'pair_label_present' not in batch:
+            return None
+            
+        pair_labels = batch['pair_labels'].to(device)  # Ground truth labels (0 for STAR_A, 1 for STAR_B)
+        pair_mask = batch['pair_label_present'].to(device)  # Mask for valid comparative samples
+        
+        if not pair_mask.any():
+            return None  # No comparative samples in this batch
+        
+        # Filter to only comparative samples
+        comp_logits = classification_logits[pair_mask]  # [num_comp_samples, 2]
+        comp_labels = pair_labels[pair_mask]  # [num_comp_samples]
+        
+        if len(comp_logits) == 0:
+            return None
+            
+        # Check for valid labels (should be 0 or 1)
+        if not torch.all((comp_labels == 0) | (comp_labels == 1)):
+            print("Warning: Invalid pair labels detected, skipping classification loss")
+            return None
+            
+        # Compute cross-entropy loss
+        classification_loss = F.cross_entropy(comp_logits, comp_labels)
+        
+        return classification_loss
+    
+    def _get_stellar_parameter_predictions(self, batch: Dict[str, Any], batch_idx: int, device: torch.device) -> Optional[str]:
+        """Get stellar parameter predictions as JSON string"""
+        try:
+            outputs = self.get_logits(batch, device, val=True)
+            if 'stellar_predictions' not in outputs:
+                return None
+
+            predictions = outputs['stellar_predictions']
+            if predictions is None:
+                return None
+
+            if not isinstance(predictions, torch.Tensor):
+                print(f"Unexpected stellar_predictions type: {type(predictions)}")
+                return None
+
+            model_ref = self._unwrap_model()
+            param_names = getattr(model_ref, 'stellar_params', ['Teff', 'logg', 'FeH'])
+            num_params = len(param_names)
+            quantiles = getattr(self, 'quantiles', getattr(model_ref, 'quantiles', [0.159, 0.5, 0.841]))
+            num_quantiles = len(quantiles)
+
+            if predictions.dim() != 2 or predictions.size(1) != num_params * num_quantiles:
+                print(f"Unexpected stellar_predictions shape: {predictions.shape}")
+                return None
+
+            preds = predictions.detach().cpu().view(-1, num_params, num_quantiles)
+            if batch_idx >= preds.size(0):
+                return None
+
+            sample_preds = preds[batch_idx]
+            bounds = {
+                'Teff': (3000.0, 7500.0),
+                'logg': (0.0, 5.0),
+                'FeH': (-3.0, 0.5),
+            }
+            formatted = {}
+            for param_idx, param_name in enumerate(param_names):
+                param_values = sample_preds[param_idx]
+                lo, hi = bounds.get(param_name, (0.0, 1.0))
+                scale = hi - lo
+                inner = {}
+                for q_idx, q in enumerate(quantiles):
+                    norm_val = float(param_values[q_idx])
+                    physical = lo + norm_val * scale
+                    inner[f"{q:.3f}".rstrip('0').rstrip('.')] = round(physical, 3)
+                formatted[param_name] = inner
+
+            import json
+            return json.dumps(formatted, separators=(',', ':'))
+        except Exception as e:
+            print(f"Error getting stellar predictions: {e}")
+            return None
+    
+    def _get_ground_truth_stellar_parameters(self, batch: Dict[str, Any], batch_idx: int) -> Optional[str]:
+        """Get ground truth stellar parameters as JSON string"""
+        try:
+            import json
+            
+            # Try single-star mode first
+            if 'stellar_params_gt' in batch and batch['stellar_params_gt'] is not None:
+                gt_params = batch['stellar_params_gt']
+                gt_mask = batch['stellar_params_gt_present']
+                
+                if batch_idx < len(gt_mask) and gt_mask[batch_idx] and gt_params.size(1) > 0:
+                    param_names = ['Teff', 'logg', 'FeH']
+                    gt_dict = {}
+                    for i, param_name in enumerate(param_names):
+                        if i < gt_params.shape[1]:
+                            gt_dict[param_name] = round(gt_params[batch_idx, i].item(), 2)
+                    
+                    if gt_dict:
+                        return json.dumps(gt_dict, separators=(',', ':'))
+            
+            # Try comparative mode star A
+            if 'stellar_params_gt_a' in batch and batch['stellar_params_gt_a'] is not None:
+                gt_params_a = batch['stellar_params_gt_a']
+                gt_mask_a = batch['stellar_params_gt_a_present']
+                
+                if batch_idx < len(gt_mask_a) and gt_mask_a[batch_idx] and gt_params_a.size(1) > 0:
+                    param_names = ['Teff', 'logg', 'FeH']
+                    gt_dict_a = {}
+                    for i, param_name in enumerate(param_names):
+                        if i < gt_params_a.shape[1]:
+                            gt_dict_a[f"{param_name}_A"] = round(gt_params_a[batch_idx, i].item(), 2)
+                    
+                    # Also try star B
+                    gt_dict_b = {}
+                    if 'stellar_params_gt_b' in batch and batch['stellar_params_gt_b'] is not None:
+                        gt_params_b = batch['stellar_params_gt_b']
+                        gt_mask_b = batch['stellar_params_gt_b_present']
+                        
+                        if batch_idx < len(gt_mask_b) and gt_mask_b[batch_idx] and gt_params_b.size(1) > 0:
+                            for i, param_name in enumerate(param_names):
+                                if i < gt_params_b.shape[1]:
+                                    gt_dict_b[f"{param_name}_B"] = round(gt_params_b[batch_idx, i].item(), 2)
+                    
+                    combined_dict = {**gt_dict_a, **gt_dict_b}
+                    if combined_dict:
+                        return json.dumps(combined_dict, separators=(',', ':'))
+            
+            return None
+        except Exception as e:
+            print(f"Error getting ground truth stellar parameters: {e}")
+            return None
     
     def eval_epoch(self, device, epoch):
         """
         Enhanced evaluation: first evaluate on sample questions, then run regular eval
         """
-        # Evaluate on validation samples first (rank 0 only)
-        if (not dist.is_initialized()) or dist.get_rank() == 0:
-            if epoch % 1 == 0:  # Every epoch
-                self.evaluate_validation_samples(device, epoch)
+        # Skip detailed evaluation for the first few epochs to let model stabilize
+        current_rank = dist.get_rank() if dist.is_initialized() else 0
+        print(f"DEBUG: eval_epoch called on rank {current_rank}")
+        
+        if epoch >= 3:  # Only run detailed evaluation after epoch 3
+            if (not dist.is_initialized()) or dist.get_rank() == 0:
+                print(f"DEBUG: Running evaluate_validation_samples on rank {current_rank}")
+                try:
+                    self.evaluate_validation_samples(device, epoch, num_samples=10)
+                except Exception as e:
+                    print(f"Warning: Evaluation failed with error: {e}")
+                    print("Continuing training without detailed evaluation...")
+            else:
+                print(f"DEBUG: Skipping evaluate_validation_samples on rank {current_rank}")
+        else:
+            print(f"DEBUG: Skipping evaluation for epoch {epoch} (stabilization period)")
         
         # Then run regular evaluation
-        self._reset_loss_tracker('val')
-        result = super().eval_epoch(device, epoch)
-        self._finalize_loss_tracker('val', epoch)
-        return result
+        return super().eval_epoch(device, epoch)
         
     def evaluate_validation_samples(self, device, epoch, num_samples=3,
-                                    max_new_tokens=50, temperature=0.2, top_p=0.8):
+                                    max_new_tokens=128, temperature=0.2, top_p=0.8):
         """
         Evaluate model on actual validation samples with both teacher-forcing and generation perplexity
         """
+        current_rank = dist.get_rank() if dist.is_initialized() else 0
+        print(f"DEBUG: evaluate_validation_samples called on rank {current_rank}")
         self.model.eval()
+        
+        # For combined mode, ensure model is set to combined mode across all ranks
+        if hasattr(self, 'combined_mode') and self.combined_mode:
+            # Ensure model is in combined mode
+            if isinstance(self.model, torch.nn.DataParallel) or isinstance(self.model, torch.nn.parallel.DistributedDataParallel):
+                self.model.module.mode = "combined"
+            else:
+                self.model.mode = "combined"
         
         print(f"\n{'='*80}")
         print(f"VALIDATION SAMPLE EVALUATION - EPOCH {epoch}")
@@ -1154,7 +1850,14 @@ class LLMTrainer(Trainer):
         if tokenizer is None:
             print("Warning: No tokenizer available for decoding")
         
-        val_iter = iter(self.val_dl)
+        # Use appropriate validation dataloader based on current mode
+        if hasattr(self, 'combined_mode') and self.combined_mode:
+            # For mixed datasets, always use the mixed validation dataloader
+            val_dl = self.val_dl
+        else:
+            val_dl = self.val_dl
+        
+        val_iter = iter(val_dl)
         
         epoch_results = {
             'epoch': epoch,
@@ -1177,14 +1880,26 @@ class LLMTrainer(Trainer):
                     break
                 
                 batch_idx = 0
-                obsid = batch['obsids'][batch_idx] if 'obsids' in batch else "Unknown"
+                # Handle different batch structures for mixed vs single datasets
+                if 'obsids' in batch:
+                    # Single dataset format
+                    obsid = batch['obsids'][batch_idx]
+                elif 'metadata' in batch and batch['metadata']:
+                    # Mixed dataset format
+                    meta = batch['metadata'][batch_idx]
+                    if meta and 'raw' in meta:
+                        obsid = meta['raw'].get('obsid', "Unknown")
+                    else:
+                        obsid = "Unknown"
+                else:
+                    obsid = "Unknown"
                 
                 # 1. Calculate teacher-forcing perplexity (how well it predicts the true answer)
                 tf_perplexity = self._calculate_teacher_forcing_perplexity(batch, batch_idx, device)
 
                 # 2. Generate response and calculate generation perplexity
                 if isinstance(self.model, torch.nn.DataParallel) or isinstance(self.model, torch.nn.parallel.DistributedDataParallel):          
-                    generated_text, input_text, target_text, generation_log_probs = self.model.module.generate_response_from_batch(
+                    generated_text, input_text, target_text, generation_log_probs, gen_ids = self.model.module.generate_response_from_batch(
                         batch_data=batch,
                         batch_idx=batch_idx,
                         tokenizer=tokenizer,
@@ -1193,7 +1908,7 @@ class LLMTrainer(Trainer):
                         top_p=top_p
                     )
                 else:
-                    generated_text, input_text, target_text, generation_log_probs = self.model.generate_response_from_batch(
+                    generated_text, input_text, target_text, generation_log_probs, gen_ids = self.model.generate_response_from_batch(
                         batch_data=batch,
                         batch_idx=batch_idx,
                         tokenizer=tokenizer,
@@ -1214,30 +1929,32 @@ class LLMTrainer(Trainer):
                 print(f"{'-'*60}")
                 print(f"QUESTION: {input_text}")
                 print(f"TRUE ANSWER: {target_text}")
-                print(f"GENERATED ANSWER: {generated_text}")
+
+                # Display followup turns if present
+                followup_turns = batch.get('followup_turns', None)
+                if followup_turns is not None and len(followup_turns) > 0:
+                    turns_list = followup_turns[batch_idx] if isinstance(followup_turns, list) else followup_turns
+                    if turns_list:
+                        print(f"\nFOLLOWUP TURNS ({len(turns_list)}):")
+                        for i, (fq, fa) in enumerate(turns_list, 1):
+                            print(f"  Turn {i} Q: {fq}")
+                            print(f"  Turn {i} A: {fa}")
+
+                print(f"\nGENERATED ANSWER: {generated_text}")
                 print(f"Teacher-Forcing Perplexity: {tf_perplexity:.2f}")
                 print(f"Generation Perplexity: {gen_perplexity:.2f}")
                 print(f"Generated {len(generation_log_probs)} tokens")
-
-                # Attempt retrieval parsing/metrics if target has retrieval format
-                retrieval_ok = None
-                try:
-                    from util.retrieval import parse_neighbors_text, parse_order_text
-                    t_neighbors = parse_neighbors_text(target_text)
-                    t_order = parse_order_text(target_text)
-                    if t_neighbors is not None:
-                        p_neighbors = parse_neighbors_text(generated_text)
-                        if p_neighbors is not None:
-                            L = len(t_neighbors)
-                            retrieval_ok = int(p_neighbors[:L] == t_neighbors)
-                    elif t_order is not None:
-                        p_order = parse_order_text(generated_text)
-                        if p_order is not None:
-                            L = len(t_order)
-                            retrieval_ok = int(p_order[:L] == t_order)
-                except Exception:
-                    pass
-
+                
+                # Add stellar parameter predictions if available
+                stellar_pred_json = self._get_stellar_parameter_predictions(batch, batch_idx, device)
+                if stellar_pred_json:
+                    print(f"STELLAR PARAMETERS: {stellar_pred_json}")
+                
+                # Add ground truth stellar parameters if available
+                stellar_gt_json = self._get_ground_truth_stellar_parameters(batch, batch_idx)
+                if stellar_gt_json:
+                    print(f"TRUE STELLAR PARAMS: {stellar_gt_json}")
+                
                 # Store results
                 sample_result = {
                     'obsid': obsid,
@@ -1320,122 +2037,59 @@ class LLMTrainer(Trainer):
         """
         Calculate perplexity using teacher forcing (how well model predicts the true answer)
         """
-        # Extract batch data
-        input_ids = batch['input_ids'][batch_idx:batch_idx+1].to(device)
-        target_ids = batch['target_ids'][batch_idx:batch_idx+1].to(device)
-        input_spectra = batch['masked_spectra'][batch_idx:batch_idx+1].to(device)
-        feature_start_idx = batch['feature_start_indices'][batch_idx].item()
-        neighbor_latents = None
-        neighbor_mask = None
-        if 'neighbor_latents' in batch and batch['neighbor_latents'].numel() > 0:
-            neighbor_latents = batch['neighbor_latents'][batch_idx:batch_idx+1].to(device)
-        if 'neighbor_mask' in batch and batch['neighbor_mask'].numel() > 0:
-            neighbor_mask = batch['neighbor_mask'][batch_idx:batch_idx+1].to(device)
+        # Extract single sample from batch for teacher forcing evaluation
+        single_batch = {}
+        for key, value in batch.items():
+            if isinstance(value, torch.Tensor):
+                single_batch[key] = value[batch_idx:batch_idx+1].to(device)
+            elif isinstance(value, list):
+                single_batch[key] = [value[batch_idx]]
+            else:
+                single_batch[key] = value
         
-        # Forward pass with full sequence (including target)
-        special_token_positions = torch.tensor([feature_start_idx], device=device)
+        # Use get_logits method which handles all modes correctly
+        outputs = self.get_logits(single_batch, device, val=True)
         
-        outputs = self.model(
-            input_ids=input_ids,
-            input_spectra=input_spectra,
-            special_token_positions=special_token_positions,
-            neighbor_latents=neighbor_latents,
-            neighbor_mask=neighbor_mask,
-        )
+        # Extract target for loss calculation
+        target_ids = single_batch['target_ids']
         
+        # Check if forward pass was successful
+        if outputs is None:
+            print("Warning: Model forward pass returned None")
+            return float('inf')
+            
         logits = outputs['logits']
         
-        # Calculate cross-entropy loss only on answer tokens (where target_ids != -100)
-        # Shift for next-token prediction
-        shift_logits = logits[..., :-1, :].contiguous()  # [batch, seq_len-1, vocab_size]
-        shift_labels = target_ids[..., 1:].contiguous()   # [batch, seq_len-1]
+        # Check if logits are valid
+        if torch.isnan(logits).any() or torch.isinf(logits).any():
+            print("Warning: Invalid logits detected in teacher forcing")
+            return float('inf')
         
-        # Create mask for answer tokens (target_ids != -100)
-        answer_mask = (shift_labels != -100)
+        # Calculate loss only on answer tokens (where target_ids != -100)
+        valid_mask = (target_ids != -100)
+        if not valid_mask.any():
+            print("Warning: No valid target tokens found")
+            return float('inf')
         
+        # Flatten logits and targets for loss calculation
+        flat_logits = logits.view(-1, logits.size(-1))
+        flat_targets = target_ids.view(-1)
+        
+        # Filter to only answer tokens
+        answer_mask = (flat_targets != -100)
         if not answer_mask.any():
             return float('inf')
         
-        # Calculate loss only on answer tokens
-        flat_logits = shift_logits.view(-1, shift_logits.size(-1))  # [batch*(seq_len-1), vocab_size]
-        flat_labels = shift_labels.view(-1)                          # [batch*(seq_len-1)]
-        flat_mask = answer_mask.view(-1)                            # [batch*(seq_len-1)]
-        
-        # Select only answer token positions
-        answer_logits = flat_logits[flat_mask]  # [num_answer_tokens, vocab_size]
-        answer_labels = flat_labels[flat_mask]  # [num_answer_tokens]
-        
-        if len(answer_logits) == 0:
-            return float('inf')
+        answer_logits = flat_logits[answer_mask]
+        answer_labels = flat_targets[answer_mask]
         
         # Calculate cross-entropy loss
+        import torch.nn.functional as F
         loss = F.cross_entropy(answer_logits, answer_labels, reduction='mean')
         perplexity = torch.exp(loss).item()
         
         return perplexity
-
-    def plot_perplexity_trends(self, save_path=None):
-        """
-        Plot both teacher-forcing and generation perplexity trends over epochs
-        """
-        if not hasattr(self, 'validation_sample_history') or not self.validation_sample_history:
-            print("No validation sample history to plot")
-            return
-        
-        epochs = []
-        tf_perplexities = []
-        gen_perplexities = []
-        
-        for result in self.validation_sample_history:
-            epochs.append(result['epoch'])
-            tf_perp = result['avg_teacher_forcing_perplexity']
-            gen_perp = result['avg_generation_perplexity']
-            
-            # Only include finite values
-            tf_perplexities.append(tf_perp if tf_perp != float('inf') else None)
-            gen_perplexities.append(gen_perp if gen_perp != float('inf') else None)
-        
-        # Filter out None values for plotting
-        valid_epochs = []
-        valid_tf = []
-        valid_gen = []
-        
-        for i, (ep, tf, gen) in enumerate(zip(epochs, tf_perplexities, gen_perplexities)):
-            if tf is not None:
-                valid_epochs.append(ep)
-                valid_tf.append(tf)
-            if gen is not None and i < len(valid_gen):
-                valid_gen.append(gen)
-        
-        if not valid_epochs:
-            print("No valid perplexity values to plot")
-            return
-        
-        import matplotlib.pyplot as plt
-        
-        plt.figure(figsize=(12, 6))
-        
-        if valid_tf:
-            plt.plot(valid_epochs[:len(valid_tf)], valid_tf, 'b-o', 
-                    label='Teacher-Forcing Perplexity', alpha=0.7)
-        if valid_gen:
-            plt.plot(valid_epochs[:len(valid_gen)], valid_gen, 'r-o', 
-                    label='Generation Perplexity', alpha=0.7)
-        
-        plt.xlabel('Epoch')
-        plt.ylabel('Perplexity')
-        plt.title('Validation Sample Perplexity Trends')
-        plt.legend()
-        plt.grid(True, alpha=0.3)
-        plt.yscale('log')  # Log scale for better visualization
-        
-        if save_path:
-            plt.savefig(save_path, dpi=300, bbox_inches='tight')
-            print(f"Perplexity plot saved to {save_path}")
-        else:
-            plt.show()
-        
-        plt.close()
+    
 
     def sanity_questions(self, device, tokenizer, max_new_tokens=50, temperature=0.7, top_p=0.9):
         # Set token IDs for generation
@@ -1486,7 +2140,7 @@ class LLMTrainer(Trainer):
         self.model.eval()
         
         if self.best_state_dict is not None:
-            self.model.load_state_dict(self.best_state_dict)
+            self.model.load_state_dict(self.best_state_dict, strict=False)
             print("Loaded best model state")
         
         all_losses = []
@@ -2098,7 +2752,7 @@ class CLIPTrainer(Trainer):
         Enhanced prediction method for CLIP model
         """
         if load_best and hasattr(self, 'best_state_dict'):
-            self.model.load_state_dict(self.best_state_dict)
+            self.model.load_state_dict(self.best_state_dict, strict=False)
             
         self.model.eval()
         
@@ -2165,3 +2819,729 @@ class CLIPTrainer(Trainer):
             results['retrieval_metrics'] = final_retrieval_metrics
         
         return results
+
+
+class LateFusionTrainer(Trainer):
+    """
+    Trainer for the Perceiver-based late fusion model. Handles both reconstruction
+    (fusion) and contrastive objectives exposed by `LateFusionModel`.
+    """
+
+    def __init__(self, lora_params=None, log_loss_every: Optional[int] = None, **kwargs):
+        super().__init__(**kwargs)
+        self.log_loss_every = log_loss_every or 0
+        self._last_logged_step = -1
+        
+        # LoRA parameters
+        if lora_params is not None:
+            self.freeze_strategy = lora_params.get('freeze_strategy', 'encoder_only')
+            self.lora_rank = lora_params.get('lora_rank', 4)
+            self.lora_alpha = lora_params.get('lora_alpha', 4.0)
+            self.lora_dropout = lora_params.get('lora_dropout', 0.1)
+            self.lora_target_modules = lora_params.get('lora_target_modules', [])
+            self.lora_start_epoch = lora_params.get('lora_start_epoch', 0)
+            self.lora_modules = None
+        else:
+            self.freeze_strategy = 'none'
+            self.lora_rank = 4
+            self.lora_alpha = 4.0
+            self.lora_dropout = 0.1
+            self.lora_target_modules = []
+            self.lora_start_epoch = 0
+            self.lora_modules = None
+        
+        # Apply initial freeze strategy
+        if hasattr(self, 'freeze_strategy') and self.freeze_strategy != 'none':
+            self._apply_freeze_strategy(self.freeze_strategy)
+
+    def _check_inputs(self, batch, batch_idx, split="train"):
+        """Check for NaN/Inf in inputs and invalid token IDs."""
+        device = self.device  # Assume self.device is correct
+        
+        # Check input_ids for valid range (if vocab_size known)
+        # We need access to the tokenizer or model config for vocab size
+        vocab_size = None
+        if hasattr(self.model, 'module'):
+             model_ref = self.model.module
+        else:
+             model_ref = self.model
+             
+        if hasattr(model_ref, 'llm_model'):
+            llm = model_ref.llm_model 
+            base = getattr(llm, 'base_model', llm)
+            if hasattr(base, 'params'):
+                vocab_size = getattr(base.params, 'vocab_size', None)
+            elif hasattr(base, 'config'):
+                vocab_size = getattr(base.config, 'vocab_size', None)
+
+        # ids_to_check = ['input_ids', 'followup_input_ids']
+        # for key in ids_to_check:
+        #     if key in batch:
+        #         t = batch[key]
+        #         if torch.is_tensor(t):
+        #             if (t < 0).any():
+        #                 print(f"ERROR: [{split} batch {batch_idx}] Negative values in {key}!")
+        #                 return False
+        #             if vocab_size is not None and (t >= vocab_size).any():
+        #                 print(f"ERROR: [{split} batch {batch_idx}] Values >= vocab_size ({vocab_size}) in {key}!")
+        #                 # Print some bad values
+        #                 mask = t >= vocab_size
+        #                 print(f"  Bad values: {t[mask][:10]}")
+        #                 return False
+
+        # Check for NaNs/Infs in all float tensors
+        for key, value in batch.items():
+            if torch.is_tensor(value) and value.is_floating_point():
+                if torch.isnan(value).any():
+                    print(f"ERROR: [{split} batch {batch_idx}] NaNs in input {key}!")
+                    return False
+                if torch.isinf(value).any():
+                    print(f"ERROR: [{split} batch {batch_idx}] Infs in input {key}!")
+                    return False
+        return True
+
+    def _move_to_device(self, obj, device):
+        if torch.is_tensor(obj):
+            return obj.to(device, non_blocking=True)
+        if isinstance(obj, dict):
+            return {k: self._move_to_device(v, device) for k, v in obj.items()}
+        if isinstance(obj, list):
+            return [self._move_to_device(v, device) for v in obj]
+        if isinstance(obj, tuple):
+            return tuple(self._move_to_device(v, device) for v in obj)
+        return obj
+
+    @staticmethod
+    def _loss_value(outputs: Dict[str, torch.Tensor], key: str) -> float:
+        value = outputs.get(key)
+        if value is None:
+            return 0.0
+        return float(value.detach().cpu().item())
+
+    def _record_train_metrics(self, outputs: Dict[str, torch.Tensor]) -> None:
+        self.train_aux_loss_1.append(self._loss_value(outputs, "reconstruction_loss"))
+        self.train_aux_loss_2.append(self._loss_value(outputs, "contrastive_loss"))
+        self.train_aux_loss_3.append(self._loss_value(outputs, "ce_loss"))
+
+    def _record_val_metrics(self, outputs: Dict[str, torch.Tensor]) -> None:
+        self.val_aux_loss_1.append(self._loss_value(outputs, "reconstruction_loss"))
+        self.val_aux_loss_2.append(self._loss_value(outputs, "contrastive_loss"))
+        self.val_aux_loss_3.append(self._loss_value(outputs, "ce_loss"))
+
+    def _maybe_log_losses(self, outputs: Dict[str, torch.Tensor], batch_idx: int, split: str) -> None:
+        if not self.log_loss_every or self.log_loss_every <= 0:
+            return
+        if (batch_idx + 1) % self.log_loss_every != 0:
+            return
+        if torch.distributed.is_initialized() and torch.distributed.get_rank() != 0:
+            return
+        raw_recon = outputs.get("reconstruction_loss", torch.tensor([0.0]))
+        feat_recon = outputs.get("feat_rec_loss", torch.tensor([0.0]))
+        desc_loss = outputs.get("desc_loss", torch.tensor([0.0]))
+        params = outputs.get("param_loss", torch.tensor([0.0]))
+        follow_ce = outputs.get("ce_loss", torch.tensor([0.0]))
+        feat_recon_val = float(feat_recon.detach().cpu().item()) if feat_recon is not None else 0.0
+        desc_loss_val = float(desc_loss.detach().cpu().item()) if desc_loss is not None else 0.0
+        recon_val = float(raw_recon.detach().cpu().item()) if raw_recon is not None else 0.0
+        params_val = float(params.detach().cpu().item()) if params is not None else 0.0
+        follow_ce_val = float(follow_ce.detach().cpu().item()) if follow_ce is not None else 0.0
+        print(
+            f"[{split} step {batch_idx+1}] raw_recon={recon_val:.6f}, "
+            f"param_loss={params_val:.6f}, follow_ce={follow_ce_val:.6f} "
+            f"feat_recon={feat_recon_val:.6f}, desc_loss={desc_loss_val:.6f}",
+            flush=True,
+        )
+
+    def _unwrap_model(self):
+        """Get the underlying model, handling DDP/DataParallel wrapping"""
+        if isinstance(self.model, (torch.nn.DataParallel, torch.nn.parallel.DistributedDataParallel)):
+            return self.model.module
+        return self.model
+
+    def _apply_lora(self):
+        """Apply LoRA to the LLM within the LateFusionModel"""
+        print("Applying LoRA layers to LLM in LateFusionModel...")
+        
+        model = self._unwrap_model()
+        
+        # Access the LLM within LateFusionModel
+        llm_model = getattr(model, 'llm_model', None)
+        if llm_model is None:
+            print("Warning: No llm_model found in LateFusionModel, skipping LoRA")
+            return
+        
+        # Get supported linear layer types
+        try:
+            from fairscale.nn.model_parallel.layers import RowParallelLinear, ColumnParallelLinear
+            linear_types = (torch.nn.Linear, RowParallelLinear, ColumnParallelLinear)
+            print("Using FairScale parallel layers support")
+        except ImportError:
+            linear_types = (torch.nn.Linear,)
+            print("FairScale not available, using only torch.nn.Linear")
+
+        # Collect all linear modules in the LLM
+        print("Available modules in LLM:")
+        all_modules = []
+        for name, module in llm_model.named_modules():
+            if isinstance(module, linear_types):
+                all_modules.append(name)
+
+        print(f"Found {len(all_modules)} Linear/Parallel modules in LLM:")
+        for i, name in enumerate(all_modules[:10]):  # Show first 10
+            print(f"  {name}")
+        if len(all_modules) > 10:
+            print(f"  ... and {len(all_modules) - 10} more")
+
+        # Convert wildcard patterns to actual module names
+        target_modules = []
+        import re
+
+        for pattern in self.lora_target_modules:
+            if '*' in pattern:
+                # Convert pattern to regex, handling multiple wildcards
+                pattern_regex = pattern.replace('.', r'\.').replace('*', r'[^.]+')
+                pattern_regex = f"^{pattern_regex}$"
+
+                # Find matching modules
+                matched_modules = []
+                for name in all_modules:
+                    if re.match(pattern_regex, name):
+                        matched_modules.append(name)
+                        target_modules.append(name)
+
+                print(f"Pattern '{pattern}' matched {len(matched_modules)} modules")
+                if matched_modules:
+                    print(f"  Examples: {matched_modules[:3]}")
+            else:
+                if pattern in all_modules:
+                    target_modules.append(pattern)
+                    print(f"Direct match: {pattern}")
+                else:
+                    print(f"Warning: Pattern '{pattern}' not found in LLM")
+
+        print(f"\nTotal target modules for LoRA: {len(target_modules)}")
+
+        if not target_modules:
+            print("ERROR: No target modules found! Check your lora_target_modules patterns.")
+            return
+
+        # Apply LoRA using the utility function
+        self.lora_modules = apply_lora_to_model(
+            llm_model,
+            target_modules,
+            rank=self.lora_rank,
+            alpha=self.lora_alpha,
+            dropout=self.lora_dropout
+        )
+
+        print(f"Successfully applied LoRA to {len(self.lora_modules)} modules in LLM")
+
+    def _apply_freeze_strategy(self, strategy: str):
+        """Apply different freezing strategies to the LateFusionModel"""
+        print(f"Applying freeze strategy: {strategy}")
+        
+        model = self._unwrap_model()
+
+        if strategy == 'encoder_only':
+            # Freeze backbones (LLM and spectral model), unfreeze Perceiver and adapters
+            for name, param in model.named_parameters():
+                # Only set requires_grad on floating point and complex tensors
+                if not param.dtype.is_floating_point and not param.dtype.is_complex:
+                    continue
+                    
+                if 'llm_model' in name or 'spectral_model' in name:
+                    param.requires_grad = False
+                else:
+                    param.requires_grad = True
+                    # print(f"  ✓ Unfrozen: {name}")
+
+        elif strategy == 'lora':
+            print("applying lora strategy")
+            # Apply LoRA if not already applied and we're at the start epoch
+            if not self.lora_modules and hasattr(self, 'epoch') and self.epoch == self.lora_start_epoch:
+                self._apply_lora()
+
+            # Freeze all LLM parameters except LoRA, unfreeze Perceiver and adapters
+            for name, param in model.named_parameters():
+                # Only set requires_grad on floating point and complex tensors
+                if not param.dtype.is_floating_point and not param.dtype.is_complex:
+                    continue
+                    
+                if 'llm_model' in name:
+                    if 'lora' in name:
+                        param.requires_grad = True
+                        # print(f"  ✓ Unfrozen (LoRA): {name}")
+                    else:
+                        param.requires_grad = False
+                elif 'spectral_model' in name:
+                    param.requires_grad = False
+                else:
+                    # Perceiver, adapters, decoders, etc.
+                    param.requires_grad = True
+                    # print(f"  ✓ Unfrozen: {name}")
+
+        elif strategy == 'none':
+            # Unfreeze everything (only floating point and complex tensors)
+            for param in model.parameters():
+                if param.dtype.is_floating_point or param.dtype.is_complex:
+                    param.requires_grad = True
+
+        self.current_freeze_state = strategy
+
+        # Print summary of trainable parameters
+        trainable_count = 0
+        lora_count = 0
+        perceiver_count = 0
+        for name, param in model.named_parameters():
+            if param.requires_grad:
+                trainable_count += param.numel()
+                if 'lora' in name:
+                    lora_count += param.numel()
+                elif 'perceiver' in name or 'adapter' in name or 'decoder' in name:
+                    perceiver_count += param.numel()
+
+        print(f"Total trainable parameters: {trainable_count:,}")
+        if lora_count > 0:
+            print(f"  LoRA parameters: {lora_count:,}")
+        if perceiver_count > 0:
+            print(f"  Perceiver/Adapter parameters: {perceiver_count:,}")
+
+    def train_epoch(self, device, epoch):
+        """Apply CE warmup schedule and freeze strategy before delegating to base epoch loop."""
+        # Store epoch for freeze_strategy logic
+        self.epoch = epoch
+        
+        # Apply freeze strategy (including LoRA if needed)
+        if hasattr(self, 'freeze_strategy'):
+            self._apply_freeze_strategy(self.freeze_strategy)
+        
+        # Apply CE warmup schedule if provided
+        try:
+            sched = getattr(self, 'ce_schedule', None)
+            model = self._unwrap_model()
+            if sched and getattr(model, 'enable_cycle_ce', False) and hasattr(model, 'loss_weights'):
+                enable = bool(sched.get('enable', True))
+                if enable:
+                    target = float(sched.get('target_weight', 1.0))
+                    warm = int(sched.get('warmup_epochs', 0))
+                    start = int(sched.get('start_epoch', 0))
+                    if epoch < start:
+                        w = 0.0
+                    elif warm > 0 and epoch < start + warm:
+                        w = target * float(epoch - start + 1) / float(warm)
+                    else:
+                        w = target
+                    prev = float(model.loss_weights.get('ce', 0.0))
+                    if abs(prev - w) > 1e-8:
+                        model.loss_weights['ce'] = w
+                        if (not torch.distributed.is_initialized()) or torch.distributed.get_rank() == 0:
+                            print(f"[LateFusionTrainer] Epoch {epoch}: set CE weight to {w:.4f}")
+        except Exception:
+            pass
+        return super().train_epoch(device, epoch)
+
+    def train_batch(self, batch, batch_idx, device):
+        if not self._check_inputs(batch, batch_idx, split="train"):
+            print(f"Skipping training batch {batch_idx} due to invalid inputs.")
+            # Return dummy values to satisfy the loop
+            bsz = batch["input_ids"].size(0) if "input_ids" in batch else 1
+            return torch.tensor(0.0, device=device, requires_grad=True), torch.zeros(self.output_dim, device=device), torch.zeros(bsz, device=device)
+
+        batch = self._move_to_device(batch, device)
+        bsz = batch["input_ids"].size(0)
+
+        # print("--------------test------------")
+        # print(batch['input_texts'][0], batch['target_texts'][0])
+        # print(batch['followup_turns'][0])
+
+        with torch.amp.autocast('cuda', enabled=self.use_amp):
+            outputs = self.model(batch)
+            loss = outputs["total_loss"]
+
+        self._record_train_metrics(outputs)
+        self._maybe_log_losses(outputs, batch_idx, split="train")
+
+        # Determine if this rank wants to skip
+        skip_reason = None
+        if torch.isnan(loss) or torch.isinf(loss):
+            skip_reason = "NaN/Inf"
+        elif not loss.requires_grad:
+            skip_reason = "No Grad"
+        
+        # In DDP, ALL ranks must skip if ANY rank skips to avoid desync
+        # We use a tensor on the same device as the loss
+        skip_batch = torch.tensor([1.0 if skip_reason else 0.0], device=device)
+        if torch.distributed.is_initialized():
+            torch.distributed.all_reduce(skip_batch, op=torch.distributed.ReduceOp.MAX)
+        
+        if skip_batch.item() > 0:
+            if skip_reason and (batch_idx + 1) % 10 == 0:
+                rank_str = f"Rank {torch.distributed.get_rank()}" if torch.distributed.is_initialized() else ""
+                print(f"Warning: Skipping batch {batch_idx+1} due to {skip_reason} {rank_str}")
+                if skip_reason == "NaN/Inf":
+                    for k, v in outputs.items():
+                        if "loss" in k and isinstance(v, torch.Tensor):
+                            val = v.item() if v.numel() == 1 else "tensor"
+                            print(f"  {k}: {val}")
+                            
+            self.optimizer.zero_grad()
+            return loss.detach(), torch.zeros(self.output_dim, device=device), torch.zeros(bsz, device=device)
+
+        if self.scaler is not None:
+            self.scaler.scale(loss).backward()
+            if (batch_idx + 1) % self.accumulation_step == 0:
+                self.scaler.unscale_(self.optimizer)
+                
+                # Gradient Clipping & Logging
+                if self.grad_clip and self.max_grad_norm:
+                    total_norm = torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.max_grad_norm)
+                    if total_norm > self.max_grad_norm:
+                         if (batch_idx + 1) % 100 == 0: # Log only occasionally to avoid spam
+                            print(f"Warning: Gradient clipped (norm {total_norm:.2f} > {self.max_grad_norm})")
+                
+                self.scaler.step(self.optimizer)
+                self.scaler.update()
+                if self.scheduler is not None:
+                    self.scheduler.step()
+                self.optimizer.zero_grad(set_to_none=True)
+        else:
+            loss.backward()
+            if (batch_idx + 1) % self.accumulation_step == 0:
+                
+                # Gradient Clipping & Logging
+                if self.grad_clip and self.max_grad_norm:
+                     total_norm = torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.max_grad_norm)
+                     if total_norm > self.max_grad_norm:
+                        if (batch_idx + 1) % 100 == 0:
+                            print(f"Warning: Gradient clipped (norm {total_norm:.2f} > {self.max_grad_norm})")
+
+                if self.optimizer is not None:
+                    self.optimizer.step()
+                if self.scheduler is not None:
+                    self.scheduler.step()
+                if self.optimizer is not None:
+                    self.optimizer.zero_grad(set_to_none=True)
+
+        loss_detached = loss.detach()
+        acc = torch.zeros(self.output_dim, device=device)
+        dummy_targets = torch.zeros(bsz, device=device)
+        
+        # Explicit cleanup to break potential cycles or delayed GC
+        del outputs
+        del loss
+        
+        # Debug memory accumulation
+        import gc
+        gc.collect()
+        
+        mem_alloc = torch.cuda.memory_allocated(device) / 1e9
+        mem_res = torch.cuda.memory_reserved(device) / 1e9
+        if (batch_idx + 1) % 1000 == 0:
+            print(f"Step {batch_idx+1} End: Allocated {mem_alloc:.2f}GB, Reserved {mem_res:.2f}GB", flush=True)
+            
+        return loss_detached, acc, dummy_targets
+            
+        return loss_detached, acc, dummy_targets
+
+    def eval_batch(self, batch, batch_idx, device):
+        if not self._check_inputs(batch, batch_idx, split="val"):
+            print(f"Skipping validation batch {batch_idx} due to invalid inputs.")
+            bsz = batch["input_ids"].size(0) if "input_ids" in batch else 1
+            return torch.tensor(0.0, device=device), torch.zeros(self.output_dim, device=device), torch.zeros(bsz, device=device)
+
+        batch = self._move_to_device(batch, device)
+        bsz = batch["input_ids"].size(0)
+
+        with torch.no_grad():
+            with torch.amp.autocast('cuda', enabled=self.use_amp):
+                outputs = self.model(batch)
+                loss = outputs["total_loss"].detach()
+
+        self._record_val_metrics(outputs)
+        self._maybe_log_losses(outputs, batch_idx, split="val")
+        acc = torch.zeros(self.output_dim, device=device)
+        dummy_targets = torch.zeros(bsz, device=device)
+        return loss, acc, dummy_targets
+
+    def _calculate_teacher_forcing_perplexity(self, batch, batch_idx, device):
+        """
+        Calculate perplexity using teacher forcing (how well model predicts the true answer)
+        """
+        # Extract single sample from batch for teacher forcing evaluation
+        single_batch = {}
+        for key, value in batch.items():
+            if isinstance(value, torch.Tensor):
+                single_batch[key] = value[batch_idx:batch_idx+1].to(device)
+            elif isinstance(value, list):
+                single_batch[key] = [value[batch_idx]]
+            else:
+                single_batch[key] = value
+        
+        # Run forward pass
+        with torch.no_grad():
+            # Ensure we are in eval mode
+            self.model.eval()
+            outputs = self.model(single_batch)
+            
+        if 'ce_loss' in outputs:
+            return torch.exp(outputs['ce_loss']).item()
+            
+        return float('inf')
+
+    def _get_ground_truth_stellar_parameters(self, batch: Dict[str, Any], batch_idx: int) -> Optional[str]:
+        """Get ground truth stellar parameters as JSON string"""
+        try:
+            import json
+            
+            # Try single-star mode first
+            if 'stellar_params_gt' in batch and batch['stellar_params_gt'] is not None:
+                gt_params = batch['stellar_params_gt']
+                gt_mask = batch['stellar_params_gt_present']
+                
+                if batch_idx < len(gt_mask) and gt_mask[batch_idx] and gt_params.size(1) > 0:
+                    param_names = ['Teff', 'logg', 'FeH']
+                    gt_dict = {}
+                    for i, param_name in enumerate(param_names):
+                        if i < gt_params.shape[1]:
+                            gt_dict[param_name] = round(gt_params[batch_idx, i].item(), 2)
+                    
+                    if gt_dict:
+                        return json.dumps(gt_dict, separators=(',', ':'))
+            return None
+        except Exception as e:
+            print(f"Error getting ground truth stellar parameters: {e}")
+            return None
+
+    def _get_stellar_parameter_predictions(self, batch: Dict[str, Any], batch_idx: int, device: torch.device) -> Optional[str]:
+        # LateFusionModel currently doesn't output stellar parameter predictions in a standard way
+        return None
+
+    def evaluate_validation_samples(self, device, epoch, num_samples=3,
+                                    max_new_tokens=128, temperature=0.2, top_p=0.8):
+        """
+        Evaluate model on actual validation samples with both teacher-forcing and generation perplexity
+        """
+        current_rank = dist.get_rank() if dist.is_initialized() else 0
+        print(f"DEBUG: evaluate_validation_samples called on rank {current_rank}")
+        self.model.eval()
+        
+        print(f"\n{'='*80}")
+        print(f"VALIDATION SAMPLE EVALUATION - EPOCH {epoch}")
+        print(f"{'='*80}")
+        
+        tokenizer = getattr(self, 'tokenizer', None)
+        if tokenizer is None:
+            print("Warning: No tokenizer available for decoding")
+        
+        val_dl = self.val_dl
+        print(f"DEBUG: val_dl length: {len(val_dl)}")
+        val_iter = iter(val_dl)
+        
+        epoch_results = {
+            'epoch': epoch,
+            'samples': [],
+            'avg_teacher_forcing_perplexity': 0.0,
+            'avg_generation_perplexity': 0.0
+        }
+        
+        sample_count = 0
+        total_tf_perplexity = 0
+        total_gen_perplexity = 0
+        valid_tf_count = 0
+        valid_gen_count = 0
+        
+        # Use autocast if enabled in trainer
+        use_amp = getattr(self, 'use_amp', False)
+        
+        with torch.no_grad():
+            with torch.amp.autocast('cuda', enabled=use_amp):
+                while sample_count < num_samples:
+                    try:
+                        batch = next(val_iter)
+                    except StopIteration:
+                        break
+                
+                    batch_idx = 0
+                    # Handle different batch structures
+                    if 'obsids' in batch:
+                        obsid = batch['obsids'][batch_idx]
+                    elif 'metadata' in batch and batch['metadata']:
+                        meta = batch['metadata'][batch_idx]
+                        if meta and 'raw' in meta:
+                            obsid = meta['raw'].get('obsid', "Unknown")
+                        else:
+                            obsid = "Unknown"
+                    else:
+                        obsid = "Unknown"
+                    
+                    # 1. Calculate teacher-forcing perplexity (and get other outputs)
+                tf_perplexity = self._calculate_teacher_forcing_perplexity(batch, batch_idx, device)
+                
+                # Get stellar parameter predictions by running a forward pass on this sample
+                # We need to reconstruct a mini-batch of size 1 for the forward pass 
+                mini_batch = {}
+                for k, v in batch.items():
+                    if isinstance(v, torch.Tensor):
+                        mini_batch[k] = v[batch_idx : batch_idx + 1].to(device)
+                    elif isinstance(v, list):
+                        mini_batch[k] = [v[batch_idx]]
+                    else:
+                        mini_batch[k] = v
+                
+                stellar_pred_str = "N/A"
+                with torch.no_grad():
+                    self.model.eval()
+                    try:
+                        outputs = self.model(mini_batch)
+                        if "stellar_prediction" in outputs:
+                            pred = outputs["stellar_prediction"][0] # [3]
+                            # Denormalize Teff (index 0)
+                            teff = pred[0].item() * 5700.0
+                            logg = pred[1].item()
+                            feh = pred[2].item()
+                            stellar_pred_str = f'{{"Teff": {teff:.2f}, "logg": {logg:.2f}, "FeH": {feh:.2f}}}'
+                    except Exception as e:
+                        print(f"Error getting stellar predictions: {e}")
+
+                # 2. Generate response
+                model_ref = self.model.module if isinstance(self.model, (torch.nn.DataParallel, torch.nn.parallel.DistributedDataParallel)) else self.model
+                
+                if hasattr(model_ref, 'generate_response_from_batch'):
+                    generated_text, input_text, target_text, generation_log_probs = model_ref.generate_response_from_batch(
+                        batch_data=batch,
+                        batch_idx=batch_idx,
+                        tokenizer=tokenizer,
+                        max_new_tokens=max_new_tokens,
+                        temperature=temperature,
+                        top_p=top_p
+                    )
+                else:
+                    print("Model does not support generate_response_from_batch")
+                    generated_text = "N/A"
+                    input_text = "N/A"
+                    target_text = "N/A"
+                    generation_log_probs = []
+                
+                # Calculate generation perplexity
+                if generation_log_probs:
+                    avg_log_prob = np.mean(generation_log_probs)
+                    gen_perplexity = np.exp(-avg_log_prob)
+                else:
+                    gen_perplexity = float('inf')
+                
+                print(f"\n{'-'*60}")
+                print(f"SAMPLE {sample_count + 1} (OBSID: {obsid})")
+                print(f"{'-'*60}")
+                print(f"QUESTION: {input_text}")
+                print(f"TRUE ANSWER: {target_text}")
+
+                # Display followup turns if present
+                followup_turns = batch.get('followup_turns', None)
+                if followup_turns is not None and len(followup_turns) > 0:
+                    turns_list = followup_turns[batch_idx] if isinstance(followup_turns, list) else followup_turns
+                    if turns_list:
+                        print(f"\nFOLLOWUP TURNS ({len(turns_list)}):")
+                        for i, (fq, fa) in enumerate(turns_list, 1):
+                            print(f"  Turn {i} Q: {fq}")
+                            print(f"  Turn {i} A: {fa}")
+
+                print(f"\nGENERATED ANSWER: {generated_text}")
+                print(f"Teacher-Forcing Perplexity: {tf_perplexity:.2f}")
+                print(f"Generation Perplexity: {gen_perplexity:.2f}")
+                print(f"Generated {len(generation_log_probs)} tokens")
+                
+                # Add ground truth stellar parameters if available
+                stellar_gt_json = self._get_ground_truth_stellar_parameters(batch, batch_idx)
+                if stellar_gt_json:
+                    print(f"TRUE STELLAR PARAMS:      {stellar_gt_json}")
+                print(f"PREDICTED STELLAR PARAMS: {stellar_pred_str}")
+                
+                # Store results
+                sample_result = {
+                    'obsid': obsid,
+                    'question': input_text,
+                    'true_answer': target_text,
+                    'generated_answer': generated_text,
+                    'teacher_forcing_perplexity': tf_perplexity,
+                    'generation_perplexity': gen_perplexity,
+                    'num_generated_tokens': len(generation_log_probs),
+                    'predicted_stellar_params': stellar_pred_str
+                }    
+                epoch_results['samples'].append(sample_result)
+                
+                # Track valid perplexities for averaging
+                if tf_perplexity != float('inf'):
+                    total_tf_perplexity += tf_perplexity
+                    valid_tf_count += 1
+                if gen_perplexity != float('inf'):
+                    total_gen_perplexity += gen_perplexity
+                    valid_gen_count += 1
+                
+                    sample_count += 1
+        
+        # Calculate averages
+        if valid_tf_count > 0:
+            epoch_results['avg_teacher_forcing_perplexity'] = total_tf_perplexity / valid_tf_count
+        else:
+            epoch_results['avg_teacher_forcing_perplexity'] = float('inf')
+            
+        if valid_gen_count > 0:
+            epoch_results['avg_generation_perplexity'] = total_gen_perplexity / valid_gen_count
+        else:
+            epoch_results['avg_generation_perplexity'] = float('inf')
+        
+        print(f"\n{'='*60}")
+        print(f"EPOCH {epoch} SUMMARY:")
+        print(f"Avg Teacher-Forcing Perplexity: {epoch_results['avg_teacher_forcing_perplexity']:.2f}")
+        print(f"Avg Generation Perplexity: {epoch_results['avg_generation_perplexity']:.2f}")
+        print(f"Valid TF Samples: {valid_tf_count}/{sample_count}")
+        print(f"Valid Gen Samples: {valid_gen_count}/{sample_count}")
+        print(f"{'='*60}")
+        
+        # Store results
+        if not hasattr(self, 'validation_sample_history'):
+            self.validation_sample_history = []
+        self.validation_sample_history.append(epoch_results)
+        
+        # Save results
+        if hasattr(self, 'log_path') and self.log_path:
+            eval_file = os.path.join(self.log_path, f'{self.exp_name}_validation_samples.json')
+            with open(eval_file, 'w') as f:
+                # Convert inf to None for JSON serialization
+                serializable_history = []
+                for result in self.validation_sample_history:
+                    serializable_result = result.copy()
+                    serializable_result['avg_teacher_forcing_perplexity'] = (
+                        None if result['avg_teacher_forcing_perplexity'] == float('inf') 
+                        else result['avg_teacher_forcing_perplexity']
+                    )
+                    serializable_result['avg_generation_perplexity'] = (
+                        None if result['avg_generation_perplexity'] == float('inf') 
+                        else result['avg_generation_perplexity']
+                    )
+                    for sample in serializable_result['samples']:
+                        if sample['teacher_forcing_perplexity'] == float('inf'):
+                            sample['teacher_forcing_perplexity'] = None
+                        if sample['generation_perplexity'] == float('inf'):
+                            sample['generation_perplexity'] = None
+                    serializable_history.append(serializable_result)
+                
+                json.dump(serializable_history, f, indent=2)
+
+
+    def eval_epoch(self, device, epoch):
+        """
+        Override eval_epoch to run text generation evaluation every epoch.
+        """
+        # Run detailed evaluation (text generation)
+        if (not torch.distributed.is_initialized()) or torch.distributed.get_rank() == 0:
+            try:
+                self.evaluate_validation_samples(device, epoch, num_samples=10)
+            except Exception as e:
+                print(f"Warning: Evaluation failed with error: {e}")
+                import traceback
+                traceback.print_exc()
+        
+        # Then run regular evaluation (loss calculation)
+        return super().eval_epoch(device, epoch)
+

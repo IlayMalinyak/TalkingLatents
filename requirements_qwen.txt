@@ -1,0 +1,6 @@
+# Additional dependencies required when enabling the Hugging Face/Qwen backend
+# Install with: pip install -r requirements_qwen.txt
+transformers>=4.39.0
+accelerate>=0.30.0
+bitsandbytes>=0.43.0
+sentencepiece>=0.1.99

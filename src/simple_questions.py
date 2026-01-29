@@ -23,8 +23,10 @@ ROOT_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.append(ROOT_DIR)
 print("running from ", ROOT_DIR) 
 
+os.system('pip install fairscale')
+
 from nn.llm import MultimodalLlamaModel
-from nn.models import MultiTaskRegressor
+from nn.spectra_model import MultiTaskRegressor, SpectralViT
 from llama3.llama.model import Transformer, ModelArgs
 from data.dataset_interpert import StellarQuestionsDataset, create_stellar_dataloaders, collate_fn
 from data.transforms import *
@@ -32,12 +34,17 @@ from nn.train import LLMTrainer
 from util.utils import *
 # from nn.multimodal import setup
 
-JSON_PATH = '/lustre/fswork/projects/rech/oxl/utl47bv/data/stellar_descriptions_questions_short.json'
-FEATURES_PATH = '/lustre/fswork/projects/rech/oxl/utl47bv/data/features.npy'  # Optional, can be None to load all features on-the-fly
-MODEL_PATH = "/lustre/fsmisc/dataset/HuggingFace_Models/meta-llama/Meta-Llama-3.1-8B/original"
-TOKENIZER_PATH = "/lustre/fsmisc/dataset/HuggingFace_Models/meta-llama/Meta-Llama-3.1-8B/original"
-SPECTRA_CONFIG_PATH = "/data/DESA/logs/spec_decode2_2025-02-16/MultiTaskRegressor_spectra__decode_4_complete_config.yaml"
-SPECTRA_WEIGHTS_PATH = "/data/DESA/logs/spec_decode2_2025-02-16/MultiTaskRegressor_spectra_decode_4.pth"
+JSON_PATH = '/home/ilay.kamai/work/TalkingLatents/data/dataset/stellar_descriptions_questions_short.json'
+ADVANCED_JSON_PATH = '/home/ilay.kamai/work/TalkingLatents/data/dataset/caption_advanced_100k.json'
+COMPARATIVE_JSON_FILE='/home/ilay.kamai/work/TalkingLatents/data/dataset/comparative_dataset.json'
+FEATURES_PATH = '/home/ilay.kamai/work/TalkingLatents/logs/2025-07-29/features.npy'  # Optional, can be None to load all features on-the-fly
+MODEL_PATH = "/home/ilay.kamai/work/.llama/Llama3.1-8B"
+TOKENIZER_PATH = "/home/ilay.kamai/work/.llama/Llama3.1-8B"
+SPECTRA_CONFIG_PATH = "/home/ilay.kamai/work/DESA/logs/spec_decode2_2025-02-16/MultiTaskRegressor_spectra__decode_4_complete_config.yaml"
+SPECTRA_WEIGHTS_PATH = "/home/ilay.kamai/work/DESA/logs/spec_decode2_2025-02-16/MultiTaskRegressor_spectra_decode_4.pth"
+SPECTRA_CONFIG_PATH_v2 = '/home/ilay.kamai/work/MultiDESA/configs/lamost.yaml'
+SPECTRA_WEIGHTS_PATH_v2 = 'pretrained_models/spectra.pth'
+
 
 print("number of gpus: ", torch.cuda.device_count())
 # os.environ['PYTORCH_CUDA_ALLOC_CONF'] = 'expandable_segments:True'
@@ -59,47 +66,45 @@ def setup():
     """
     import torch.distributed as dist
 
-    # Derive distributed env from SLURM or torchrun
-    world_size = int(os.environ.get("WORLD_SIZE", os.environ.get("SLURM_NTASKS", 1)))
-    rank = int(os.environ.get("RANK", os.environ.get("SLURM_PROCID", 0)))
-    local_rank = int(os.environ.get("LOCAL_RANK", os.environ.get("SLURM_LOCALID", 0)))
-    jobid = int(os.environ.get("SLURM_JOBID", 0))
-
-    # Ensure master addr/port are present (even for single process)
-    os.environ.setdefault("MASTER_ADDR", os.environ.get("MASTER_ADDR", "127.0.0.1"))
-    # Choose a port deterministically from job id when available
-    default_port = 12910 + (jobid % 20000) if jobid else 12910
-    os.environ.setdefault("MASTER_PORT", str(default_port))
+    # Initialize process group (works for world_size==1 as well)
+    # If using torchrun, these vars are set. If not, fallback to SLURM.
+    if "RANK" in os.environ and "WORLD_SIZE" in os.environ:
+        local_rank = int(os.environ.get("LOCAL_RANK", 0))
+        torch.cuda.set_device(local_rank)
+        if not dist.is_initialized():
+            dist.init_process_group(backend="nccl", init_method="env://")
+        rank = dist.get_rank()
+        world_size = dist.get_world_size()
+    else:
+        # Fallback for direct srun or local
+        world_size = int(os.environ.get("WORLD_SIZE", os.environ.get("SLURM_NTASKS", 1)))
+        rank = int(os.environ.get("RANK", os.environ.get("SLURM_PROCID", 0)))
+        local_rank = int(os.environ.get("LOCAL_RANK", os.environ.get("SLURM_LOCALID", 0)))
+        
+        # Ensure master addr/port are present
+        os.environ.setdefault("MASTER_ADDR", os.environ.get("MASTER_ADDR", "127.0.0.1"))
+        jobid = int(os.environ.get("SLURM_JOBID", 0))
+        default_port = 12910 + (jobid % 20000) if jobid else 12910
+        os.environ.setdefault("MASTER_PORT", str(default_port))
+        
+        torch.cuda.set_device(local_rank)
+        if not dist.is_initialized():
+            dist.init_process_group(backend="nccl", rank=rank, world_size=world_size, init_method="env://")
 
     gpus_per_node = torch.cuda.device_count()
-    print('jobid ', jobid)
-    print('gpus per node ', gpus_per_node)
-    print(
-        f"Hello from rank {rank} of {world_size} where there are {gpus_per_node} allocated GPUs per node.",
-        flush=True,
-    )
-
-    if gpus_per_node == 0:
-        if rank == 0:
-            print("No CUDA devices detected; running in CPU-only mode without distributed init.")
-        return 0, 1, 0
-
-    # Initialize process group (works for world_size==1 as well)
-    if not dist.is_initialized():
-        dist.init_process_group(backend="nccl", rank=rank, world_size=world_size, init_method="env://")
-
     if rank == 0:
-        print(f"Group initialized? {dist.is_initialized()}", flush=True)
+        print(f"Hello from rank {rank} of {world_size} where there are {gpus_per_node} allocated GPUs per node.", flush=True)
 
-    # Map this process to its local GPU
-    torch.cuda.set_device(local_rank)
-    print(f"rank: {rank}, local_rank: {local_rank}")
+    # Device is already set above
+    # torch.cuda.set_device(local_rank) 
+    if rank == 0:
+        print(f"rank: {rank}, local_rank: {local_rank}, device: {torch.cuda.current_device()}")
 
-    # Initialize fairscale model parallel if available (required for LLaMA even on 1 GPU)
+    # Initialize fairscale model parallel if available
     try:
         import fairscale.nn.model_parallel.initialize as fs_init
         if not fs_init.model_parallel_is_initialized():
-            fs_init.initialize_model_parallel(1)  # 1 = no model parallel split
+            fs_init.initialize_model_parallel(1)
             if rank == 0:
                 print("Fairscale model parallel initialized", flush=True)
     except Exception as _:
@@ -146,8 +151,12 @@ def _load_llm_model_with_error_handling(args) -> Transformer:
         else:
             print(f"Loading LLaMA checkpoint on rank {rank}: {checkpoints[0]}")
             try:
-                # Load weights on CPU to avoid GPU OOM; immediately free after load.
-                checkpoint = torch.load(checkpoints[0], map_location="cpu")
+                # Load weights on CPU with mmap to avoid OOM
+                try:
+                    checkpoint = torch.load(checkpoints[0], map_location="cpu", mmap=True)
+                except TypeError:
+                    print("mmap=True not supported/failed, falling back to standard load")
+                    checkpoint = torch.load(checkpoints[0], map_location="cpu")
                 
                 # Print checkpoint info
                 if isinstance(checkpoint, dict):
@@ -199,7 +208,7 @@ def get_model_path(args):
     """
     def is_valid_model_dir(p: str) -> bool:
         return os.path.isfile(os.path.join(p, 'params.json')) and os.path.isfile(os.path.join(p, 'tokenizer.model'))
-
+    print('llm root: ', args.llm_root)
     candidates = []
     if hasattr(args, 'llm_path') and args.llm_path:
         candidates.append(args.llm_path)
@@ -255,141 +264,7 @@ def print_detailed_memory():
         print(f"  Available: {available:.2f} GB")
         print(f"  Free (Reserved - Allocated): {(reserved - allocated):.2f} GB")
 
-def parse_args():
-    """Parse command line arguments"""
-    parser = argparse.ArgumentParser(description='Train CLIP Multimodal Stellar Model')
-    
-    # Data paths
-    parser.add_argument('--json_file', type=str, default=JSON_PATH,
-                       help='Path to stellar descriptions JSON file')
-    parser.add_argument('--features_file', type=str, default=FEATURES_PATH,
-                       help='Path to spectral features numpy file')
-    parser.add_argument('--output_dir', type=str, default='logs',
-                       help='Output directory for logs and models')
-    parser.add_argument('--exp_name', type=str, default='interpert',
-                       help='Experiment name')
-    
-    # Model configuration
-    parser.add_argument('--llm_root', type=str, default=os.environ.get('LLM_ROOT', '/data/.llama'),
-                       help='Root directory containing LLaMA models (or set env LLM_ROOT)')
-    parser.add_argument('--llm_model', type=str, default='Llama3.1-8B',
-                       help='LLaMA model name under --llm_root')
-    parser.add_argument('--llm_path', type=str, default=None,
-                       help='Full path to the LLaMA model directory (contains params.json). Overrides llm_root/llm_model.')
-    parser.add_argument('--llm_precision', type=str, default='fp16', choices=['fp32','fp16','bf16'],
-                       help='Precision to hold LLM weights on GPU (fp16 recommended on V100)')
-    parser.add_argument('--spectral_embedding_dim', type=int, default=2048,
-                       help='Spectral model embedding dimension')
-    parser.add_argument('--hidden_dim', type=int, default=512,
-                       help='Common projection space dimension')
-    parser.add_argument('--num_spectral_features', type=int, default=1,
-                       help='Number of spectral features to integrate into LLM')
-    parser.add_argument('--num_neighbor_samples', type=int, default=0,
-                       help='Number of nearest neighbours to include per sample for topology supervision')
-    parser.add_argument('--neighbor_metric', type=str, default='euclidean',
-                       help='Distance metric for neighbour search (scikit-learn syntax)')
-    parser.add_argument('--neighbor_cache', type=str, default=None,
-                       help='Optional path to save/load precomputed neighbour graph (npz)')
-    parser.add_argument('--physics_keys', nargs='*', default=['Teff', 'logg', 'FeH'],
-                       help='Physical property keys used for auxiliary regression')
-    parser.set_defaults(normalize_physics=True)
-    parser.add_argument('--disable_physics_normalization', action='store_false', dest='normalize_physics',
-                       help='Disable normalization of physical property targets')
-    parser.add_argument('--use_dummy_llm', action='store_true',
-                       help='Use a tiny dummy language model for local smoke tests')
-    parser.add_argument('--latent_ids', type=list, nargs='*', default=['Teff', 'logg', 'FeH'],
-                       help='List of latent variable IDs to include (e.g., --latent_ids mass age metallicity)')
-    parser.add_argument('--max_seq_length', type=int, default=128,
-                       help='Maximum sequence length for text inputs'),
-    parser.add_argument('--checkpoint_dir', type=str, default=None,
-                          help='Directory to load model checkpoint from, if any'),
-    parser.add_argument('--train', type=bool, default=True,
-                          help='Whether to train the model or just evaluate'),
-                    
-                
-    
-    # Training parameters
-    parser.add_argument('--batch_size', type=int, default=4,
-                       help='Batch size per GPU')
-    parser.add_argument('--num_epochs', type=int, default=1000,
-                       help='Number of training epochs')
-    parser.add_argument('--learning_rate', type=float, default=1e-4,
-                       help='Learning rate')
-    parser.add_argument('--weight_decay', type=float, default=0.001,
-                       help='Weight decay')
-    parser.add_argument('--warmup_epochs', type=int, default=2,
-                       help='Number of warmup epochs')
-    parser.add_argument('--early_stopping', type=int, default=20,
-                       help='Early stopping patience')
-    parser.add_argument('--max_iter', type=int, default=-1,
-                       help='Maximum training iterations per epoch (-1 for no cap)')
-    parser.add_argument('--lambda_feat', type=float, default=0.0,
-                       help='Auxiliary weight for tokens->latent invertibility loss')
-    parser.add_argument('--lambda_text', type=float, default=0.0,
-                       help='Auxiliary weight for text->latent regression loss')
-    parser.add_argument('--lambda_retrieval', type=float, default=0.0,
-                       help='Auxiliary weight for neighbour retrieval loss')
-    parser.add_argument('--lambda_physics', type=float, default=0.0,
-                       help='Auxiliary weight for physical property regression loss')
-
-    parser.add_argument('--use_amp', action='store_true', default=False,
-                       help='Use Automatic Mixed Precision training')
-    parser.add_argument('--amp_opt_level', type=str, default='O1',
-                       choices=['O0', 'O1', 'O2', 'O3'],
-                       help='AMP optimization level')
-    parser.add_argument('--loss_scale', type=float, default=None,
-                       help='Static loss scaling factor (None for dynamic)')
-
-    parser.add_argument('--mode', type=str, choices=['single_star', 'two_star', 'combined'], 
-                       default='combined', help='Training mode: single_star, two_star, or combined')
-    
-    parser.add_argument('--switch_epoch', type=int, default=7,
-                       help='Epoch to switch from single_star to two_star in combined mode')
-    
-    parser.add_argument('--comparative_json_file', type=str, 
-                       default='/data/TalkingLatents/data/dataset/comparative_dataset.json',
-                       help='Path to comparative questions JSON file (used in two_star mode)')
-    
-    
-    # Memory optimization
-    parser.add_argument('--gradient_checkpointing', action='store_true', default=True,
-                       help='Use gradient checkpointing to save memory')
-    parser.add_argument('--max_grad_norm', type=float, default=1.0,
-                       help='Maximum gradient norm for clipping')
-    
-    # Data splitting
-    parser.add_argument('--train_ratio', type=float, default=0.8,
-                       help='Training set ratio')
-    parser.add_argument('--val_ratio', type=float, default=0.1,
-                       help='Validation set ratio')
-    parser.add_argument('--test_ratio', type=float, default=0.1,
-                       help='Test set ratio')
-    parser.add_argument('--random_seed', type=int, default=42,
-                       help='Random seed for data splitting')
-    
-    # Distributed training
-    parser.add_argument('--num_workers', type=int, default=0,
-                       help='Number of dataloader workers')
-    
-    # Model freezing
-    parser.add_argument('--freeze_llm', action='store_true', default=True,
-                       help='Freeze LLM parameters')
-    parser.add_argument('--freeze_spectral', action='store_true', default=True,
-                       help='Freeze spectral model parameters')
-    
-    # Evaluation
-    parser.add_argument('--eval_every', type=int, default=1,
-                       help='Evaluate every N epochs')
-    parser.add_argument('--save_every', type=int, default=10,
-                       help='Save checkpoint every N epochs')
-    parser.add_argument('--compute_retrieval_metrics', action='store_true',
-                       help='Compute retrieval metrics during training')
-
-    # Resume options
-    parser.add_argument('--resume_path', type=str, default=None,
-                        help='Path to a full training checkpoint (model+optimizer+scheduler+scaler) to resume')
-    
-    return parser.parse_args()
+# parse_args function has been moved to simple_questions_multitok.py
 
 def create_datasets_and_loaders(args, device):
     """Create datasets and dataloaders with distributed sampling"""
@@ -593,6 +468,7 @@ def create_model_memory_optimized(args, device):
 
 def _load_spectra_model_cpu():
     """Load spectral model directly to CPU to save memory"""
+    print("Loading spectral model...")
     config = yaml.safe_load(open(SPECTRA_CONFIG_PATH, 'r'))
     config['model_args']['avg_output'] = False
     
@@ -606,6 +482,35 @@ def _load_spectra_model_cpu():
     
     model.load_state_dict(state_dict)
     model.eval()
+
+    print("spectra model loaded succsfully!")
+    
+    return model
+
+def _load_spectra_model_cpu_v2():
+    print("loading spectra model v2...")
+    # config is already a dict from yaml.safe_load
+    config = yaml.safe_load(open(SPECTRA_CONFIG_PATH_v2, 'r'))
+    # Check for SpectralViT config first
+    if 'SpectralViT' in config:
+        print("Loading SpectralViT model...")
+        model_args = Container(**config['SpectralViT'])
+        # In MultiDESA/src/lamost.py, transformer_args uses Conformer config
+        conformer_args = Container(**config['Conformer'])
+        
+        model = SpectralViT(model_args, transformer_args=conformer_args)
+        
+        # Load checkpoint
+        ckpt_path = model_args.checkpoint_path
+        print(f"Loading checkpoint from {ckpt_path}")
+        if os.path.exists(ckpt_path):
+            state_dict = torch.load(ckpt_path, map_location='cpu')
+            # Handle DDP prefix if present
+            new_state_dict = OrderedDict()
+            for k, v in state_dict.items():
+                name = k[7:] if k.startswith('module.') else k
+                new_state_dict[name] = v
+            model.load_state_dict(new_state_dict)
     
     return model
 
@@ -636,10 +541,143 @@ def _load_llm_model_cpu(args) -> Transformer:
     return model
 
 # Update the existing functions to use CPU loading
-def _load_spectra_model():
+def _load_spectra_model(args):
+    if args.v2:
+        return _load_spectra_model_cpu_v2()
     return _load_spectra_model_cpu()
 
-def _load_llm_model(args) -> Transformer:
+def _load_hf_llm_model(args):
+    """Load a Hugging Face causal LM for use as the text backbone."""
+    try:
+        from transformers import AutoModelForCausalLM  # type: ignore
+    except ImportError as exc:  # pragma: no cover - optional dependency
+        raise ImportError(
+            "Hugging Face backend requested but transformers is not installed. "
+            "Install it via `pip install transformers accelerate bitsandbytes`."
+        ) from exc
+
+    model_name = getattr(args, "hf_model_name", None)
+    if not model_name:
+        raise ValueError("hf_model_name must be provided when llm_backend='hf'.")
+
+    precision = getattr(args, "llm_precision", "fp16").lower()
+    if precision == "fp16":
+        torch_dtype = torch.float16
+    elif precision == "bf16":
+        torch_dtype = torch.bfloat16
+    else:
+        torch_dtype = torch.float32
+
+    quantization = getattr(args, "hf_quantization", "none")
+    quantization = (quantization or "none").lower()
+    if quantization in {"4bit", "8bit"} and not torch.cuda.is_available():
+        print(
+            f"Warning: Requested {quantization} quantization but CUDA is unavailable. "
+            "Falling back to full-precision CPU loading."
+        )
+        quantization = "none"
+
+    load_kwargs = {
+        "torch_dtype": torch_dtype,
+        "trust_remote_code": getattr(args, "hf_trust_remote_code", False),
+        "cache_dir": getattr(args, "hf_cache_dir", None),
+        "token": getattr(args, "hf_auth_token", None),
+        "attn_implementation": getattr(args, "hf_attn_implementation", None),
+    }
+
+    hf_revision = getattr(args, "hf_revision", None)
+    if hf_revision:
+        load_kwargs["revision"] = hf_revision
+
+    hf_device_map = getattr(args, "hf_device_map", None)
+    if hf_device_map:
+        if isinstance(hf_device_map, str) and hf_device_map.strip().startswith('{'):
+            try:
+                hf_device_map = json.loads(hf_device_map)
+            except json.JSONDecodeError:
+                print(f"Warning: Failed to parse hf_device_map as JSON: {hf_device_map}")
+        load_kwargs["device_map"] = hf_device_map
+
+    max_memory_gb = getattr(args, "hf_max_memory_gb", None)
+    if max_memory_gb:
+        max_memory = {}
+        if torch.cuda.is_available():
+            # accelerate expects integer GPU indices as keys, not 'cuda:0' strings
+            for idx in range(torch.cuda.device_count()):
+                max_memory[idx] = f"{max_memory_gb}GiB"
+            # Also allow CPU offload headroom when CUDA is available
+            cpu_offload_gb = os.environ.get("HF_CPU_OFFLOAD_GB", None)
+            if cpu_offload_gb is not None and str(cpu_offload_gb).strip() != "":
+                max_memory["cpu"] = f"{cpu_offload_gb}GiB"
+            else:
+                # Provide a reasonable default for CPU offload if not specified
+                max_memory["cpu"] = "64GiB"
+        else:
+            max_memory["cpu"] = f"{max_memory_gb}GiB"
+        load_kwargs["max_memory"] = max_memory
+
+    if quantization in {"4bit", "8bit"}:
+        try:
+            from transformers import BitsAndBytesConfig  # type: ignore
+        except ImportError as exc:  # pragma: no cover - optional dependency
+            raise ImportError(
+                "bitsandbytes is required for HF quantized loading. "
+                "Install it via `pip install bitsandbytes`."
+            ) from exc
+
+        if quantization == "4bit":
+            quant_config = BitsAndBytesConfig(
+                load_in_4bit=True,
+                bnb_4bit_use_double_quant=True,
+                bnb_4bit_quant_type="nf4",
+                bnb_4bit_compute_dtype=torch.bfloat16 if torch.cuda.is_available() else torch.float32,
+            )
+        else:
+            quant_config = BitsAndBytesConfig(
+                load_in_8bit=True,
+                bnb_8bit_compute_dtype=torch.bfloat16 if torch.cuda.is_available() else torch.float32,
+            )
+        load_kwargs["quantization_config"] = quant_config
+        load_kwargs.setdefault("device_map", hf_device_map or "auto")
+    
+    # Force low_cpu_mem_usage to prevent checking entire model into RAM
+    load_kwargs["low_cpu_mem_usage"] = True
+
+    # Remove None entries to avoid transformers warnings
+    load_kwargs = {k: v for k, v in load_kwargs.items() if v is not None}
+
+    print(
+        f"Loading Hugging Face causal LM '{model_name}' "
+        f"(dtype={torch_dtype}, quantization={quantization}) ..."
+    )
+    try:
+        model = AutoModelForCausalLM.from_pretrained(
+            model_name,
+            **load_kwargs,
+        )
+    except RuntimeError as err:
+        if "cuda" in str(err).lower():
+            print(f"Encountered CUDA error while loading HF model: {err}")
+            print("Retrying load on CPU (device_map=None)...")
+            load_kwargs.pop("device_map", None)
+            load_kwargs.pop("quantization_config", None)
+            model = AutoModelForCausalLM.from_pretrained(
+                model_name,
+                **load_kwargs,
+            )
+        else:
+            raise
+
+    print("[OK] Hugging Face model loaded")
+    return model
+
+
+def _load_llm_model(args):
+    backend = getattr(args, "llm_backend", "llama").lower()
+    if backend == "qwen":
+        backend = "hf"
+    if backend in {"hf", "qwen"}:
+        return _load_hf_llm_model(args)
     return _load_llm_model_with_error_handling(args)
 
 def create_model(args, device):
@@ -802,7 +840,8 @@ def create_optimizer_and_scheduler(model, args, train_loader):
     named_params = list(model.named_parameters())
     for name, param in named_params:
         if 'base_model' in name and args.freeze_llm:
-            param.requires_grad = False
+            if 'lora' not in name:
+                param.requires_grad = False
         if 'fm_model' in name and args.freeze_spectral:
             param.requires_grad = False
 
@@ -830,7 +869,25 @@ def create_optimizer_and_scheduler(model, args, train_loader):
         return 0.5 * (1 + np.cos(np.pi * (step - max(0, warmup_steps)) / denom))
     
     scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
-    scaler = GradScaler(enabled=args.use_amp)
+    
+    # Disable GradScaler for bfloat16 as it doesn't need/support it
+    use_scaler = args.use_amp
+    precision = getattr(args, 'llm_precision', 'unknown')
+    
+    # Check actual parameter dtypes
+    param_dtypes = {p.dtype for p in opt_params}
+    if torch.bfloat16 in param_dtypes:
+        use_scaler = False
+        if dist.get_rank() == 0:
+            print("DEBUG: Detected bfloat16 parameters in optimizer. Disabling GradScaler.")
+            
+    if precision in ['bf16', 'bfloat16']:
+        use_scaler = False
+        
+    if dist.get_rank() == 0:
+        print(f"DEBUG: Optimizer creation - Precision: {precision}, Use AMP: {args.use_amp}, Enable Scaler: {use_scaler}")
+
+    scaler = GradScaler(enabled=use_scaler)
 
     return optimizer, scheduler, scaler
 
@@ -865,17 +922,37 @@ def create_trainer(model, optimizer, criterion, train_loader, val_loader,scaler,
         lora_params=lora_params,
         scaler=scaler,
         use_amp=args.use_amp,
-        max_grad_norm=args.max_grad_norm 
+        max_grad_norm=args.max_grad_norm,
+        loss_lambda=args.loss_lambda
     )
     
     return trainer
 
-def save_config(args, output_dir):
+def save_config(args, output_dir, backend_config=None):
     """Save training configuration"""
     config_path = os.path.join(output_dir, 'training_config.json')
-    config_dict = vars(args)
-    config_dict['llm_model'] = args.llm_model
+    config_dict = dict(vars(args))
+    # Sanitize non-serializable objects from argparse namespace
+    lb_cfg = config_dict.get('llm_backend_config')
+    if lb_cfg is not None:
+        if hasattr(lb_cfg, 'to_dict'):
+            config_dict['llm_backend_config'] = lb_cfg.to_dict()
+        elif isinstance(lb_cfg, dict):
+            # keep as-is
+            pass
+        else:
+            # drop to avoid JSON serialization errors (a copy also saved under 'backend_config' below)
+            config_dict.pop('llm_backend_config', None)
+    config_dict['llm_model'] = getattr(args, 'llm_model', None)
     config_dict['json_path'] = JSON_PATH
+    if backend_config is None:
+        maybe_cfg = getattr(args, 'llm_backend_config', None)
+        if hasattr(maybe_cfg, "to_dict"):
+            backend_config = maybe_cfg.to_dict()
+        elif isinstance(maybe_cfg, dict):
+            backend_config = maybe_cfg
+    if backend_config is not None:
+        config_dict['backend_config'] = backend_config
     
     with open(config_path, 'w') as f:
         json.dump(config_dict, f, indent=2)

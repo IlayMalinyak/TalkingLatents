@@ -3,16 +3,46 @@
 
 import math
 from dataclasses import dataclass
-from typing import Optional, Tuple
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
-import fairscale.nn.model_parallel.initialize as fs_init
+
 import torch
 import torch.nn.functional as F
-from fairscale.nn.model_parallel.layers import (
-    ColumnParallelLinear,
-    RowParallelLinear,
-    VocabParallelEmbedding,
-)
+
+try:
+    import fairscale.nn.model_parallel.initialize as fs_init
+    from fairscale.nn.model_parallel.layers import (
+        ColumnParallelLinear,
+        RowParallelLinear,
+        VocabParallelEmbedding,
+    )
+except ImportError:
+    class MockFsInit:
+        @staticmethod
+        def get_model_parallel_world_size():
+            return 1
+        @staticmethod
+        def get_model_parallel_rank():
+            return 0
+    fs_init = MockFsInit()
+
+    class ColumnParallelLinear(torch.nn.Linear):
+        def __init__(self, in_features, out_features, *args, **kwargs):
+            kwargs.pop('gather_output', None)
+            kwargs.pop('init_method', None)
+            super().__init__(in_features, out_features, *args, **kwargs)
+
+    class RowParallelLinear(torch.nn.Linear):
+        def __init__(self, in_features, out_features, *args, **kwargs):
+            kwargs.pop('input_is_parallel', None)
+            kwargs.pop('init_method', None)
+            super().__init__(in_features, out_features, *args, **kwargs)
+
+    class VocabParallelEmbedding(torch.nn.Embedding):
+         def __init__(self, num_embeddings, embedding_dim, *args, **kwargs):
+            kwargs.pop('init_method', None)
+            super().__init__(num_embeddings, embedding_dim, *args, **kwargs)
+
 from torch import nn
 
 
@@ -98,6 +128,8 @@ class Attention(nn.Module):
         self.n_rep = self.n_local_heads // self.n_local_kv_heads
         self.head_dim = args.dim // args.n_heads
 
+        self.args = args # Store args for lazy allocation
+
         self.wq = ColumnParallelLinear(
             args.dim,
             args.n_heads * self.head_dim,
@@ -127,24 +159,9 @@ class Attention(nn.Module):
             init_method=lambda x: x,
         )
 
-        # Allocate caches on CPU first to avoid early GPU memory pressure.
-        # They are moved to the correct device on first forward with `to(xq)`.
-        self.cache_k = torch.zeros(
-            (
-                args.max_batch_size,
-                args.max_seq_len,
-                self.n_local_kv_heads,
-                self.head_dim,
-            )
-        )
-        self.cache_v = torch.zeros(
-            (
-                args.max_batch_size,
-                args.max_seq_len,
-                self.n_local_kv_heads,
-                self.head_dim,
-            )
-        )
+        # Lazy allocation to save memory when cache is not used (e.g. training)
+        self.cache_k = None
+        self.cache_v = None
 
     def forward(
         self,
@@ -152,8 +169,16 @@ class Attention(nn.Module):
         start_pos: int,
         freqs_cis: torch.Tensor,
         mask: Optional[torch.Tensor],
+        cache_rows: Optional[Sequence[int]] = None,
+        use_cache: bool = True,
     ):
         bsz, seqlen, _ = x.shape
+        if cache_rows is not None:
+            if len(cache_rows) != bsz:
+                raise ValueError(f"cache_rows length {len(cache_rows)} != batch size {bsz}")
+            row_indices = [int(r) for r in cache_rows]
+        else:
+            row_indices = list(range(bsz))
         xq, xk, xv = self.wq(x), self.wk(x), self.wv(x)
 
         xq = xq.view(bsz, seqlen, self.n_local_heads, self.head_dim)
@@ -162,14 +187,56 @@ class Attention(nn.Module):
 
         xq, xk = apply_rotary_emb(xq, xk, freqs_cis=freqs_cis)
 
-        self.cache_k = self.cache_k.to(xq)
-        self.cache_v = self.cache_v.to(xq)
+        # DEBUG: Check for NaNs in Q/K/V
+        if torch.isnan(xq).any() or torch.isinf(xq).any():
+             print(f"DEBUG: Attention NaN/Inf detected in XQ! Shape: {xq.shape}, Max: {xq.max()}, Min: {xq.min()}")
+        if torch.isnan(xk).any() or torch.isinf(xk).any():
+             print(f"DEBUG: Attention NaN/Inf detected in XK! Shape: {xk.shape}")
+        if torch.isnan(xv).any() or torch.isinf(xv).any():
+             print(f"DEBUG: Attention NaN/Inf detected in XV! Shape: {xv.shape}")
 
-        self.cache_k[:bsz, start_pos : start_pos + seqlen] = xk
-        self.cache_v[:bsz, start_pos : start_pos + seqlen] = xv
-
-        keys = self.cache_k[:bsz, : start_pos + seqlen]
-        values = self.cache_v[:bsz, : start_pos + seqlen]
+        if use_cache:
+            if self.cache_k is None:
+                # Lazy allocation on first use
+                self.cache_k = torch.zeros(
+                    (
+                        self.args.max_batch_size,
+                        self.args.max_seq_len,
+                        self.n_local_kv_heads,
+                        self.head_dim,
+                    ),
+                    device=xq.device,
+                    dtype=xq.dtype # Match dtype
+                )
+                self.cache_v = torch.zeros(
+                    (
+                        self.args.max_batch_size,
+                        self.args.max_seq_len,
+                        self.n_local_kv_heads,
+                        self.head_dim,
+                    ),
+                    device=xq.device,
+                    dtype=xq.dtype
+                )
+            
+            self.cache_k = self.cache_k.to(xq)
+            self.cache_v = self.cache_v.to(xq)
+    
+            for i, row in enumerate(row_indices):
+                self.cache_k[row, start_pos : start_pos + seqlen] = xk[i]
+                self.cache_v[row, start_pos : start_pos + seqlen] = xv[i]
+    
+            keys = torch.stack(
+                [self.cache_k[row, : start_pos + seqlen] for row in row_indices], dim=0
+            )
+            values = torch.stack(
+                [self.cache_v[row, : start_pos + seqlen] for row in row_indices], dim=0
+            )
+        else:
+            # Bypass cache storage, use current inputs directly
+            # This avoids OOM/Graph leaks during training
+            keys = xk
+            values = xv
 
         # repeat k/v heads if n_kv_heads < n_heads
         keys = repeat_kv(
@@ -187,8 +254,30 @@ class Attention(nn.Module):
         scores = torch.matmul(xq, keys.transpose(2, 3)) / math.sqrt(self.head_dim)
         if mask is not None:
             scores = scores + mask  # (bs, n_local_heads, seqlen, cache_len + seqlen)
+        
+        # Clamp scores to prevent overflow/NaN in Softmax (and backprop)
+        scores = torch.clamp(scores, min=-10000.0, max=10000.0)
+        
         scores = F.softmax(scores.float(), dim=-1).type_as(xq)
-        output = torch.matmul(scores, values)  # (bs, n_local_heads, seqlen, head_dim)
+
+        # --- HARD DEBUG PATCH (CONDITIONAL) ---
+        # print(f"DEBUG: Attention forward {id(self)} run. store_attention={getattr(self, 'store_attention', 'MISSING')}")
+        if getattr(self, 'store_attention', False):
+            try:
+                self.last_attn_scores = scores.detach().cpu()
+            except Exception as e:
+                print(f"Error capturing attention: {e}")
+        # ------------------------
+        
+        # Force float32 for weighted sum to avoid FP16 overflow/underflow
+        # Also disable autocast to ensure gradients don't downcast
+        with torch.autocast(device_type='cuda', enabled=False):
+             scores_f = scores.float()
+             values_f = values.float()
+             output = torch.matmul(scores_f, values_f)  # (bs, n_local_heads, seqlen, head_dim)
+        
+        output = output.type_as(xq)
+        
         output = output.transpose(1, 2).contiguous().view(bsz, seqlen, -1)
         return self.wo(output)
 
@@ -245,8 +334,12 @@ class TransformerBlock(nn.Module):
         start_pos: int,
         freqs_cis: torch.Tensor,
         mask: Optional[torch.Tensor],
+        cache_rows: Optional[Sequence[int]] = None,
+        use_cache: bool = True,
     ):
-        h = x + self.attention(self.attention_norm(x), start_pos, freqs_cis, mask)
+        h = x + self.attention(
+            self.attention_norm(x), start_pos, freqs_cis, mask, cache_rows=cache_rows, use_cache=use_cache
+        )
         out = h + self.feed_forward(self.ffn_norm(h))
         return out
 
@@ -278,7 +371,9 @@ class Transformer(nn.Module):
         )
 
     @torch.inference_mode()
-    def forward(self, tokens: torch.Tensor, start_pos: int):
+    def forward(
+        self, tokens: torch.Tensor, start_pos: int, cache_rows: Optional[Sequence[int]] = None
+    ):
         _bsz, seqlen = tokens.shape
         h = self.tok_embeddings(tokens)
         self.freqs_cis = self.freqs_cis.to(h.device)
@@ -299,7 +394,7 @@ class Transformer(nn.Module):
             ).type_as(h)
         
         for layer in self.layers:
-            h = layer(h, start_pos, freqs_cis, mask)
+            h = layer(h, start_pos, freqs_cis, mask, cache_rows=cache_rows)
         h = self.norm(h)
         output = self.output(h).float()
         return output, h

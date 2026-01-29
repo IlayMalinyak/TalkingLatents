@@ -10,11 +10,20 @@ from typing import List, Optional, Tuple, TypedDict
 
 import torch
 import torch.nn.functional as F
-from fairscale.nn.model_parallel.initialize import (
-    get_model_parallel_rank,
-    initialize_model_parallel,
-    model_parallel_is_initialized,
-)
+try:
+    from fairscale.nn.model_parallel.initialize import (
+        get_model_parallel_rank,
+        initialize_model_parallel,
+        model_parallel_is_initialized,
+    )
+except ImportError:
+    def get_model_parallel_rank():
+        return 0
+    def initialize_model_parallel(size):
+        pass
+    def model_parallel_is_initialized():
+        return False
+
 
 from llama3.llama.model import ModelArgs, Transformer
 from llama3.llama.tokenizer import ChatFormat, Dialog, Message, Tokenizer

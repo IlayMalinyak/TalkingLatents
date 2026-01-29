@@ -3,6 +3,18 @@ from collections import OrderedDict
 from typing import List
 import pandas as pd
 
+def collate_with_idx(batch):
+    # drop skipped items
+    batch = [b for b in batch if b is not None]
+    if len(batch) == 0:
+        return None, None  # DataLoader will hand this to the loop; you can skip the step
+
+    data, idxs = zip(*batch)
+    # use your original collate for tensors
+    out = kepler_collate_fn(data)  # or collate_triplets(data)
+    # attach indices for debugging
+    return out, torch.as_tensor(idxs, dtype=torch.long)
+
 def kepler_collate_fn(batch:List):
     """
     Collate function for the Kepler dataset.

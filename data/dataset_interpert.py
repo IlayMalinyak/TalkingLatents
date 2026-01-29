@@ -4,15 +4,17 @@ from torch.utils.data import Dataset, DataLoader
 import torch.distributed as dist
 from torch.utils.data.distributed import DistributedSampler
 import json
+import math
 import numpy as np
 import pandas as pd
+import random
 from sklearn.model_selection import train_test_split
-from typing import Optional, Tuple, Dict, Any, List
+from typing import Optional, Tuple, Dict, Any, List, Type
 import os
 from pathlib import Path
 from astropy.io import fits
 import re
-
+from typing import Optional, Tuple, Dict, Any, List, Type, Union
 
 import os
 os.system('pip install tiktoken fairscale fire blobfile')
@@ -23,6 +25,8 @@ print("running from ", ROOT_DIR)
 
 from llama3.llama.tokenizer import Tokenizer
 from data.transforms import RandomMasking
+from data.feature_normalizer import FeatureNormalizer
+from src.follow_up_templates import create_follow_up_specs
 
 
 class StellarQuestionsDataset(Dataset):
@@ -31,19 +35,22 @@ class StellarQuestionsDataset(Dataset):
     """
     PyTorch Dataset for stellar descriptions and optional spectral features
     Now includes tokenization for LLaMA
-    
+
     Args:
         json_file (str): Path to the JSON file with stellar data
         features_array (Optional[np.ndarray]): Optional array of spectral features
         split (str): One of 'train', 'val', 'test'
         train_ratio (float): Proportion for training set
-        val_ratio (float): Proportion for validation set  
+        val_ratio (float): Proportion for validation set
         test_ratio (float): Proportion for test set (remaining after train/val)
         random_state (int): Random seed for reproducible splits
         filter_valid_descriptions (bool): Whether to filter out samples with no description
         cache_dir (Optional[str]): Directory to cache split indices for consistency
         tokenizer_path (Optional[str]): Path to SentencePiece tokenizer model
         max_length (int): Maximum sequence length for tokenization
+        enable_followup (bool): Whether to append follow-up questions
+        followup_json_file (Optional[str]): Path to second JSON for description-based follow-ups
+        followup_mode (str): "stellar_type", "description", or "mixed" (50/50 default)
     """
     
     def __init__(self, 
@@ -58,13 +65,23 @@ class StellarQuestionsDataset(Dataset):
                  filter_valid_descriptions: bool = True,
                  cache_dir: Optional[str] = None,
                  tokenizer_path: Optional[str] = None,
+                 tokenizer: Optional[Any] = None,
+                 tokenizer_backend: str = 'llama',
                  max_length: int = 512,
                  num_spectral_features: int = 1,
-                 num_neighbor_samples: int = 0,
-                 neighbor_cache_path: Optional[str] = None,
-                 neighbor_metric: str = 'euclidean',
-                 physics_keys: Tuple[str, ...] = ('Teff', 'logg', 'FeH'),
-                 normalize_physics: bool = True):
+                 normalize_features: bool = True,
+                 feature_stats: Optional[Dict[str, np.ndarray]] = None,
+                 feature_norm_epsilon: float = 1e-6,
+                 enable_followup: bool = False,
+                 followup_prob: float = 0.0,
+                 max_followup_turns: int = 1,
+                 followup_seed: int = 42,
+                 # Optional second JSON for follow-up Q&A
+                 followup_json_file: Optional[str] = None,
+                 followup_mode: str = "mixed",
+                 multimodal_df: Optional[pd.DataFrame] = None,
+                 index_df: Optional[pd.DataFrame] = None,
+                 apply_norm: bool = True):
         
         assert split in ['train', 'val', 'test'], f"Split must be 'train', 'val', or 'test', got {split}"
         assert abs(train_ratio + val_ratio + test_ratio - 1.0) < 1e-6, "Ratios must sum to 1.0"
@@ -76,38 +93,145 @@ class StellarQuestionsDataset(Dataset):
         self.random_state = random_state
         self.filter_valid_descriptions = filter_valid_descriptions
         self.tokenizer_path = tokenizer_path
+        self.tokenizer_backend = tokenizer_backend
         self.max_length = max_length
-        self.tokenizer = None
+        self.tokenizer = tokenizer
         self.transforms = spectral_transforms
         self.mask_transform = RandomMasking()  # Example masking
-        self.num_neighbor_samples = max(0, int(num_neighbor_samples))
-        self.neighbor_cache_path = neighbor_cache_path
-        self.neighbor_metric = neighbor_metric
-        self.physics_keys = tuple(physics_keys)
-        self.normalize_physics = normalize_physics
-        self.physics_mean = None
-        self.physics_std = None
-        self.physics_mean_tensor = None
-        self.physics_std_tensor = None
-        self.df_index_to_phys: Dict[int, np.ndarray] = {}
-        self.df_index_to_obsid: Dict[int, int] = {}
-        self._neighbor_indices: Optional[np.ndarray] = None
-        self._neighbor_distances: Optional[np.ndarray] = None
-        self._features_key: Optional[int] = None
-        if isinstance(self.features_array, np.ndarray):
-            try:
-                self._features_key = int(self.features_array.__array_interface__['data'][0])
-            except Exception:
-                self._features_key = id(self.features_array)
+        self.normalize_features = normalize_features and (self.features_array is not None)
+        self.feature_norm_epsilon = feature_norm_epsilon
+        self.feature_normalizer = FeatureNormalizer(
+            enabled=self.normalize_features,
+            epsilon=self.feature_norm_epsilon,
+        )
+        self.enable_followup = enable_followup
+        self.followup_prob = followup_prob
+        self.max_followup_turns = max_followup_turns
+        self.followup_json_file = followup_json_file
+        self.followup_mode = followup_mode
+        seed_offset = followup_seed + hash((split, random_state))
+        self.followup_rng = random.Random(seed_offset)
 
-        # Load tokenizer if available
-        self._load_tokenizer()
+        # Load follow-up JSON if provided
+        self.followup_data = None
+        if self.followup_json_file and self.enable_followup:
+            self._load_followup_json()
 
+        self.multimodal_df = multimodal_df
+        if self.multimodal_df is not None:
+            # Ensure index for faster lookup if possible, but user might pass raw dataframe
+            # We'll assume it's indexable by obsid or we find the row using a column
+            print(f"Loaded multimodal dataframe with {len(self.multimodal_df)} rows")
+
+        self.index_df = index_df
+        self.obsid_to_feature_idx = {}
+        if self.index_df is not None:
+             print(f"Loaded index dataframe for feature alignment with {len(self.index_df)} rows")
+             # Build lookup map: obsid -> row_idx
+             # Handle potential column name variations if needed, but assuming 'obsid' based on user request
+             if 'obsid' in self.index_df.columns:
+                 # Create mapping for both string and int versions to be robust
+                 for idx, row in self.index_df.iterrows():
+                     obsid_val = row['obsid']
+                     self.obsid_to_feature_idx[str(obsid_val)] = idx
+                     try:
+                         self.obsid_to_feature_idx[int(obsid_val)] = idx
+                     except (ValueError, TypeError):
+                         pass
+             else:
+                 print("Warning: index_df provided but 'obsid' column not found.")
+
+        # Print follow-up mode info
+        if self.enable_followup:
+            if self.followup_data is not None:
+                print(f"Follow-up mode: {self.followup_mode} (with {len(self.followup_data)} description samples loaded)")
+            else:
+                print(f"Follow-up mode: stellar_type only (no followup_json_file provided)")
+        
+        self.numeric_bounds = {
+            'Teff': (3000.0, 7500.0),
+            'logg': (0.0, 5.0),
+            'FeH': (-3.0, 0.5),
+        }
+        self.numeric_key_alternatives = {
+            'Teff': ['Teff', 'teff_k', 'teff', 'effective_temperature'],
+            'logg': ['logg', 'log_g'],
+            'FeH': ['FeH', 'feh', '[Fe/H]', 'metallicity'],
+        }
+
+        # Load tokenizer if not provided
+        if self.tokenizer is None:
+            self._load_tokenizer()
+        
         # Load and process data
         self._load_data()
         self._prepare_physics_and_neighbors()
         self._create_splits(train_ratio, val_ratio, test_ratio, cache_dir)
+        self._initialize_feature_normalizer(feature_stats)
         
+    def _load_followup_json(self):
+        """Load the follow-up JSON file for Q&A pairs."""
+        try:
+            with open(self.followup_json_file, 'r') as f:
+                raw_followup = json.load(f)
+            
+            # Convert list to dict keyed by obsid
+            self.followup_data = {}
+            count = 0
+            for item in raw_followup:
+                # Try to find obsid in top level or inside stellar_data
+                obsid = item.get("obsid")
+                if obsid is None and "stellar_data" in item:
+                    obsid = item["stellar_data"].get("obsid")
+                
+                if obsid is not None:
+                    # Store by integer obsid if possible
+                    try:
+                        obsid = int(obsid)
+                    except (ValueError, TypeError):
+                        pass
+                    self.followup_data[obsid] = item
+                    count += 1
+                    
+            print(f"Loaded {count} follow-up samples from {self.followup_json_file} (indexed by obsid)")
+        except Exception as e:
+            print(f"Warning: Could not load follow-up JSON {self.followup_json_file}: {e}")
+            self.followup_data = None
+
+    def _get_followup_from_description(self, obsid: int) -> Optional[Tuple[str, str]]:
+        """Extract question and answer from the follow-up JSON file by obsid."""
+        if self.followup_data is None:
+            return None
+        
+        # Ensure obsid is int/consistent
+        try:
+            obsid = int(obsid)
+        except (ValueError, TypeError):
+            print(f"Warning: Invalid obsid {obsid} (not an integer)")
+            pass
+
+        followup_sample = self.followup_data.get(obsid)
+        if followup_sample is None:
+            print(f"Warning: No follow-up sample found for obsid {obsid}")
+            return None
+
+        description = followup_sample.get("description", "")
+
+        if not description:
+            print(f"Warning: No description found for obsid {obsid}")
+            return None
+
+        # Parse the description to get question and answer
+        parsed = self.parse_description_text(description)
+        question = parsed.get("question", "")
+        answer = parsed.get("answer", "")
+
+        if not question or not answer:
+            print(f"Warning: No question or answer found for obsid {obsid}")
+            return None
+
+        return question, answer
+
     def _load_tokenizer(self):
         """Load SentencePiece tokenizer if available"""
         if self.tokenizer_path and os.path.exists(self.tokenizer_path):
@@ -172,8 +296,162 @@ class StellarQuestionsDataset(Dataset):
             for word in words:
                 word_hash = hash(word) % 10000
                 token_ids.append(abs(word_hash) + 1)
-                
+
             return token_ids, len(token_ids)
+
+    def _extend_with_tokens(self,
+                            full_tokens: List[int],
+                            target_tokens: List[int],
+                            tokens: List[int],
+                            mask_targets: bool) -> None:
+        if not tokens:
+            return
+        available = self.max_length - len(full_tokens)
+        if available <= 0:
+            return
+        chunk = tokens[:available]
+        full_tokens.extend(chunk)
+        if mask_targets:
+            target_tokens.extend([-100] * len(chunk))
+        else:
+            target_tokens.extend(chunk)
+
+    def _extract_physical_params(self, stellar_data: Dict[str, Any], obsid: Optional[int] = None) -> Dict[str, Optional[float]]:
+        """Return raw Teff/logg/FeH values when available. Also merges from multimodal_df if preset."""
+        params: Dict[str, Optional[float]] = {}
+        
+        # 1. Basic params from internal JSON
+        if isinstance(stellar_data, dict):
+             for param in ['Teff', 'logg', 'FeH']:
+                value = None
+                for key in self.numeric_key_alternatives.get(param, [param]):
+                    raw_val = stellar_data.get(key)
+                    if raw_val is not None:
+                        try:
+                            value = float(raw_val)
+                        except (TypeError, ValueError):
+                            value = None
+                        break
+                params[param] = value
+        
+        # 2. Add multimodal params if available
+        if self.multimodal_df is not None and obsid is not None:
+            try:
+                row = None
+                row = self.multimodal_df[self.multimodal_df['obsid'] == obsid]
+                if row is not None:
+                    # Extract required fields: 'binarity_class_hard', 'final_age', 'age_ref', 'Age'
+                    for col in ['binarity_class_hard', 'final_age', 'age_ref', 'Age']:
+                        if col in row:
+                            val = row[col]
+                            # Handle Series vs scalar
+                            if hasattr(val, 'item'):
+                                val = val.item()
+                            params[col] = val
+            except Exception as e:
+                # Be robust
+                pass
+
+        return params
+
+    def _append_followup_turns(self,
+                               full_tokens: List[int],
+                               target_tokens: List[int],
+                               stellar_params: Dict[str, Optional[float]],
+                               sample_idx: int = -1,
+                               obsid: Optional[int] = None) -> List[Tuple[str, str]]:
+        """Append followup turns and return list of (question, answer) text pairs."""
+        if not self.enable_followup or self.followup_prob <= 0.0:
+            return []
+        if self.followup_rng.random() > self.followup_prob:
+            return []
+
+        followups = []
+
+        if self.multimodal_df is not None:
+             # Multimodal Followup Logic
+            #  choice = self.followup_rng.choice(['binarity', 'age', 'stellar_type'])
+             choice = 'stellar_type' # use only stellar_type for now
+             
+             if choice == 'binarity':
+                 q_text = "Is this star a binary?"
+                 bin_class = stellar_params.get('binarity_class_hard')
+                 if bin_class == 1:
+                     a_text = "Yes"
+                 elif bin_class == 2:
+                     a_text = "No"
+                 else:
+                     # nan or other -> probably no
+                     a_text = "Probably no"
+                 followups.append({'question': q_text, 'answer': a_text})
+
+             elif choice == 'age':
+                 q_text = "What is the age of this star in Gyrs?"
+                 final_age = stellar_params.get('final_age')
+                 age_val = None
+                 
+                 # Logic: use final_age if not nan
+                 if final_age is not None and not (isinstance(final_age, float) and math.isnan(final_age)):
+                     age_val = final_age
+                 else:
+                     # fallback to Age and set age_ref
+                     age = stellar_params.get('Age')
+                     if age is not None and not (isinstance(age, float) and math.isnan(age)):
+                         age_val = age
+                         stellar_params['age_ref'] = 'isochrone'
+                 
+                 if age_val is not None:
+                     a_text = f"{float(age_val):.2f}"
+                 else:
+                     a_text = "Unknown"
+                 
+                 followups.append({'question': q_text, 'answer': a_text})
+
+             else: # stellar_type
+                  stellar_type_followups = create_follow_up_specs(
+                    stellar_params,
+                    self.followup_rng,
+                    max_pairs=1, 
+                    include_answers=True,
+                )
+                  if stellar_type_followups:
+                      followups.append(stellar_type_followups[0])
+
+        else:
+            # ORIGINAL LOGIC
+            # FIRST followup: Generate stellar type question from templates
+            stellar_type_followups = create_follow_up_specs(
+                stellar_params,
+                self.followup_rng,
+                max_pairs=1,  # Get just one stellar type question
+                include_answers=True,
+            )
+            if stellar_type_followups:
+                followups.append(stellar_type_followups[0])
+        # SECOND followup: Get description from JSON file (if available and max_followup_turns >= 2)
+        if self.max_followup_turns >= 2 and self.followup_data is not None and obsid is not None:
+            # Note: sample_idx here is actually used as obsid in the updated logic
+            qa_pair = self._get_followup_from_description(obsid)
+            if qa_pair is not None:
+                question, answer = qa_pair
+                followups.append({'question': question, 'answer': answer})
+
+        # Tokenize and append both followup questions
+        text_pairs = []
+        for spec in followups:
+            question_text = f"\nFollow-up question: {spec['question']}\nAnswer:"
+            q_tokens, _ = self._tokenize_text_no_pad(question_text, bos=False)
+            answer_text = (spec.get('answer') or "").strip()
+            if not answer_text:
+                answer_text = "It would remain broadly consistent apart from the requested adjustment."
+            a_tokens, _ = self._tokenize_text_no_pad(answer_text, bos=False)
+            self._extend_with_tokens(full_tokens, target_tokens, q_tokens, mask_targets=True)
+            self._extend_with_tokens(full_tokens, target_tokens, a_tokens, mask_targets=False)
+            text_pairs.append((spec['question'], answer_text))
+            if len(full_tokens) >= self.max_length:
+                break
+
+        return text_pairs
     
     def _load_data(self):
         """Load data from JSON file"""
@@ -184,6 +462,22 @@ class StellarQuestionsDataset(Dataset):
             
         print(f"Loaded {len(self.raw_data)} samples from JSON")
         
+        # Polyfill description from qa_pairs if missing
+        for sample in self.raw_data:
+            if not sample.get('description') and sample.get('qa_pairs'):
+                try:
+                    # Pick the first QA pair - or prefer reasoning/classification?
+                    # Let's just pick the first one for now to ensure we have data
+                    pair = sample['qa_pairs'][0]
+                    # Create the JSON structure expected by parse_description_text
+                    desc_obj = {
+                        "Question": pair.get('question', ''),
+                        "Description": pair.get('answer', '')
+                    }
+                    sample['description'] = json.dumps(desc_obj)
+                except (IndexError, AttributeError, TypeError):
+                    pass
+
         # Filter samples with valid descriptions if requested
         if self.filter_valid_descriptions:
             valid_samples = []
@@ -414,7 +708,7 @@ class StellarQuestionsDataset(Dataset):
     
     def _create_splits(self, train_ratio: float, val_ratio: float, test_ratio: float, cache_dir: Optional[str] = None):
         """Create train/val/test splits with caching for consistency"""
-        
+
         n_samples = len(self.raw_data)
         indices = np.arange(n_samples)
         
@@ -436,13 +730,10 @@ class StellarQuestionsDataset(Dataset):
         else:
             print("Creating new train/val/test splits...")
             
-            # First split: separate test set
-            temp_indices, test_indices = train_test_split(
-                indices, 
-                test_size=test_ratio,
-                random_state=self.random_state,
-                shuffle=True
-            )
+            # First split: separate test set (Fixed first 1000 samples as per user request)
+            # This avoids the test_size=0.0 error and provides the requested deterministic split
+            test_indices = indices[:1000]
+            temp_indices = indices[1000:]
             
             # Second split: separate train and val from remaining data
             adjusted_val_ratio = val_ratio / (train_ratio + val_ratio)
@@ -468,9 +759,63 @@ class StellarQuestionsDataset(Dataset):
             self.split_indices = val_indices
         else:  # test
             self.split_indices = test_indices
-            
+
         print(f"Split sizes - Train: {len(train_indices)}, Val: {len(val_indices)}, Test: {len(test_indices)}")
         print(f"Current split ({self.split}): {len(self.split_indices)} samples")
+
+    def _initialize_feature_normalizer(self, provided_stats: Optional[Dict[str, np.ndarray]]) -> None:
+        if self.feature_normalizer is None or self.features_array is None:
+            return
+        indices = self._collect_feature_indices()
+        self.feature_normalizer.initialize(self.features_array, indices, provided_stats)
+
+    def _collect_feature_indices(self) -> List[int]:
+        indices: List[int] = []
+        if self.features_array is None:
+            return indices
+            
+        for raw_idx in self.split_indices:
+            sample = self.raw_data[raw_idx]
+            
+            # Logic to find feature index
+            df_idx = None
+            if self.index_df is not None:
+                 obsid = sample.get('obsid')
+                 if obsid is not None:
+                     df_idx = self.obsid_to_feature_idx.get(obsid)
+                     if df_idx is None:
+                         # Try int/str conversion just in case key format differs
+                         try:
+                             df_idx = self.obsid_to_feature_idx.get(int(obsid))
+                         except (ValueError, TypeError):
+                             pass
+                         if df_idx is None:
+                             df_idx = self.obsid_to_feature_idx.get(str(obsid))
+
+            # Fallback to internal index if index_df not used or lookup failed
+            if df_idx is None:
+                df_idx = sample.get('index')
+
+            if df_idx is not None and 0 <= df_idx < len(self.features_array):
+                indices.append(df_idx)
+        return indices
+
+    def get_feature_normalization_stats(self, copy: bool = True) -> Optional[Dict[str, np.ndarray]]:
+        if self.feature_normalizer is None:
+            return None
+        return self.feature_normalizer.get_stats(copy=copy)
+
+    def denormalize_features(self, features: torch.Tensor) -> torch.Tensor:
+        if self.feature_normalizer is None:
+            return features
+        return self.feature_normalizer.inverse(features)
+
+    def _apply_feature_normalization(self, features: np.ndarray) -> np.ndarray:
+        if self.feature_normalizer is None:
+            # print("not normalizing features")
+            return np.asarray(features, dtype=np.float32)
+        # print("normalizing features")
+        return self.feature_normalizer.transform(features)
         
     def read_lamost_spectra(self, filename):
         try:
@@ -526,11 +871,11 @@ class StellarQuestionsDataset(Dataset):
     def get_raw_spectra(self, obsid: int, id_type='obsid') -> Optional[np.ndarray]:
         if id_type == 'obsid':
                 obsdir = str(obsid)[:4]
-                spectra_filename = os.path.join(f'/data/lamost/data', f'{obsdir}/{obsid}.fits')
+                spectra_filename = os.path.join(f'/home/ilay.kamai/work/lamost/data', f'{obsdir}/{obsid}.fits')
                 spectra, spectra_masked, meta = self.read_lamost_spectra(spectra_filename)
                 meta['obsid'] = obsid
         elif id_type == 'APOGEE_ID':
-            spectra_filename = f"/data/apogee/data/aspcapStar-dr17-{obsid}.fits"
+            spectra_filename = f"/home/ilay.kamai/work/apogee/data/aspcapStar-dr17-{obsid}.fits"
             spectra, spectra_masked, meta = self.read_apogee_spectra(spectra_filename)
             meta['apogee_id'] = obsid
         else:
@@ -572,96 +917,103 @@ class StellarQuestionsDataset(Dataset):
             total_tokens = available_length
         
         # Create the full sequence with feature space AT THE BEGINNING
-        # Structure: [FEATURE_SPACE] + [question_tokens] + [answer_tokens] + [PADDING]
-        full_sequence = []
-        
-        # Reserve space for features at the beginning (fill with -100, will be replaced during training)
+        # Structure: [FEATURE_SPACE] + [question_tokens] + [answer_tokens] + follow-ups + [PADDING]
         feature_start_idx = 0
-        full_sequence.extend([-100] * self.num_spectral_features)
-        
+        full_sequence: List[int] = [-100] * self.num_spectral_features
+        target_sequence: List[int] = [-100] * self.num_spectral_features
+
         # Add question tokens after features
         question_start_idx = len(full_sequence)
-        full_sequence.extend(question_tokens[:num_tok_q])
-        
-        # Add answer tokens  
+        base_question_tokens = question_tokens[:num_tok_q]
+        full_sequence.extend(base_question_tokens)
+        target_sequence.extend([-100] * len(base_question_tokens))
+
+        # Add answer tokens
         answer_start_idx = len(full_sequence)
-        full_sequence.extend(answer_tokens[:num_tok_a])
+        base_answer_tokens = answer_tokens[:num_tok_a]
+        full_sequence.extend(base_answer_tokens)
+        target_sequence.extend(base_answer_tokens)
+        base_answer_length = len(base_answer_tokens)
+
+        # Optional follow-up turns conditioned on stellar parameters
+        stellar_data = sample.get('stellar_data', {})
+        obsid = sample.get('obsid', None)
+        try:
+             obsid_int = int(obsid) if obsid is not None else None
+        except:
+             obsid_int = None
+        stellar_params = self._extract_physical_params(stellar_data, obsid=obsid_int)
+        followup_text_pairs = []  # Track followup Q&A pairs as text
+        if self.enable_followup:
+            followup_text_pairs = self._append_followup_turns(full_sequence,
+             target_sequence, stellar_params, sample_idx, obsid=obsid_int)
         
-        # Pad remaining space with -100
+        # Create attention mask for leakage prevention
+        # Default: 0.0 (allow attention)
+        # We will set blocked regions to -inf
+        attention_mask = torch.full((self.max_length, self.max_length), float("-inf"), dtype=torch.float32)
+        attention_mask = torch.triu(attention_mask, diagonal=1)
+        
+        if followup_text_pairs and base_answer_length > 0:
+            # Mask out Main Answer from Followup Turns
+            # Followup starts after Main Answer
+            followup_start = answer_start_idx + base_answer_length
+            followup_end = min(len(full_sequence), self.max_length)
+            
+            main_ans_start = answer_start_idx
+            main_ans_end = answer_start_idx + base_answer_length
+            
+            if followup_start < followup_end:
+                 # Block attention: Followup (rows) -> Main Answer (cols)
+                 attention_mask[followup_start:followup_end, main_ans_start:main_ans_end] = float("-inf")
+
+        # Pad remaining space with -100 placeholders
         remaining_space = self.max_length - len(full_sequence)
-        full_sequence.extend([-100] * remaining_space)
-        
+        if remaining_space > 0:
+            full_sequence.extend([-100] * remaining_space)
+            target_sequence.extend([-100] * remaining_space)
+        elif remaining_space < 0:
+            full_sequence = full_sequence[:self.max_length]
+            target_sequence = target_sequence[:self.max_length]
+
         # Convert to tensor
         input_ids = torch.tensor(full_sequence, dtype=torch.long)
-        
-        # Create targets: mask features AND question with -100
-        target_ids = input_ids.clone()
-        target_ids[:answer_start_idx] = -100  # Mask features + question
-        # Answer tokens and padding (-100) remain as they are
+        target_ids = torch.tensor(target_sequence, dtype=torch.long)
         
         # Get other data
-        df_index = sample.get('index')
-        spectra, masked_spectra, _ = self.get_raw_spectra(sample['obsid'])
+        # Feature lookup logic
+        df_index = None
+        if self.index_df is not None:
+             # Use the provided index_df mapping
+             # obsid extracted earlier around line 800
+             if obsid is not None:
+                 df_index = self.obsid_to_feature_idx.get(obsid)
+                 if df_index is None:
+                      # Try alternate types
+                      try:
+                          df_index = self.obsid_to_feature_idx.get(int(obsid))
+                      except (ValueError, TypeError):
+                          pass
+                      if df_index is None:
+                          df_index = self.obsid_to_feature_idx.get(str(obsid))
+        
+        # Fallback to legacy 'index' field if no index_df or lookup failed
+        if df_index is None:
+            df_index = sample.get('index')
         
         if self.features_array is not None and df_index is not None:
-            features = torch.tensor(self.features_array[df_index].astype(np.float32))
+            norm_features = self._apply_feature_normalization(self.features_array[df_index])
+            features = torch.from_numpy(norm_features)
             masked_spectra = features
+            spectra = features
         else:
+            spectra, masked_spectra, _ = self.get_raw_spectra(sample['obsid'])
             features = masked_spectra
         
         stellar_data = sample.get('stellar_data', {})
         obsid = sample.get('obsid', None)
-
-        # Physics targets (raw + normalized)
-        phys_dim = len(self.physics_keys)
-        if phys_dim > 0 and df_index is not None and df_index in self.df_index_to_phys:
-            physics_target = torch.from_numpy(self.df_index_to_phys[df_index].copy())
-            if self.physics_mean_tensor is not None and self.physics_std_tensor is not None:
-                physics_target_norm = (physics_target - self.physics_mean_tensor) / self.physics_std_tensor
-            else:
-                physics_target_norm = physics_target.clone()
-            physics_mask = torch.tensor(1.0, dtype=torch.float32)
-        else:
-            physics_target = torch.zeros(phys_dim, dtype=torch.float32)
-            physics_target_norm = physics_target.clone()
-            physics_mask = torch.tensor(0.0, dtype=torch.float32)
-
-        # Neighbor context (latents + physics)
-        neighbor_latents = torch.zeros((self.num_neighbor_samples, self.features_array.shape[1] if isinstance(self.features_array, np.ndarray) else 1), dtype=torch.float32)
-        neighbor_physics = torch.zeros((self.num_neighbor_samples, phys_dim), dtype=torch.float32)
-        neighbor_obsids = torch.full((self.num_neighbor_samples,), -1, dtype=torch.long)
-        neighbor_mask = torch.zeros((self.num_neighbor_samples,), dtype=torch.float32)
-        neighbor_distances = torch.full((self.num_neighbor_samples,), float('inf'), dtype=torch.float32)
-
-        if (
-            self.num_neighbor_samples > 0
-            and self._neighbor_indices is not None
-            and df_index is not None
-            and 0 <= df_index < len(self._neighbor_indices)
-        ):
-            cand_indices = self._neighbor_indices[df_index]
-            cand_distances = self._neighbor_distances[df_index] if self._neighbor_distances is not None else np.zeros_like(cand_indices, dtype=np.float32)
-            fill_ptr = 0
-            for neigh_idx, neigh_dist in zip(cand_indices, cand_distances):
-                if neigh_idx == df_index:
-                    continue
-                if not (0 <= neigh_idx < len(self.features_array)):
-                    continue
-                if fill_ptr >= self.num_neighbor_samples:
-                    break
-                neighbor_latents[fill_ptr] = torch.tensor(self.features_array[neigh_idx], dtype=torch.float32)
-                if phys_dim > 0 and neigh_idx in self.df_index_to_phys:
-                    neighbor_physics[fill_ptr] = torch.from_numpy(self.df_index_to_phys[neigh_idx].astype(np.float32))
-                neighbor_obsids[fill_ptr] = int(self.df_index_to_obsid.get(neigh_idx, -1))
-                neighbor_mask[fill_ptr] = 1.0
-                neighbor_distances[fill_ptr] = float(neigh_dist)
-                fill_ptr += 1
-
-        # Index of positive neighbor (default to first valid entry)
-        if neighbor_mask.sum() > 0:
-            positive_idx = int(torch.argmax(neighbor_mask).item())
-        else:
-            positive_idx = 0
+        
+        numeric_tensor = self._extract_numeric_tensor(stellar_data)
 
         return {
             'input_ids': input_ids,                    # [-100,-100,Q1,Q2,A1,A2,-100,-100,...]
@@ -671,9 +1023,10 @@ class StellarQuestionsDataset(Dataset):
             'feature_length': self.num_spectral_features,        # Number of feature tokens
             'question_start_idx': question_start_idx,  # Where question begins
             'answer_start_idx': answer_start_idx,      # Where answer begins
-            'target_length': num_tok_a,                # Length of answer portion
+            'target_length': base_answer_length,                # Length of base answer portion
             'input_text': parsed_desc['question'],
             'target_text': parsed_desc['answer'],
+            'followup_turns': followup_text_pairs,     # List of (question, answer) tuples for followup turns
             'features': features,
             'spectra': spectra,
             'masked_spectra': masked_spectra,
@@ -681,17 +1034,41 @@ class StellarQuestionsDataset(Dataset):
             'obsid': obsid,
             'df_index': df_index,
             'sample_index': sample_idx,
-            'physics_target': physics_target,
-            'physics_target_norm': physics_target_norm,
-            'physics_mask': physics_mask,
-            'neighbor_latents': neighbor_latents,
-            'neighbor_physics': neighbor_physics,
-            'neighbor_obsids': neighbor_obsids,
-            'neighbor_mask': neighbor_mask,
-            'neighbor_distances': neighbor_distances,
-            'neighbor_target_idx': torch.tensor(positive_idx, dtype=torch.long)
+            'df_index': df_index,
+            'sample_index': sample_idx,
+            'y_numeric': numeric_tensor,
+            'attention_mask': attention_mask,
         }
     
+    def _extract_numeric_tensor(self, stellar_data: Optional[Dict[str, Any]]) -> Optional[torch.Tensor]:
+        """Extract normalized Teff/logg/FeH vector if available."""
+        if not isinstance(stellar_data, dict):
+            return None
+
+        values = []
+        for param in ('Teff', 'logg', 'FeH'):
+            raw_val = None
+            for key in self.numeric_key_alternatives.get(param, [param]):
+                if key in stellar_data and stellar_data[key] is not None:
+                    raw_val = stellar_data[key]
+                    break
+            if raw_val is None:
+                return None
+            try:
+                val = float(raw_val)
+            except (TypeError, ValueError):
+                return None
+            if math.isnan(val):
+                return None
+            low, high = self.numeric_bounds[param]
+            norm = (val - low) / (high - low)
+            norm = max(0.0, min(1.0, norm))
+            values.append(norm)
+
+        if len(values) != 3:
+            return None
+        return torch.tensor(values, dtype=torch.float32)
+
     def get_split_info(self) -> Dict[str, int]:
         """Get information about all splits"""
         # This requires recreating splits temporarily
@@ -720,16 +1097,24 @@ def create_stellar_dataloaders(json_file: str,
                              random_state: int = 42,
                              num_workers: int = 0,
                              cache_dir: Optional[str] = None,
+                             world_size: int = 1,
+                             device: Optional[str] = None,
+                             dataset_cls: Type["StellarQuestionsDataset"] = StellarQuestionsDataset,
+                             multimodal_df: Optional[pd.DataFrame] = None,
+                             index_df: Optional[pd.DataFrame] = None,
                              **dataset_kwargs) -> Tuple[DataLoader, DataLoader, DataLoader]:
     """
     Create train, validation, and test dataloaders
-    
+
     Returns:
         Tuple[DataLoader, DataLoader, DataLoader]: train, val, test dataloaders
     """
-    
+
+    dataset_cls = dataset_cls or StellarQuestionsDataset
+    shared_feature_stats = dataset_kwargs.pop('feature_stats', None)
+
     # Create datasets for each split
-    train_dataset = StellarQuestionsDataset(
+    train_dataset = dataset_cls(
         json_file=json_file,
         features_array=features_array,
         split='train',
@@ -738,10 +1123,17 @@ def create_stellar_dataloaders(json_file: str,
         test_ratio=test_ratio,
         random_state=random_state,
         cache_dir=cache_dir,
+        feature_stats=shared_feature_stats,
+        multimodal_df=multimodal_df,
+        index_df=index_df,
         **dataset_kwargs
     )
-    
-    val_dataset = StellarQuestionsDataset(
+
+    feature_stats = train_dataset.get_feature_normalization_stats(copy=True)
+    if feature_stats is None:
+        feature_stats = shared_feature_stats
+
+    val_dataset = dataset_cls(
         json_file=json_file,
         features_array=features_array,
         split='val',
@@ -750,10 +1142,13 @@ def create_stellar_dataloaders(json_file: str,
         test_ratio=test_ratio,
         random_state=random_state,
         cache_dir=cache_dir,
+        feature_stats=feature_stats,
+        multimodal_df=multimodal_df,
+        index_df=index_df,
         **dataset_kwargs
     )
-    
-    test_dataset = StellarQuestionsDataset(
+
+    test_dataset = dataset_cls(
         json_file=json_file,
         features_array=features_array,
         split='test',
@@ -762,56 +1157,56 @@ def create_stellar_dataloaders(json_file: str,
         test_ratio=test_ratio,
         random_state=random_state,
         cache_dir=cache_dir,
+        feature_stats=feature_stats,
+        multimodal_df=multimodal_df,
+        index_df=index_df,
         **dataset_kwargs
     )
 
-    train_sampler = DistributedSampler(train_dataset) if dist.is_initialized() else None
-    val_sampler = DistributedSampler(val_dataset, shuffle=False) if dist.is_initialized() else None
-    test_sampler = DistributedSampler(test_dataset, shuffle=False) if dist.is_initialized() else None
-    
-    # Create dataloaders
-    # Build DataLoader kwargs and only set prefetch/persistent when using workers
-    train_kwargs = dict(
+    # Common loader kwargs
+    loader_kwargs = dict(
         batch_size=batch_size,
-        sampler=train_sampler,
-        shuffle=(train_sampler is None),
-        num_workers=num_workers,
-        pin_memory=True,
-        collate_fn=collate_fn,
-        drop_last=False,
-    )
-    if num_workers > 0:
-        train_kwargs.update(persistent_workers=True, prefetch_factor=2)
-    train_loader = DataLoader(train_dataset, **train_kwargs)
-    
-    val_kwargs = dict(
-        batch_size=batch_size,
-        sampler=val_sampler,
-        shuffle=False,
         num_workers=num_workers,
         pin_memory=True if torch.cuda.is_available() else False,
         collate_fn=collate_fn,
         drop_last=False,
     )
     if num_workers > 0:
-        val_kwargs.update(persistent_workers=True, prefetch_factor=2)
-    val_loader = DataLoader(val_dataset, **val_kwargs)
-    
-    test_kwargs = dict(
-        batch_size=batch_size,
-        sampler=test_sampler,
-        shuffle=False,
-        num_workers=num_workers,
-        pin_memory=True if torch.cuda.is_available() else False,
-        collate_fn=collate_fn,
-        drop_last=False,
-    )
-    if num_workers > 0:
-        test_kwargs.update(persistent_workers=True, prefetch_factor=2)
-    test_loader = DataLoader(test_dataset, **test_kwargs)
-    
-    return train_loader, val_loader, test_loader
+        loader_kwargs.update(persistent_workers=True, prefetch_factor=2)
 
+    # Handle distributed training
+    if world_size > 1:
+        train_sampler = DistributedSampler(
+            train_dataset, 
+            num_replicas=world_size, 
+            shuffle=True, 
+            seed=random_state,
+            drop_last=False
+        )
+        val_sampler = DistributedSampler(
+            val_dataset, 
+            num_replicas=world_size, 
+            shuffle=False, 
+            seed=random_state,
+            drop_last=False
+        )
+        test_sampler = DistributedSampler(
+            test_dataset, 
+            num_replicas=world_size, 
+            shuffle=False, 
+            seed=random_state,
+            drop_last=False
+        )
+
+        train_loader = DataLoader(train_dataset, sampler=train_sampler, **loader_kwargs)
+        val_loader = DataLoader(val_dataset, sampler=val_sampler, **loader_kwargs)
+        test_loader = DataLoader(test_dataset, sampler=test_sampler, **loader_kwargs)
+    else:
+        train_loader = DataLoader(train_dataset, shuffle=True, **loader_kwargs)
+        val_loader = DataLoader(val_dataset, shuffle=False, **loader_kwargs)
+        test_loader = DataLoader(test_dataset, shuffle=False, **loader_kwargs)
+
+    return train_loader, val_loader, test_loader
 
 def collate_fn(batch: List[Dict[str, Any]]) -> Dict[str, Any]:
     """
@@ -835,13 +1230,15 @@ def collate_fn(batch: List[Dict[str, Any]]) -> Dict[str, Any]:
 
     input_texts = [item['input_text'] for item in batch]
     target_texts = [item['target_text'] for item in batch]
+    followup_turns = [item.get('followup_turns', []) for item in batch]  # Collect followup turns
     obsids = [item['obsid'] for item in batch]
     df_indices = [item['df_index'] for item in batch]
     stellar_data = [item['stellar_data'] for item in batch]
     spectra = [item['spectra'] for item in batch]
     masked_spectra = [item['masked_spectra'] for item in batch]
-    
-    
+    y_numeric_list = [item.get('y_numeric') for item in batch]
+    attention_masks = [item.get('attention_mask') for item in batch]
+
     # Handle features - check if any sample has features
     features_list = [item['features'] for item in batch]
     if any(f is not None for f in features_list):
@@ -864,6 +1261,17 @@ def collate_fn(batch: List[Dict[str, Any]]) -> Dict[str, Any]:
             features_tensor = None
     else:
         features_tensor = None
+
+        features_tensor = None
+    
+    # Stack attention masks if present
+    if any(m is not None for m in attention_masks):
+        # Stack and ensure valid shape (B, S, S)
+        stacked_masks = torch.stack([m if m is not None else torch.zeros((input_ids.shape[1], input_ids.shape[1])) for m in attention_masks])
+    else:
+        stacked_masks = None
+
+    y_numeric, y_numeric_present = _stack_numeric(y_numeric_list)
     
     physics_target = torch.stack([item['physics_target'] for item in batch]) if batch[0]['physics_target'].numel() > 0 else torch.empty(len(batch), 0)
     physics_target_norm = torch.stack([item['physics_target_norm'] for item in batch]) if batch[0]['physics_target_norm'].numel() > 0 else torch.empty(len(batch), 0)
@@ -887,32 +1295,49 @@ def collate_fn(batch: List[Dict[str, Any]]) -> Dict[str, Any]:
         'target_lengths': target_lengths,            # Answer lengths
         'input_texts': input_texts,
         'target_texts': target_texts,
+        'followup_turns': followup_turns,            # List of followup Q&A pairs per sample
         'features': features_tensor,
         'spectra': torch.stack(spectra),
         'masked_spectra': torch.stack(masked_spectra),
         'obsids': obsids,
         'df_indices': df_indices,
         'stellar_data': stellar_data,
-        'physics_target': physics_target,
-        'physics_target_norm': physics_target_norm,
-        'physics_mask': physics_mask,
-        'neighbor_latents': neighbor_latents,
-        'neighbor_physics': neighbor_physics,
-        'neighbor_obsids': neighbor_obsids,
-        'neighbor_mask': neighbor_mask,
-        'neighbor_distances': neighbor_distances,
-        'neighbor_target_idx': neighbor_targets
+        'y_numeric': y_numeric,
+        'y_numeric_present': y_numeric_present,
+        'attention_mask': stacked_masks
     }
+
+
+def _stack_numeric(values: List[Optional[torch.Tensor]]) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Stack optional numeric tensors with a presence mask."""
+    if not values:
+        return torch.zeros((0, 3), dtype=torch.float32), torch.zeros(0, dtype=torch.bool)
+
+    valid = [v for v in values if v is not None]
+    if not valid:
+        zeros = torch.zeros((len(values), 3), dtype=torch.float32)
+        mask = torch.zeros(len(values), dtype=torch.bool)
+        return zeros, mask
+
+    shape = valid[0].shape
+    batch = torch.zeros((len(values),) + shape, dtype=torch.float32)
+    mask = torch.zeros(len(values), dtype=torch.bool)
+    for idx, tensor in enumerate(values):
+        if tensor is None:
+            continue
+        batch[idx] = tensor.to(dtype=torch.float32)
+        mask[idx] = True
+    return batch, mask
 
 
 # Example usage and testing
 if __name__ == "__main__":
 
-    TOKENIZER_PATH = "/data/.llama/Llama3.2-1B/tokenizer.model"
+    TOKENIZER_PATH = "/home/ilay.kamai/work/.llama/Llama3.2-1B/tokenizer.model"
     tokenizer = Tokenizer(model_path=TOKENIZER_PATH)
 
-    json_path = '/data/TalkingLatents/data/dataset/stellar_descriptions_questions.json'
-    spectral_features = np.load('/data/TalkingLatents/logs/2025-07-29/features.npy')
+    json_path = "/home/ilay.kamai/work/TalkingLatents/data/dataset/stellar_descriptions_questions_short.json"
+    spectral_features = np.load('/home/ilay.kamai/work/TalkingLatents/logs/2025-07-29/features.npy')
     # Example usage
     print("Example usage:")
     # Case 3: Create all dataloaders at once
@@ -925,7 +1350,7 @@ if __name__ == "__main__":
         val_ratio=0.1,
         test_ratio=0.1,
         tokenizer_path=TOKENIZER_PATH,
-        num_spectral_features=32,
+        num_spectral_features=8,
         cache_dir='cache/'  # Cache splits for consistency
     )
     
@@ -935,7 +1360,16 @@ if __name__ == "__main__":
         print("f start indices:", data['feature_start_indices'], " feature lengths:", data['feature_lengths'])
         print("Answer start indices:", data['answer_start_indices'], " target lengths:", data['target_lengths'])
         print(data['input_ids'][0][:100])
+        first_tokens = data['input_ids'][0][:100].tolist()
+        first_targets = data['target_ids'][0][:100].tolist()
+        printable_tokens = [tok for tok in first_tokens if tok >= 0]
+        printable_targets = [tok for tok in first_targets if tok >= 0]
+        print("decoded: ", tokenizer.decode(printable_tokens) if printable_tokens else "")
+        print("decoded target: ", tokenizer.decode(printable_targets) if printable_targets else "")
+
+        print(data['input_texts'][0][:100])
         print(data['target_ids'][0][:100])
+        print(data['target_texts'][0][:100])
         print("tot lengths: ", data['input_lengths'] + data['target_lengths'])
 
         if i == 10:

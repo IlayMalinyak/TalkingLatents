@@ -1,21 +1,27 @@
 {
   "lora_params": {
     "freeze_strategy": "lora",
-    "lora_start_epoch": 5,
+    "lora_start_epoch": 6,
     "lora_lr_multiplier": 1.0,
     "lora_rank": 8,
     "lora_alpha": 8.0,
-    "lora_dropout": 0.0,
+    "lora_dropout": 0.1,
     "lora_target_modules": [
+      "layers.*.attention.wq",
+      "layers.*.attention.wk",
+      "layers.*.attention.wv",
+      "layers.*.attention.wo",
+      "base_model.model.layers.*.self_attn.q_proj",
+      "base_model.model.layers.*.self_attn.k_proj",
+      "base_model.model.layers.*.self_attn.v_proj",
+      "base_model.model.layers.*.self_attn.o_proj",
       "base_model.layers.*.attention.wq",
       "base_model.layers.*.attention.wk",
       "base_model.layers.*.attention.wv",
       "base_model.layers.*.attention.wo",
-      "module.base_model.layers.*.attention.wq",
-      "module.base_model.layers.*.attention.wk",
-      "module.base_model.layers.*.attention.wv",
-      "module.base_model.layers.*.attention.wo"
+      "base_model.layers.*.feed_forward.w1",
+      "base_model.layers.*.feed_forward.w2",
+      "base_model.layers.*.feed_forward.w3"
     ]
   }
 }
-

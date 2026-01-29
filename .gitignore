@@ -5,21 +5,30 @@ pretrained_models/
 checkpoints/
 llama_url.txt
 google_api.txt
-
+baseline_followup*/
+cycle_fusion.md
 # Specific files
 data/dataset_noiseless.tar.gz
 data/dataset_noiseless/
 data/dataset/
 cache/
 figs/
+papers/
+concepts_v2/
+concepts_v2_cls/
+follow_up_outputs/
+concepts/plots
 checkpoints/
 tables/
-
+depreceated/
+generate_corrected_stats.py
+generate_corrected_stats_multimodal.py
 # File extensions
 *.pth
 *.npy
 *.csv
 *.pt
+*.out
 
 # Optional: Common additional ignores
 __pycache__/

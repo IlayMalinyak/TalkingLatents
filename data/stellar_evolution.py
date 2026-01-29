@@ -1,6 +1,8 @@
 import numpy as np
 from scipy.interpolate import LinearNDInterpolator, NearestNDInterpolator, CloughTocher2DInterpolator
 import pandas as pd
+import os
+os.system('pip install kiauhoku')
 import kiauhoku as kh
 from tqdm import tqdm
 import time

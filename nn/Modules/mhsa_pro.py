@@ -101,7 +101,7 @@ class MHA_rotary(nn.Module):
         q = self.query(x).view(B, T, self.num_heads, self.head_size).transpose(1, 2)       # (B, T, C) -> (B, nh, T, hs)
         k = self.key(x).view(B, T, self.num_heads, self.head_size).transpose(1, 2)         # (B, T, C) -> (B, nh, T, hs)
         v = self.value(x).view(B, T, self.num_heads, self.head_size).transpose(1, 2)       # (B, T, C) -> (B, nh, T, hs)
-
+        
         q, query_pass = q[..., :self.rotary_ndims], q[..., self.rotary_ndims:]
         k, key_pass = k[..., :self.rotary_ndims], k[..., self.rotary_ndims:]
         
@@ -109,7 +109,7 @@ class MHA_rotary(nn.Module):
         cos, sin = RoPE
         q, k = apply_rotary_pos_emb(q, k, cos, sin)                                     # rotary encoding
         q = torch.cat((q, query_pass), dim=-1)
-        k = torch.cat((k, key_pass), dim=-1)  
+        k = torch.cat((k, key_pass), dim=-1) 
         
         att = (q @ k.transpose(-2, -1)) * (1.0 / math.sqrt(k.size(-1)))                 # self-attention: (B, nh, T, hs) * (B, nh, hs, T) -> (B, nh, T, T)
         if key_padding_mask is not None:

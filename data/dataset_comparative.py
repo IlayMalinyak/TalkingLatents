@@ -4,6 +4,7 @@ from torch.utils.data import Dataset, DataLoader
 import torch.distributed as dist
 from torch.utils.data.distributed import DistributedSampler
 import json
+import math
 import numpy as np
 import pandas as pd
 from sklearn.model_selection import train_test_split
@@ -23,6 +24,7 @@ print("running from ", ROOT_DIR)
 
 from llama3.llama.tokenizer import Tokenizer
 from data.transforms import RandomMasking
+from data.feature_normalizer import FeatureNormalizer
 
 
 
@@ -58,9 +60,14 @@ class StellarComparativeDataset(Dataset):
                  spectral_transforms: Optional[Any] = None,
                  cache_dir: Optional[str] = None,
                  tokenizer_path: Optional[str] = None,
+                 tokenizer: Optional[Any] = None,
+                 tokenizer_backend: str = 'llama',
                  max_length: int = 512,
-                 num_stellar_features: int = 64,
-                 include_error_stats: bool = True):
+                 num_spectral_features: int = 64,
+                 include_error_stats: bool = True,
+                 normalize_features: bool = True,
+                 feature_stats: Optional[Dict[str, np.ndarray]] = None,
+                 feature_norm_epsilon: float = 1e-6):
         
         assert split in ['train', 'val', 'test'], f"Split must be 'train', 'val', or 'test', got {split}"
         assert abs(train_ratio + val_ratio + test_ratio - 1.0) < 1e-6, "Ratios must sum to 1.0"
@@ -70,19 +77,27 @@ class StellarComparativeDataset(Dataset):
         self.split = split
         self.random_state = random_state
         self.tokenizer_path = tokenizer_path
+        self.tokenizer_backend = tokenizer_backend
         self.max_length = max_length
-        self.num_stellar_features = num_stellar_features  # Features for each star (2 stars total)
+        self.num_spectral_features = num_spectral_features  # Features for each star (2 stars total)
         self.transforms = spectral_transforms
         self.mask_transform = RandomMasking()
         self.include_error_stats = include_error_stats
-        self.tokenizer = None
+        self.normalize_features = normalize_features and (self.features_array is not None)
+        self.feature_norm_epsilon = feature_norm_epsilon
+        self.feature_normalizer = FeatureNormalizer(
+            enabled=self.normalize_features,
+            epsilon=self.feature_norm_epsilon,
+        )
+        self.tokenizer = tokenizer
         
-        # Load tokenizer if available
-        self._load_tokenizer()
+        if self.tokenizer is None:
+            self._load_tokenizer()
         
         # Load and process data
         self._load_data()
         self._create_splits(train_ratio, val_ratio, test_ratio, cache_dir)
+        self._initialize_feature_normalizer(feature_stats)
         
     def _load_tokenizer(self):
         """Load SentencePiece tokenizer if available"""
@@ -231,9 +246,48 @@ class StellarComparativeDataset(Dataset):
             self.split_indices = val_indices
         else:  # test
             self.split_indices = test_indices
-            
+    
         print(f"Split sizes - Train: {len(train_indices)}, Val: {len(val_indices)}, Test: {len(test_indices)}")
         print(f"Current split ({self.split}): {len(self.split_indices)} samples")
+
+    def _initialize_feature_normalizer(self, provided_stats: Optional[Dict[str, np.ndarray]]) -> None:
+        if self.feature_normalizer is None or self.features_array is None:
+            return
+        indices = self._collect_feature_indices()
+        self.feature_normalizer.initialize(self.features_array, indices, provided_stats)
+
+    def _collect_feature_indices(self) -> List[int]:
+        indices: List[int] = []
+        if self.features_array is None:
+            return indices
+        for raw_idx in self.split_indices:
+            sample = self.raw_data[raw_idx]
+            for key in ('index', 'index_a', 'index_b'):
+                df_idx = sample.get(key)
+                if df_idx is not None and 0 <= df_idx < len(self.features_array):
+                    indices.append(df_idx)
+            # Some datasets include nested entries for STAR_A / STAR_B
+            for key in ('star_a', 'star_b'):
+                nested = sample.get(key, {})
+                df_idx = nested.get('index')
+                if df_idx is not None and 0 <= df_idx < len(self.features_array):
+                    indices.append(df_idx)
+        return indices
+
+    def get_feature_normalization_stats(self, copy: bool = True) -> Optional[Dict[str, np.ndarray]]:
+        if self.feature_normalizer is None:
+            return None
+        return self.feature_normalizer.get_stats(copy=copy)
+
+    def denormalize_features(self, features: torch.Tensor) -> torch.Tensor:
+        if self.feature_normalizer is None:
+            return features
+        return self.feature_normalizer.inverse(features)
+
+    def _apply_feature_normalization(self, features: np.ndarray) -> np.ndarray:
+        if self.feature_normalizer is None:
+            return np.asarray(features, dtype=np.float32)
+        return self.feature_normalizer.transform(features)
         
     def format_stellar_data(self, obs_data: Dict[str, Any]) -> str:
         """Format observational data into a readable string"""
@@ -325,7 +379,7 @@ class StellarComparativeDataset(Dataset):
         star_b_positions = np.where(tokens_array == star_b_token_ids)[0]
         
         # Create feature tokens (-100 values)
-        feature_tokens = np.full(self.num_stellar_features, -100, dtype=tokens_array.dtype)
+        feature_tokens = np.full(self.num_spectral_features, -100, dtype=tokens_array.dtype)
         
         # Determine insertion positions
         star_a_insert_pos = star_a_positions[0] + 1 if len(star_a_positions) > 0 else 0
@@ -337,17 +391,17 @@ class StellarComparativeDataset(Dataset):
         
         if len(star_a_positions) > 0:
             insertion_positions.append((star_a_insert_pos, 'STAR_A'))
-            feature_info['star_a_indices'] = list(range(star_a_insert_pos, star_a_insert_pos + self.num_stellar_features))
+            feature_info['star_a_indices'] = list(range(star_a_insert_pos, star_a_insert_pos + self.num_spectral_features))
         else:
             insertion_positions.append((0, 'STAR_A'))
-            feature_info['star_a_indices'] = list(range(0, self.num_stellar_features))
+            feature_info['star_a_indices'] = list(range(0, self.num_spectral_features))
         
         if len(star_b_positions) > 0:
             insertion_positions.append((star_b_insert_pos, 'STAR_B'))
-            feature_info['star_b_indices'] = list(range(star_b_insert_pos, star_b_insert_pos + self.num_stellar_features))
+            feature_info['star_b_indices'] = list(range(star_b_insert_pos, star_b_insert_pos + self.num_spectral_features))
         else:
             insertion_positions.append((0, 'STAR_B'))
-            feature_info['star_b_indices'] = list(range(0, self.num_stellar_features))
+            feature_info['star_b_indices'] = list(range(0, self.num_spectral_features))
         
         # Sort by position in descending order to insert from right to left
         insertion_positions.sort(key=lambda x: x[0], reverse=True)
@@ -360,8 +414,8 @@ class StellarComparativeDataset(Dataset):
             # Insert both at the beginning: STAR_A first, then STAR_B
             all_feature_tokens = np.concatenate([feature_tokens, feature_tokens])
             extended_tokens = np.insert(extended_tokens, 0, all_feature_tokens)
-            feature_info['star_a_indices'] = list(range(0, self.num_stellar_features))
-            feature_info['star_b_indices'] = list(range(self.num_stellar_features, 2 * self.num_stellar_features))
+            feature_info['star_a_indices'] = list(range(0, self.num_spectral_features))
+            feature_info['star_b_indices'] = list(range(self.num_spectral_features, 2 * self.num_spectral_features))
         else:
             # Insert from right to left to avoid index shifting
             if star_b_insert_pos > star_a_insert_pos:
@@ -369,23 +423,23 @@ class StellarComparativeDataset(Dataset):
                 extended_tokens = np.insert(extended_tokens, star_b_insert_pos, feature_tokens)
                 extended_tokens = np.insert(extended_tokens, star_a_insert_pos, feature_tokens)
                 # Update feature_info accounting for the insertion
-                feature_info['star_a_indices'] = list(range(star_a_insert_pos, star_a_insert_pos + self.num_stellar_features))
-                feature_info['star_b_indices'] = list(range(star_b_insert_pos + self.num_stellar_features, 
-                                                            star_b_insert_pos + 2 * self.num_stellar_features))
+                feature_info['star_a_indices'] = list(range(star_a_insert_pos, star_a_insert_pos + self.num_spectral_features))
+                feature_info['star_b_indices'] = list(range(star_b_insert_pos + self.num_spectral_features, 
+                                                            star_b_insert_pos + 2 * self.num_spectral_features))
             else:
                 # Insert STAR_A first (rightmost), or they're at the same position
                 extended_tokens = np.insert(extended_tokens, star_a_insert_pos, feature_tokens)
                 if star_b_insert_pos != star_a_insert_pos:
                     extended_tokens = np.insert(extended_tokens, star_b_insert_pos, feature_tokens)
-                    feature_info['star_b_indices'] = list(range(star_b_insert_pos, star_b_insert_pos + self.num_stellar_features))
-                    feature_info['star_a_indices'] = list(range(star_a_insert_pos + self.num_stellar_features, 
-                                                            star_a_insert_pos + 2 * self.num_stellar_features))
+                    feature_info['star_b_indices'] = list(range(star_b_insert_pos, star_b_insert_pos + self.num_spectral_features))
+                    feature_info['star_a_indices'] = list(range(star_a_insert_pos + self.num_spectral_features, 
+                                                            star_a_insert_pos + 2 * self.num_spectral_features))
                 else:
                     # Same position - insert STAR_B after STAR_A
-                    extended_tokens = np.insert(extended_tokens, star_a_insert_pos + self.num_stellar_features, feature_tokens)
-                    feature_info['star_a_indices'] = list(range(star_a_insert_pos, star_a_insert_pos + self.num_stellar_features))
-                    feature_info['star_b_indices'] = list(range(star_a_insert_pos + self.num_stellar_features, 
-                                                            star_a_insert_pos + 2 * self.num_stellar_features))
+                    extended_tokens = np.insert(extended_tokens, star_a_insert_pos + self.num_spectral_features, feature_tokens)
+                    feature_info['star_a_indices'] = list(range(star_a_insert_pos, star_a_insert_pos + self.num_spectral_features))
+                    feature_info['star_b_indices'] = list(range(star_a_insert_pos + self.num_spectral_features, 
+                                                            star_a_insert_pos + 2 * self.num_spectral_features))
         
         return extended_tokens.tolist(), feature_info
     
@@ -458,7 +512,8 @@ class StellarComparativeDataset(Dataset):
         spectra, masked_spectra, _ = self.get_raw_spectra(obsid)
         
         if self.features_array is not None and index is not None:
-            features = torch.tensor(self.features_array[index].astype(np.float32))
+            normalized = self._apply_feature_normalization(self.features_array[index])
+            features = torch.from_numpy(normalized)
             masked_spectra = features
         else:
             features = masked_spectra
@@ -532,7 +587,7 @@ class StellarComparativeDataset(Dataset):
                     values.append(0.0)  # Default for non-numeric
             
             # Pad or truncate to exact size needed
-            target_size = self.num_stellar_features
+            target_size = self.num_spectral_features
             if len(values) > target_size:
                 values = values[:target_size]
             else:
@@ -546,13 +601,19 @@ class StellarComparativeDataset(Dataset):
         # Create target_ids: mask question with -100, keep only answer (like in dataset_interpert.py)
         target_ids = input_ids.clone()
         target_ids[:answer_start_in_expanded] = -100  # Mask question and features
-        # Answer tokens and padding remain as they are in input_ids
+        # Mask padding after the answer span to avoid LM loss on pads
+        answer_end_idx = answer_start_in_expanded + num_tok_a
+        if answer_end_idx < target_ids.numel():
+            target_ids[answer_end_idx:] = -100
 
         # Get other data
         df_indices = sample.get('indices')
         obsids = sample['obsids']
         spectra_a, masked_spectra_a, features_a = self.create_features(df_indices['a'], obsids['a'])
         spectra_b, masked_spectra_b, features_b = self.create_features(df_indices['b'], obsids['b'])
+
+        y_numeric_a = self._extract_numeric_tensor(star_a_params)
+        y_numeric_b = self._extract_numeric_tensor(star_b_params)
 
         
         # For compatibility with the training code, we keep target_ids but it will be mostly masked
@@ -567,7 +628,7 @@ class StellarComparativeDataset(Dataset):
             'answer_start_idx': answer_start_in_expanded,     # Where answer begins in the sequence
             'star_a_feature_indices': torch.tensor(feature_indices['star_a_indices'], dtype=torch.long),  # Exact positions for Star A features
             'star_b_feature_indices': torch.tensor(feature_indices['star_b_indices'], dtype=torch.long),  # Exact positions for Star B features
-            'num_stellar_features': self.num_stellar_features,  # K features per star
+            'num_spectral_features': self.num_spectral_features,  # K features per star
             'sequence_length': len(expanded_tokens),          # Length before padding
             'question_text': mcq_data['question'],
             'input_text': mcq_data['full_question'],          # For compatibility with dataset_interpert.py
@@ -589,8 +650,51 @@ class StellarComparativeDataset(Dataset):
             'masked_spectra_b': masked_spectra_b,
             'pair_id': sample.get('pair_id', ''),
             'obsid': sample.get('obsids', {}),
-            'sample_index': sample_idx
+            'sample_index': sample_idx,
+            'pair_label': target_index,
+            'y_numeric_a': y_numeric_a,
+            'y_numeric_b': y_numeric_b,
         }
+    
+    def _extract_numeric_tensor(self, stellar_data: Optional[Dict[str, Any]]) -> Optional[torch.Tensor]:
+        """Extract normalized Teff/logg/FeH tensor; return None if any value missing."""
+        if not isinstance(stellar_data, dict):
+            return None
+
+        numeric_bounds = {
+            'Teff': (3000.0, 7500.0),
+            'logg': (0.0, 5.0),
+            'FeH': (-3.0, 0.5),
+        }
+        alternatives = {
+            'Teff': ['Teff', 'teff_k', 'teff', 'effective_temperature'],
+            'logg': ['logg', 'log_g'],
+            'FeH': ['FeH', 'feh', '[Fe/H]', 'metallicity'],
+        }
+
+        values = []
+        for param in ('Teff', 'logg', 'FeH'):
+            raw_val = None
+            for key in alternatives.get(param, [param]):
+                if key in stellar_data and stellar_data[key] is not None:
+                    raw_val = stellar_data[key]
+                    break
+            if raw_val is None:
+                return None
+            try:
+                val = float(raw_val)
+            except (TypeError, ValueError):
+                return None
+            if math.isnan(val):
+                return None
+            low, high = numeric_bounds[param]
+            norm = (val - low) / (high - low)
+            norm = max(0.0, min(1.0, norm))
+            values.append(norm)
+
+        if len(values) != 3:
+            return None
+        return torch.tensor(values, dtype=torch.float32)
     
     def get_split_info(self) -> Dict[str, int]:
         """Get information about all splits"""
@@ -620,6 +724,8 @@ def create_comparative_dataloaders(json_file: str,
                                  random_state: int = 42,
                                  num_workers: int = 0,
                                  cache_dir: Optional[str] = None,
+                                 world_size: int = 1,
+                                 device: Optional[str] = None,
                                  **dataset_kwargs) -> Tuple[DataLoader, DataLoader, DataLoader]:
     """
     Create train, validation, and test dataloaders for comparative questions
@@ -627,7 +733,8 @@ def create_comparative_dataloaders(json_file: str,
     Returns:
         Tuple[DataLoader, DataLoader, DataLoader]: train, val, test dataloaders
     """
-    print("crete_dataset: features arryu: {features+arra}")
+    shared_feature_stats = dataset_kwargs.pop('feature_stats', None)
+
     # Create datasets for each split
     train_dataset = StellarComparativeDataset(
         json_file=json_file,
@@ -638,8 +745,13 @@ def create_comparative_dataloaders(json_file: str,
         test_ratio=test_ratio,
         random_state=random_state,
         cache_dir=cache_dir,
+        feature_stats=shared_feature_stats,
         **dataset_kwargs
     )
+
+    feature_stats = train_dataset.get_feature_normalization_stats(copy=True)
+    if feature_stats is None:
+        feature_stats = shared_feature_stats
     
     val_dataset = StellarComparativeDataset(
         json_file=json_file,
@@ -650,6 +762,7 @@ def create_comparative_dataloaders(json_file: str,
         test_ratio=test_ratio,
         random_state=random_state,
         cache_dir=cache_dir,
+        feature_stats=feature_stats,
         **dataset_kwargs
     )
     
@@ -662,52 +775,52 @@ def create_comparative_dataloaders(json_file: str,
         test_ratio=test_ratio,
         random_state=random_state,
         cache_dir=cache_dir,
+        feature_stats=feature_stats,
         **dataset_kwargs
     )
 
-    train_sampler = DistributedSampler(train_dataset) if dist.is_initialized() else None
-    val_sampler = DistributedSampler(val_dataset, shuffle=False) if dist.is_initialized() else None
-    test_sampler = DistributedSampler(test_dataset, shuffle=False) if dist.is_initialized() else None
-    
-    # Create dataloaders
-    train_kwargs = dict(
+    # Common loader kwargs
+    loader_kwargs = dict(
         batch_size=batch_size,
-        sampler=train_sampler,
-        shuffle=(train_sampler is None),
-        num_workers=num_workers,
-        pin_memory=True,
-        collate_fn=collate_comparative_fn,
-        drop_last=False,
-    )
-    if num_workers > 0:
-        train_kwargs.update(persistent_workers=True, prefetch_factor=2)
-    train_loader = DataLoader(train_dataset, **train_kwargs)
-    
-    val_kwargs = dict(
-        batch_size=batch_size,
-        sampler=val_sampler,
-        shuffle=False,
         num_workers=num_workers,
         pin_memory=True if torch.cuda.is_available() else False,
         collate_fn=collate_comparative_fn,
         drop_last=False,
     )
     if num_workers > 0:
-        val_kwargs.update(persistent_workers=True, prefetch_factor=2)
-    val_loader = DataLoader(val_dataset, **val_kwargs)
+        loader_kwargs.update(persistent_workers=True, prefetch_factor=2)
     
-    test_kwargs = dict(
-        batch_size=batch_size,
-        sampler=test_sampler,
-        shuffle=False,
-        num_workers=num_workers,
-        pin_memory=True if torch.cuda.is_available() else False,
-        collate_fn=collate_comparative_fn,
-        drop_last=False,
-    )
-    if num_workers > 0:
-        test_kwargs.update(persistent_workers=True, prefetch_factor=2)
-    test_loader = DataLoader(test_dataset, **test_kwargs)
+    # Handle distributed training
+    if world_size > 1:
+        train_sampler = DistributedSampler(
+            train_dataset, 
+            num_replicas=world_size, 
+            shuffle=True, 
+            seed=random_state,
+            drop_last=False
+        )
+        val_sampler = DistributedSampler(
+            val_dataset, 
+            num_replicas=world_size, 
+            shuffle=False, 
+            seed=random_state,
+            drop_last=False
+        )
+        test_sampler = DistributedSampler(
+            test_dataset, 
+            num_replicas=world_size, 
+            shuffle=False, 
+            seed=random_state,
+            drop_last=False
+        )
+        
+        train_loader = DataLoader(train_dataset, sampler=train_sampler, **loader_kwargs)
+        val_loader = DataLoader(val_dataset, sampler=val_sampler, **loader_kwargs)
+        test_loader = DataLoader(test_dataset, sampler=test_sampler, **loader_kwargs)
+    else:
+        train_loader = DataLoader(train_dataset, shuffle=True, **loader_kwargs)
+        val_loader = DataLoader(val_dataset, shuffle=False, **loader_kwargs)
+        test_loader = DataLoader(test_dataset, shuffle=False, **loader_kwargs)
     
     return train_loader, val_loader, test_loader
 
@@ -730,7 +843,7 @@ def collate_comparative_fn(batch: List[Dict[str, Any]]) -> Dict[str, Any]:
     input_lengths = torch.tensor([item['input_length'] for item in batch], dtype=torch.long)
     target_lengths = torch.tensor([item['target_length'] for item in batch], dtype=torch.long)
     answer_start_indices = torch.tensor([item['answer_start_idx'] for item in batch], dtype=torch.long)
-    num_stellar_features = batch[0]['num_stellar_features']  # Same for all samples
+    num_spectral_features = batch[0]['num_spectral_features']  # Same for all samples
     
     # Stack stellar features
     star_a_features = torch.stack([item['star_a_features'] for item in batch])
@@ -755,6 +868,13 @@ def collate_comparative_fn(batch: List[Dict[str, Any]]) -> Dict[str, Any]:
     spectra_b = [item['spectra_b'] for item in batch]
     masked_spectra_b = [item['masked_spectra_b'] for item in batch]
     features_b = [item['features_b'] for item in batch]
+    y_numeric_a_list = [item.get('y_numeric_a') for item in batch]
+    y_numeric_b_list = [item.get('y_numeric_b') for item in batch]
+    pair_label_values = [item.get('pair_label') for item in batch]
+
+    y_numeric_a, y_numeric_a_present = _stack_numeric(y_numeric_a_list)
+    y_numeric_b, y_numeric_b_present = _stack_numeric(y_numeric_b_list)
+    pair_labels, pair_label_present = _stack_pair_labels(pair_label_values)
     
     return {
         'input_ids': input_ids,                              # [batch, seq_len] with question + answer and feature placeholders
@@ -765,7 +885,7 @@ def collate_comparative_fn(batch: List[Dict[str, Any]]) -> Dict[str, Any]:
         'answer_start_indices': answer_start_indices,        # [batch] - where answers start
         'star_a_feature_indices': star_a_feature_indices,    # [batch, K] - exact indices for Star A features
         'star_b_feature_indices': star_b_feature_indices,    # [batch, K] - exact indices for Star B features
-        'num_stellar_features': num_stellar_features,        # K - number of features per star
+        'num_spectral_features': num_spectral_features,        # K - number of features per star
         'sequence_lengths': sequence_lengths,                # [batch] - length before padding
         'question_texts': question_texts,
         'input_texts': input_texts,                          # For compatibility with dataset_interpert.py
@@ -784,8 +904,48 @@ def collate_comparative_fn(batch: List[Dict[str, Any]]) -> Dict[str, Any]:
         'masked_spectra_b': torch.stack(masked_spectra_b),
         'obsid': obsids,
         'star_a_params': star_a_params,
-        'star_b_params': star_b_params
+        'star_b_params': star_b_params,
+        'y_numeric_a': y_numeric_a,
+        'y_numeric_a_present': y_numeric_a_present,
+        'y_numeric_b': y_numeric_b,
+        'y_numeric_b_present': y_numeric_b_present,
+        'pair_labels': pair_labels,
+        'pair_label_present': pair_label_present,
     }
+
+
+def _stack_numeric(values: List[Optional[torch.Tensor]]) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Stack optional numeric tensors with a presence mask (expects length-3 vectors)."""
+    batch_size = len(values)
+    stacked = torch.zeros((batch_size, 3), dtype=torch.float32)
+    mask = torch.zeros(batch_size, dtype=torch.bool)
+    for idx, tensor in enumerate(values):
+        if tensor is None:
+            continue
+        tensor = tensor.view(-1)
+        if tensor.numel() != 3:
+            continue
+        stacked[idx] = tensor.to(dtype=torch.float32)
+        mask[idx] = True
+    return stacked, mask
+
+
+def _stack_pair_labels(values: List[Optional[Any]]) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Stack scalar pair labels into tensor with presence mask."""
+    batch_size = len(values)
+    labels = torch.zeros(batch_size, dtype=torch.long)
+    mask = torch.zeros(batch_size, dtype=torch.bool)
+    for idx, value in enumerate(values):
+        if value is None:
+            continue
+        if isinstance(value, torch.Tensor):
+            if value.numel() != 1:
+                continue
+            labels[idx] = int(value.item())
+        else:
+            labels[idx] = int(value)
+        mask[idx] = True
+    return labels, mask
 
 
 # Example usage and testing
@@ -809,7 +969,7 @@ if __name__ == "__main__":
         val_ratio=0.1,
         test_ratio=0.1,
         tokenizer_path=TOKENIZER_PATH,
-        num_stellar_features=4,  # Features per star
+        num_spectral_features=4,  # Features per star
         cache_dir='cache/'  # Cache splits for consistency
     )
     
@@ -826,7 +986,7 @@ if __name__ == "__main__":
         print(f"  Star B feature indices shape: {batch['star_b_feature_indices'].shape}")
         print(f"  Star A features shape: {batch['masked_spectra_a'].shape}")
         print(f"  Star B features shape: {batch['masked_spectra_b'].shape}")
-        print(f"  Num stellar features: {batch['num_stellar_features']}")
+        print(f"  Num spectral features: {batch['num_spectral_features']}")
         print(f"  Comparison types: {batch['comparison_types']}")
         print(f"  Correct labels: {batch['correct_labels']}")
         print(f"  Sample question: {batch['question_texts'][0][:100]}...")

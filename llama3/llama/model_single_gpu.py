@@ -1,7 +1,7 @@
 # Modified Llama model without FairScale dependencies
 import math
 from dataclasses import dataclass
-from typing import Optional, Tuple
+from typing import Optional, Sequence, Tuple
 import torch
 import torch.nn.functional as F
 from torch import nn
@@ -95,8 +95,19 @@ class Attention(nn.Module):
             (args.max_batch_size, args.max_seq_len, self.n_local_kv_heads, self.head_dim)
         ).cuda()  # Add .cuda()
 
-    def forward(self, x: torch.Tensor, start_pos: int, freqs_cis: torch.Tensor, mask: Optional[torch.Tensor]):
+    def forward(self,
+                x: torch.Tensor,
+                start_pos: int,
+                freqs_cis: torch.Tensor,
+                mask: Optional[torch.Tensor],
+                cache_rows: Optional[Sequence[int]] = None):
         bsz, seqlen, _ = x.shape
+        if cache_rows is not None:
+            if len(cache_rows) != bsz:
+                raise ValueError(f"cache_rows length {len(cache_rows)} != batch size {bsz}")
+            row_indices = [int(r) for r in cache_rows]
+        else:
+            row_indices = list(range(bsz))
         xq, xk, xv = self.wq(x), self.wk(x), self.wv(x)
 
         xq = xq.view(bsz, seqlen, self.n_local_heads, self.head_dim)
@@ -108,11 +119,12 @@ class Attention(nn.Module):
         self.cache_k = self.cache_k.to(xq)
         self.cache_v = self.cache_v.to(xq)
 
-        self.cache_k[:bsz, start_pos: start_pos + seqlen] = xk
-        self.cache_v[:bsz, start_pos: start_pos + seqlen] = xv
+        for i, row in enumerate(row_indices):
+            self.cache_k[row, start_pos: start_pos + seqlen] = xk[i]
+            self.cache_v[row, start_pos: start_pos + seqlen] = xv[i]
 
-        keys = self.cache_k[:bsz, : start_pos + seqlen]
-        values = self.cache_v[:bsz, : start_pos + seqlen]
+        keys = torch.stack([self.cache_k[row, : start_pos + seqlen] for row in row_indices], dim=0)
+        values = torch.stack([self.cache_v[row, : start_pos + seqlen] for row in row_indices], dim=0)
 
         keys = repeat_kv(keys, self.n_rep)
         values = repeat_kv(values, self.n_rep)
@@ -164,8 +176,9 @@ class TransformerBlock(nn.Module):
         self.attention_norm = RMSNorm(args.dim, eps=args.norm_eps)
         self.ffn_norm = RMSNorm(args.dim, eps=args.norm_eps)
 
-    def forward(self, x: torch.Tensor, start_pos: int, freqs_cis: torch.Tensor, mask: Optional[torch.Tensor]):
-        h = x + self.attention(self.attention_norm(x), start_pos, freqs_cis, mask)
+    def forward(self, x: torch.Tensor, start_pos: int, freqs_cis: torch.Tensor,
+                mask: Optional[torch.Tensor], cache_rows: Optional[Sequence[int]] = None):
+        h = x + self.attention(self.attention_norm(x), start_pos, freqs_cis, mask, cache_rows=cache_rows)
         out = h + self.feed_forward(self.ffn_norm(h))
         return out
 
@@ -195,7 +208,7 @@ class Transformer(nn.Module):
         )
 
     @torch.inference_mode()
-    def forward(self, tokens: torch.Tensor, start_pos: int):
+    def forward(self, tokens: torch.Tensor, start_pos: int, cache_rows: Optional[Sequence[int]] = None):
         _bsz, seqlen = tokens.shape
         h = self.tok_embeddings(tokens)
         self.freqs_cis = self.freqs_cis.to(h.device)
@@ -210,7 +223,7 @@ class Transformer(nn.Module):
             ).type_as(h)
 
         for layer in self.layers:
-            h = layer(h, start_pos, freqs_cis, mask)
+            h = layer(h, start_pos, freqs_cis, mask, cache_rows=cache_rows)
         h = self.norm(h)
         output = self.output(h).float()
         return output, h
