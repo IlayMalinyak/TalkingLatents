@@ -14,6 +14,7 @@ data/dataset/
 cache/
 figs/
 papers/
+diagrams/
 concepts_v2/
 concepts_v2_cls/
 follow_up_outputs/
