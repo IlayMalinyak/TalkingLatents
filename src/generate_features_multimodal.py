@@ -64,7 +64,10 @@ def load_split_features(dir_path):
 def sort_features(raw_features, raw_csv, target_csv):
     # Ensure raw_csv has an index column to track original positions
     raw_csv = raw_csv.copy()
-    raw_csv['_original_index'] = np.arange(len(raw_csv))
+    raw_csv = raw_csv.copy()
+    # Create feature index in raw_csv to track valid features from the numpy array
+    # MUST be done before dropping duplicates to preserve alignment with raw_features
+    raw_csv['feature_idx'] = np.arange(len(raw_csv))
     
     print(f"[sort_features] Raw CSV 'kid' dtype: {raw_csv['kid'].dtype}")
     print(f"[sort_features] Target CSV 'KID' dtype: {target_csv['KID'].dtype}")
@@ -80,57 +83,60 @@ def sort_features(raw_features, raw_csv, target_csv):
         print("Coercing target_csv 'KID' to int...")
         target_csv['KID'] = target_csv['KID'].fillna(-1).astype(int)
 
-    # Handle duplicates by creating a rank for each occurrence of a kid
-    # This allows 1-to-1 matching of the n-th occurrence of a KID in target 
-    # to the n-th occurrence of separate kid in raw features.
-    raw_csv['kid_rank'] = raw_csv.groupby('kid').cumcount()
-    target_csv['KID_rank'] = target_csv.groupby('KID').cumcount()
+    # Ensure raw_csv 'obsid' is int
+    if 'obsid' in raw_csv.columns and not pd.api.types.is_integer_dtype(raw_csv['obsid']):
+        print("Coercing raw_csv 'obsid' to int...")
+        raw_csv['obsid'] = raw_csv['obsid'].fillna(-1).astype(int)
+
+    # Ensure target_csv 'obsid' is int
+    if 'obsid' in target_csv.columns and not pd.api.types.is_integer_dtype(target_csv['obsid']):
+        print("Coercing target_csv 'obsid' to int...")
+        target_csv['obsid'] = target_csv['obsid'].fillna(-1).astype(int)
+    
+    # Handle duplicates in raw_csv obsid
+    # If raw_csv has duplicates for obsid, the merge will explode (1-to-many).
+    # We must enforce unique obsid in raw_csv (keeping the first one found).
+    # Note: We do this AFTER assigning feature_idx so we keep the index pointing to the right feature.
+    if raw_csv['obsid'].duplicated().any():
+        dup_count = raw_csv['obsid'].duplicated().sum()
+        print(f"[sort_features] Warning: Found {dup_count} duplicate obsids in raw_csv. Keeping first occurrence.")
+        raw_csv = raw_csv.drop_duplicates(subset=['obsid'], keep='first')
+
+    # Also, -1 obsids (NaNs) should not match each other.
+    # If we have multiple -1s in raw_csv, we should probably just effectively treat them as unmatchable 
+    # unless we really want them. For safety, let's just leave them (drop_duplicates kept one -1 if present).
+    # But to be safe against matching target -1 to raw -1, we might want to ensure valid obsids.
+    # For now, drop_duplicates handles the explosion.
     
     # We want the output to match target_csv exactly.
-    # Merge on rank + ID
-    print("[sort_features] Merging target and raw CSVs...")
+    # Merge on obsid (using the single correct merge block)
+
+    # We want the output to match target_csv exactly.
+    # Merge on obsid
+    print("[sort_features] Merging target and raw CSVs on obsid...")
     merged = target_csv.merge(
-        raw_csv[['kid', 'kid_rank', '_original_index']], 
-        left_on=['KID', 'KID_rank'], 
-        right_on=['kid', 'kid_rank'], 
+        raw_csv[['obsid', 'feature_idx']], 
+        on='obsid', 
         how='left',
         suffixes=('', '_to_drop')
     )
     
-    # Initialize full features array with zeros (dummy features)
-    # Shape: (len(target_csv), feature_dim)
-    # Get feature dimension from raw_features
-    feature_shape = raw_features.shape[1:]
-    sorted_features = np.zeros((len(target_csv), *feature_shape), dtype=raw_features.dtype)
-    
-    # Identify valid matches
-    valid_mask = ~merged['_original_index'].isna()
+    # Check for matches
+    valid_mask = ~merged['feature_idx'].isna()
     valid_count = valid_mask.sum()
     print(f"[sort_features] Found {valid_count} valid matches out of {len(target_csv)} target rows.")
     
     if not valid_mask.all():
         missing_count = (~valid_mask).sum()
-        print(f"Warning: {missing_count} rows in target CSV did not match any features. Filled with zeros.")
-    
-    if valid_count > 0:
-        # Get the indices in raw_features for the valid matches
-        valid_indices = merged.loc[valid_mask, '_original_index'].astype(int).values
-        
-        # Get the indices in the target (sorted) array where we should place them
-        # sorted_features is aligned with target_csv, so we use valid_mask directly
-        sorted_features[valid_mask] = raw_features[valid_indices]
-    else:
-        print("CRITICAL WARNING: No matches found during merge! Feature array is all zeros.")
+        print(f"Warning: {missing_count} rows in target CSV did not match any features. feature_idx will be NaN.")
     
     # The requirement is "final csv should be the target csv"
-    # We strip the temporary rank column from the copy we made
-    if 'KID_rank' in target_csv.columns:
-        target_csv = target_csv.drop(columns=['KID_rank'])
+    # We stripped the sorting columns, nothing else to drop.
         
-    aligned_target_csv = target_csv.copy()
-    sorted_csv = target_csv.copy()
+    aligned_target_csv = merged.copy()
     
-    return sorted_features, sorted_csv, aligned_target_csv
+    # We return just the CSV now. Feature construction happens at the very end.
+    return aligned_target_csv
 
 if __name__ == '__main__':
     full_features, full_csv = load_split_features(DESA_FEATURES_PATH)
@@ -140,7 +146,7 @@ if __name__ == '__main__':
     print(f"Loaded CSV shape: {full_csv.shape}")
     print(f"Target CSV shape: {target_csv.shape}")
 
-    sorted_features, sorted_csv, aligned_target_csv = sort_features(full_features, full_csv, target_csv)
+    aligned_target_csv = sort_features(full_features, full_csv, target_csv)
     
     nss_csv = pd.read_csv(NSS_PATH)
 
@@ -152,8 +158,6 @@ if __name__ == '__main__':
     aligned_target_csv['binarity_class_hard'] = aligned_target_csv['binarity_class'].apply(lambda x: 1 if x > 0 else 0)
     aligned_target_csv.loc[aligned_target_csv['binarity_class'].isna(), 'binarity_class_hard'] = np.nan
      
-    print(f"Sorted features shape: {sorted_features.shape}")
-    print(f"Sorted CSV shape: {sorted_csv.shape}")
     print(f"Aligned target CSV shape: {aligned_target_csv.shape}")
     print(aligned_target_csv.head())
     
@@ -194,11 +198,33 @@ if __name__ == '__main__':
     reorder_indices = [obsid_to_idx[oid] for oid in json_obsids]
     reorder_indices = np.array(reorder_indices)
     
-    # Reorder Features
-    final_features = sorted_features[reorder_indices]
-    
     # Reorder CSV
     final_csv = aligned_target_csv.iloc[reorder_indices].reset_index(drop=True)
+    
+    # --- CONSTRUCT FINAL FEATURES ARRAY ---
+    # Now that final_csv is locked, we use the feature_idx column to build the matching array
+    print("[main] Constructing final feature array...")
+    
+    # Get feature dim
+    feature_dim = full_features.shape[1:]
+    final_features = np.zeros((len(final_csv), *feature_dim), dtype=full_features.dtype)
+    
+    # Identify rows that have a valid feature_idx
+    valid_mask = ~final_csv['feature_idx'].isna()
+    
+    if valid_mask.any():
+        # Get the indices into full_features
+        # We must cast to int because NaNs force the column to float
+        source_indices = final_csv.loc[valid_mask, 'feature_idx'].astype(int).values
+        
+        # Assign to final array
+        final_features[valid_mask] = full_features[source_indices]
+        print(f"[main] Populated {valid_mask.sum()} rows with features.")
+    else:
+        print("[main] WARNING: No valid features found for any row!")
+
+    # Drop the bookkeeping column
+    final_csv = final_csv.drop(columns=['feature_idx'])
     
     print(f"Final aligned features shape: {final_features.shape}")
     print(f"Final aligned CSV shape: {final_csv.shape}")

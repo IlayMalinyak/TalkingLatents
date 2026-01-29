@@ -15,10 +15,14 @@ cache/
 figs/
 papers/
 concepts_v2/
+concepts_v2_cls/
+follow_up_outputs/
+concepts/plots
 checkpoints/
 tables/
 depreceated/
 generate_corrected_stats.py
+generate_corrected_stats_multimodal.py
 # File extensions
 *.pth
 *.npy

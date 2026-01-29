@@ -1,8 +1,8 @@
 #!/bin/bash
 #SBATCH --job-name=TL_fup_1b
 #SBATCH --nodes=1
-#SBATCH --ntasks=2                   
-#SBATCH --gres=gpu:nvidia_h200:2
+#SBATCH --ntasks=4                   
+#SBATCH --gres=gpu:nvidia_h200:4
 #SBATCH --cpus-per-task=32
 #SBATCH --mem=128G
 #SBATCH --partition=h200-shared
@@ -22,21 +22,12 @@ JSON_FOLLOWUP=/home/ilay.kamai/work/TalkingLatents/data/dataset/stellar_descript
 OUTDIR=${OUTDIR:-/home/ilay.kamai/work/TalkingLatents/logs}
 LLM_PATH=/home/ilay.kamai/work/.llama/Llama3.2-1B
 
-FEATURE_STATS=/home/ilay.kamai/work/TalkingLatents/logs/2025-07-29/feature_stats.npz
+FEATURES_PATH='/home/ilay.kamai/work/TalkingLatents/logs/2025-07-29/features.npy'  # Optional, can be None to load all features on-the-fly
+FEATURE_STATS=/home/ilay.kamai/work/TalkingLatents/logs/2025-07-29/feature_stats_corrected.npz
+
 
 # Training hyper-parameters
-EXP=${EXP:-fup_single_none_lora_raw_spec}
-EPOCHS=${EPOCHS:-30}
-BATCH=${BATCH:-8}
-MAXLEN=${MAXLEN:-256}
-WORKERS=${WORKERS:-4}
-LR=${LR:-1e-4}
-WD=${WD:-1e-3}
-TOKS=${TOKS:-8}
-LAMBDA=${LAMBDA:-1.0}
-
-# Training hyper-parameters
-EXP=${EXP:-fup_1b_lora_6}
+EXP=${EXP:-fup_1b_lora_6_attn_mask}
 EPOCHS=${EPOCHS:-30}
 BATCH=${BATCH:-32}
 MAXLEN=${MAXLEN:-256}
@@ -50,7 +41,7 @@ srun --ntasks=1 --nodes=1 --cpus-per-task=32 \
     --output=/home/ilay.kamai/athena/logs/%x_%j_%N_%t.out \
     --error=/home/ilay.kamai/athena/logs/%x_%j_%N_%t.err \
     --container=/apps/apptainer/images/pytorch/latest/torch2.7-tf2.20-cu128.sif \
-    torchrun --nproc_per_node=2 \
+    torchrun --nproc_per_node=$SLURM_NTASKS \
         --nnodes=1 \
         --rdzv_endpoint=$MASTER_ADDR:$MASTER_PORT \
         --rdzv_backend=c10d \
@@ -58,6 +49,7 @@ srun --ntasks=1 --nodes=1 --cpus-per-task=32 \
         --llm_path "${LLM_PATH}" \
         --json_file "${JSON_FILE}" \
         --followup_json_file "${JSON_FOLLOWUP}" \
+        --features_file "${FEATURES_PATH}" \
         --feature_stats_file "${FEATURE_STATS}" \
         --mode single_star \
         --single_dataset_type regular \
@@ -69,6 +61,7 @@ srun --ntasks=1 --nodes=1 --cpus-per-task=32 \
         --weight_decay "${WD}" \
         --max_seq_length "${MAXLEN}" \
         --num_workers "${WORKERS}" \
+        --pooling_type sum \
         --num_spectral_features "${TOKS}" \
         --loss_lambda "${LAMBDA}" \
         --llm_precision fp16 \
@@ -78,5 +71,4 @@ srun --ntasks=1 --nodes=1 --cpus-per-task=32 \
         --enable_followup_augmentation  \
         --followup_prob 0.7  \
         --max_followup_turns 2 \
-    
     

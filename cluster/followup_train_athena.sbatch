@@ -5,8 +5,8 @@
 #SBATCH --gres=gpu:nvidia_l40s:4
 #SBATCH --cpus-per-task=32
 #SBATCH --mem=128G
-#SBATCH --partition=l40s-shared
-#SBATCH --qos=72h_8g
+#SBATCH --partition=l40s-public
+#SBATCH --qos=24h_4g
 #SBATCH -t 24:00:00
 
 set -euo pipefail
@@ -17,7 +17,9 @@ export MASTER_PORT=$(expr 29500 + $(echo -n $SLURM_JOBID | tail -c 4))
 export APPTAINER_BIND="$PRJ_WORKSPACE"
 
 JSON_FILE=/home/ilay.kamai/work/TalkingLatents/data/dataset/stellar_descriptions_questions_short.json
+# JSON_FILE=/home/ilay.kamai/work/TalkingLatents/data/dataset/stellar_descriptions_questions.json
 JSON_FOLLOWUP=/home/ilay.kamai/work/TalkingLatents/data/dataset/stellar_descriptions_questions.json
+
 
 OUTDIR=${OUTDIR:-/home/ilay.kamai/work/TalkingLatents/logs}
 LLM_PATH=/home/ilay.kamai/work/.llama/Llama3.1-8B
@@ -26,7 +28,7 @@ FEATURES_PATH='/home/ilay.kamai/work/TalkingLatents/logs/2025-07-29/features.npy
 FEATURE_STATS=/home/ilay.kamai/work/TalkingLatents/logs/2025-07-29/feature_stats_corrected.npz
 
 # Training hyper-parameters
-EXP=${EXP:-fup_lora_6}
+EXP=${EXP:-fup_lora_6_attn_mask_long}
 EPOCHS=${EPOCHS:-30}
 BATCH=${BATCH:-8}
 MAXLEN=${MAXLEN:-256}

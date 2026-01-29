@@ -417,11 +417,7 @@ class MultimodalBackboneBase(nn.Module):
             with torch.no_grad():
                 out = self.fm_model(spectra, return_all=True)
             if isinstance(out, dict):
-                # Prioritize CLS token if available (matches feature extraction script)
-                if 'cls' in out:
-                    latent_features = out['cls']
-                else:
-                    latent_features = out['tokens']
+                latent_features = out['tokens']
             else:
                 latent_features = out[-1]
             if torch.isnan(latent_features).any():
@@ -459,7 +455,6 @@ class MultimodalBackboneBase(nn.Module):
             
         proj_param = next(projector.parameters())
         latent = latent.to(device=proj_param.device, dtype=proj_param.dtype)
-        
         output = projector(latent)
         if torch.isnan(output).any():
             print(f"DEBUG: NaN detected in projector output (input dtype: {latent.dtype}, param dtype: {proj_param.dtype})")
@@ -556,6 +551,7 @@ class MultimodalLlamaModelMultiTokens(MultimodalBackboneBase):
         Unified forward pass that handles both single-star and two-star samples in one pass.
         """
         input_ids = batch['input_ids']
+        attention_mask = batch.get('attention_mask', None)
         batch_size, seq_len = input_ids.shape
         device = input_ids.device
         
@@ -625,7 +621,7 @@ class MultimodalLlamaModelMultiTokens(MultimodalBackboneBase):
         #         cfm_targets.extend([torch.cat([comp_spectra_a[i], comp_spectra_b[i]], dim=-1) for i in range(len(comp_indices))])
         
         # Single transformer forward pass for all samples
-        h = self._transformer_forward(token_embeddings)
+        h = self._transformer_forward(token_embeddings, attention_mask=attention_mask)
         logits = self.base_model.output(h).float()
         
         # Check for NaN in logits
@@ -705,7 +701,8 @@ class MultimodalLlamaModelMultiTokens(MultimodalBackboneBase):
                              token_embeddings: torch.Tensor,
                              start_pos: int = 0,
                              use_cache: bool = False,
-                             cache_rows: Optional[Sequence[int]] = None) -> torch.Tensor:
+                             cache_rows: Optional[Sequence[int]] = None,
+                             attention_mask: Optional[torch.Tensor] = None) -> torch.Tensor:
         """
         Unified transformer forward pass for token embeddings.
         """
@@ -745,6 +742,52 @@ class MultimodalLlamaModelMultiTokens(MultimodalBackboneBase):
         if seqlen > 1:
             mask = torch.full((seqlen, seqlen), float("-inf"), device=device, dtype=h.dtype)
             mask = torch.triu(mask, diagonal=1)
+
+        if attention_mask is not None:
+            # Broadcast attention_mask to match heads: (B, S, S) -> (B, 1, S, S)
+            if attention_mask.dim() == 3:
+                attention_mask = attention_mask.unsqueeze(1)
+            
+            # Broadcast attention_mask to potentially match heads/batch
+            if mask is not None:
+                mask = mask + attention_mask.to(device=device, dtype=mask.dtype)
+            else:
+                mask = attention_mask.to(device=device, dtype=h.dtype)
+
+        # --- DEBUG: Visualize Mask (One time) ---
+        if not hasattr(self, '_debug_mask_saved'):
+            self._debug_mask_saved = True
+            try:
+                import matplotlib.pyplot as plt
+                import numpy as np
+                print("DEBUG: Saving attention mask visualization to 'debug_attention_mask.png'...")
+                m_cpu = mask
+                if m_cpu is not None:
+                    m_cpu = m_cpu.detach().float().cpu().numpy()
+                    # Handle shapes: (S,S), (B,S,S), (B,1,S,S)
+                    if m_cpu.ndim == 3: m_cpu = m_cpu[0]
+                    elif m_cpu.ndim == 4: m_cpu = m_cpu[0, 0]
+                    
+                    plt.figure(figsize=(12, 10))
+                    # Use a copy to handle -inf for plotting
+                    m_plot = m_cpu.copy()
+                    m_plot[m_plot == float('-inf')] = -1000 # Map -inf to a finite low value
+                    
+                    plt.imshow(m_plot, cmap='viridis', interpolation='nearest')
+                    plt.colorbar()
+                    plt.title(f"Combined Attention Mask (Shape: {m_cpu.shape})")
+                    plt.savefig("/home/ilay.kamai/work/TalkingLatents/figs/debug_attention_mask.png")
+                    plt.close()
+                    print("DEBUG: Saved.")
+                    
+                    # Also print a small subsection to stdout
+                    print("DEBUG: Mask sample [Followup region?]:")
+                    # Heuristic: check middle-ish rows
+                    mid = m_cpu.shape[0] // 2
+                    print(m_cpu[mid:mid+5, mid-5:mid])
+            except Exception as e:
+                print(f"DEBUG: Failed to save mask: {e}")
+        # ----------------------------------------
 
         def layer_block(h_in, layer):
             # Attention
@@ -787,7 +830,6 @@ class MultimodalLlamaModelMultiTokens(MultimodalBackboneBase):
         # Project spectral features to K token embeddings
         spec_tokens = self.projector(latent_features)  # (B, K, d_model)
         # spec_tokens = spec_tokens.to(dtype=token_embeddings.dtype)
-
         # Normalize feature_start_indices to a 1D tensor of length bsz
         if feature_start_indices is None:
             fsi = torch.zeros(bsz, dtype=torch.long, device=input_ids.device)
@@ -987,7 +1029,8 @@ class MultimodalLlamaModelMultiTokens(MultimodalBackboneBase):
                                      tokenizer=None,
                                      max_new_tokens: int = 100,
                                      temperature: float = 0.7,
-                                     top_p: float = 0.9) -> tuple:
+                                     top_p: float = 0.9,
+                                     truncate_answer: bool = False) -> tuple:
         """Greedy/top-p generate using the multi-token model.
 
         Returns: (generated_text, input_text, target_text, generation_log_probs)

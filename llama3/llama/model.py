@@ -261,7 +261,7 @@ class Attention(nn.Module):
         scores = F.softmax(scores.float(), dim=-1).type_as(xq)
 
         # --- HARD DEBUG PATCH (CONDITIONAL) ---
-        print(f"DEBUG: Attention forward {id(self)} run. store_attention={getattr(self, 'store_attention', 'MISSING')}")
+        # print(f"DEBUG: Attention forward {id(self)} run. store_attention={getattr(self, 'store_attention', 'MISSING')}")
         if getattr(self, 'store_attention', False):
             try:
                 self.last_attn_scores = scores.detach().cpu()

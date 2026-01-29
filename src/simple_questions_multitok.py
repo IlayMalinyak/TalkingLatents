@@ -8,6 +8,7 @@ import datetime
 from pathlib import Path
 import torch
 from torch.nn.parallel import DistributedDataParallel as DDP
+import torch.distributed as dist
 
 ROOT_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.append(ROOT_DIR)
@@ -695,8 +696,30 @@ def build_model_multitok(args, local_rank, world_size=1, backend_config: LLMBack
     
     backend_config = backend_config or ensure_backend_config(args)
     backend = _normalize_backend(backend_config.backend)
+
+    # OOM Fix: Force local device mapping for DDP with HF models
+    # "auto" often leads to massive memory duplication or inefficient loading in DDP
+    if backend != 'llama' and world_size > 1:
+        current_map = getattr(args, 'hf_device_map', None)
+        if current_map == 'auto' or current_map is None:
+            print(f"[Rank {local_rank}] Overriding hf_device_map 'auto' to {{'': {local_rank}}} to prevent DDP OOM.")
+            # Update args
+            args.hf_device_map = {"": local_rank}
+            # Update config object which might be used inside _load_llm_model or later
+            if backend_config:
+                backend_config.device_map = {"": local_rank}
+
     print(f"Loading LLM model (backend={backend_config.backend})...")
-    llm = _load_llm_model(args)
+    
+    # Serialized loading to prevent OOM when multiple processes try to load 32B model to CPU/RAM simultaneously
+    if world_size > 1:
+        for r in range(world_size):
+            if r == local_rank:
+                print(f"[Rank {local_rank}] Loading LLM...")
+                llm = _load_llm_model(args)
+            dist.barrier()
+    else:
+        llm = _load_llm_model(args)
     hf_quantization = getattr(args, "hf_quantization", "none")
     is_hf_backend = backend != 'llama'
 
@@ -710,8 +733,8 @@ def build_model_multitok(args, local_rank, world_size=1, backend_config: LLMBack
             print("Warning: Gradient checkpointing is not supported with 4/8-bit HF quantization. Disabling it.")
             args.gradient_checkpointing = False
         if args.gradient_checkpointing and hasattr(llm, "gradient_checkpointing_enable"):
-            llm.gradient_checkpointing_enable()
-            print("✓ Enabled HF gradient checkpointing")
+            llm.gradient_checkpointing_enable(gradient_checkpointing_kwargs={"use_reentrant": False})
+            print("✓ Enabled HF gradient checkpointing (use_reentrant=False)")
     else:
         if args.llm_precision == 'fp16':
             llm.half()
@@ -1011,7 +1034,6 @@ def main():
             find_unused_parameters=True,
             broadcast_buffers=False,
             bucket_cap_mb=25,
-            gradient_as_bucket_view=True,
         )
     else:
         print("Single GPU - no DDP")

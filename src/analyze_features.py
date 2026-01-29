@@ -36,7 +36,7 @@ def plot_features(features, save_dir, sample_size=10):
     # histogram of features values
     fig = plt.figure()
     ax = plt.subplot(1, 1, 1)
-    ax.hist(np.log10(np.abs(features.flatten()[np.abs(features.flatten()) >1e-40])), bins=50, histtype='step', density=True,
+    ax.hist(np.log10(np.abs(features.flatten()[np.abs(features.flatten()) >1e-40])), bins=50, density=True,
      color='salmon', edgecolor='black')
     ax.set_title(f'Features Distribution', fontweight='bold')
     ax.set_xlabel(r'$\log_{10}$ (Feature Value)')
@@ -84,7 +84,7 @@ def hist_multidir(dirs, names, save_dir):
 def plot_umap(features, df, cols, save_dir):
     # Calculate grid size dynamically to ensure all cols fit
     n_plots = len(cols)
-    n_rows = 2
+    n_rows = 1
     n_cols_grid = math.ceil(n_plots / n_rows) # Uses math.ceil to handle odd numbers
     
     # Create subplots
@@ -111,18 +111,24 @@ def plot_umap(features, df, cols, save_dir):
     # --- Plotting Loop ---
     for i, col in enumerate(cols):
         ax = axis[i]
+
+        if 'teff' in col.lower():
+            unit = 'K'
+        else:
+            unit = 'dex'
         
         # 1. Capture the scatter object (sc) to pass to colorbar
         sc = ax.scatter(df['umap_x'], df['umap_y'], c=df[col], cmap='viridis', s=15, alpha=0.8)
         
         # 2. Add Colorbar with font size adjustments
         cbar = plt.colorbar(sc, ax=ax)
-        cbar.ax.tick_params(labelsize=14) 
+        cbar.set_label(unit, fontsize=24)
+        cbar.ax.tick_params(labelsize=24) 
         
         # 3. Set Titles and Labels with bigger fonts
         ax.set_title(col, fontsize=24, fontweight='bold')
-        ax.set_xlabel('UMAP 1', fontsize=18)
-        ax.set_ylabel('UMAP 2', fontsize=18)
+        ax.set_xlabel('UMAP 1', fontsize=18, fontweight='bold')
+        ax.set_ylabel('UMAP 2', fontsize=18, fontweight='bold')
         
         # Increase tick label size
         ax.tick_params(axis='both', which='major', labelsize=14)
@@ -139,16 +145,24 @@ def plot_umap(features, df, cols, save_dir):
 
 if __name__ == '__main__':
     
-    log_dir_v2 = '/home/ilay.kamai/work/TalkingLatents/logs/2025-12-16/'
-    df_v2 = pd.read_csv('/home/ilay.kamai/work/TalkingLatents/logs/2025-12-16/info.csv')
+    log_dir_v2 = '/home/ilay.kamai/work/TalkingLatents/logs/features_v2/'
+    df_v2 = pd.read_csv('/home/ilay.kamai/work/TalkingLatents/logs/features_v2/info.csv')
+    df_v2.rename(columns={'feh': 'FeH', 'teff': 'Teff'}, inplace=True)
+    # df_v2['Teff'] = df_v2['Teff'] * (7500 - 3000) + 3000 
     log_dir = '/home/ilay.kamai/work/TalkingLatents/logs/2025-07-29/'
     df = pd.read_csv('/home/ilay.kamai/work/TalkingLatents/logs/2025-07-29/info.csv')
+    # df['Teff'] = df['Teff'] * 5778
     log_dir_multimodal = '/home/ilay.kamai/work/TalkingLatents/logs/2025-07-29-multimodal/'
     df_multimodal = pd.read_csv('/home/ilay.kamai/work/TalkingLatents/logs/2025-07-29-multimodal/info_full_multimodal.csv')
     hist_multidir([log_dir_v2, log_dir, log_dir_multimodal], ['Dense', 'Sparse', 'Multimodal'], 'figs')
     
-    for log_d, df in zip([log_dir, log_dir_v2, log_dir_multimodal], [df, df_v2, df_multimodal]):
-        features = np.load(f'{log_d}/features.npy')
+    for i, (log_d, df) in enumerate(zip([log_dir, log_dir_v2], [df, df_v2])):
+        if i == 0:
+            features = np.load(f'{log_dir}/features.npy')
+            fig_dir = f'{log_dir}/figs' 
+        else:
+            features = np.load(f'{log_d}/features_cls.npy')
+            fig_dir = f'{log_d}/figs_cls'
         print(df.shape, features.shape)
-        plot_features(features, f'{log_d}/figs')
-        plot_umap(features, df, ['FeH', 'logg', 'Teff', 'Mstar', 'Lstar', 'final_age'], f'{log_d}/figs')
+        plot_features(features, fig_dir)
+        plot_umap(features, df, ['FeH', 'logg', 'Teff'], fig_dir)

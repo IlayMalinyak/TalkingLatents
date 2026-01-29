@@ -1,8 +1,8 @@
 #!/bin/bash
 #SBATCH --job-name=TL_fup_multimod
 #SBATCH --nodes=1
-#SBATCH --ntasks=2                   
-#SBATCH --gres=gpu:nvidia_h200:2
+#SBATCH --ntasks=4                   
+#SBATCH --gres=gpu:nvidia_h200:4
 #SBATCH --cpus-per-task=32
 #SBATCH --mem=128G
 #SBATCH --partition=h200-shared
@@ -22,12 +22,12 @@ JSON_FOLLOWUP=/home/ilay.kamai/work/TalkingLatents/data/dataset/stellar_descript
 OUTDIR=${OUTDIR:-/home/ilay.kamai/work/TalkingLatents/logs}
 LLM_PATH=/home/ilay.kamai/work/.llama/Llama3.1-8B
 
-FEATURE_STATS=/home/ilay.kamai/work/TalkingLatents/logs/2025-07-29/multimodal_feature_stats.npz
+FEATURE_STATS=/home/ilay.kamai/work/TalkingLatents/logs/2025-07-29/feature_stats_multimodal.npz
 
 # Training hyper-parameters
-EXP=${EXP:-fup_multimod_lora_6}
+EXP=${EXP:-fup_multimod_lora_6_attn_mask}
 EPOCHS=${EPOCHS:-30}
-BATCH=${BATCH:-32}
+BATCH=${BATCH:-8}
 MAXLEN=${MAXLEN:-256}
 WORKERS=${WORKERS:-4}
 LR=${LR:-1e-4}
@@ -65,7 +65,7 @@ srun --ntasks=1 --nodes=1 --cpus-per-task=32 \
         --disable_classification \
         --enable_followup_augmentation  \
         --followup_prob 0.7  \
-        --max_followup_turns 1 \
+        --max_followup_turns 2 \
         --use_multimodal \
         --spectral_embedding_dim 262 \
     

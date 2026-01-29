@@ -2,10 +2,10 @@
 #SBATCH --job-name=TL_fup_v2
 #SBATCH --nodes=1
 #SBATCH --ntasks=4                  
-#SBATCH --gres=gpu:nvidia_l40s:4
+#SBATCH --gres=gpu:nvidia_h200:4
 #SBATCH --cpus-per-task=32
 #SBATCH --mem=128G
-#SBATCH --partition=l40s-shared
+#SBATCH --partition=h200-shared
 #SBATCH --qos=24h_4g
 #SBATCH -t 24:00:00
 
@@ -24,9 +24,9 @@ LLM_PATH=/home/ilay.kamai/work/.llama/Llama3.1-8B
 
 FEATURE_STATS=/home/ilay.kamai/work/TalkingLatents/logs/2025-12-16/tokens_stats.npz
 # Training hyper-parameters
-EXP=${EXP:-fup_lora_6_v2_raw_spec}
+EXP=${EXP:-fup_lora_6_v2_raw_spec_attn_mask}
 EPOCHS=${EPOCHS:-30}
-BATCH=${BATCH:-8}
+BATCH=${BATCH:-30}
 MAXLEN=${MAXLEN:-256}
 WORKERS=${WORKERS:-4}
 LR=${LR:-1e-4}

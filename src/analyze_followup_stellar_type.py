@@ -261,6 +261,11 @@ def extract_value_from_text(text: str, unit: str = '') -> Optional[float]:
              # Target is Luminosity -> Forbid Mass
              forbidden_prefixes.append('mass')
 
+        if any(u in unit.lower() for u in ['gyr', 'age']):
+             # For Age, forbid Temperature(K), Msun, Lsun
+             forbidden_units = ['k', 'kelvin', 'msun', 'lsun', 'r_sun', 'rsun', 'solar radii', 'cm/s2']
+             forbidden_prefixes = ['log g', 'logg', 'gravity', 'surface', 'radius', 'teff', 'temperature', 'metallicity', 'fe/h', 'mass', 'luminosity']
+
     def _is_safe(val: float, start_idx: int, end_idx: int) -> bool:
         # 1. value sanity
         if max_val_cutoff is not None:
@@ -306,6 +311,8 @@ def extract_value_from_text(text: str, unit: str = '') -> Optional[float]:
             unit_pattern = r'(?:\s*(?:lsun|l_sun|solar\s*luminosity|l\s*sun|solar))?'
         elif unit.lower() in ['msun', 'm_sun', 'solar mass']:
             unit_pattern = r'(?:\s*(?:msun|m_sun|solar\s*mass|m\s*sun|solar|mass))?'
+        elif unit.lower() in ['gyr', 'age']:
+             unit_pattern = r'(?:\s*(?:gyr|billion years|billion|years old))?'
     
     # Robust number regex: handles "1.23", "1. 0", "1 .23", "- 5. 2"
     number_re = r'([-+]?\s*\d+(?:\s*\.\s*\d+)?)(?:[eE][-+]?\d+)?'
@@ -448,9 +455,11 @@ def analyze_followup_stellar_type(
             'total_stellar_type_questions': 0,
             'luminosity_questions': 0,
             'mass_questions': 0,
+            'age_questions': 0,
             'valid_responses': 0,
             'lum_valid_responses': 0,
             'mass_valid_responses': 0,
+            'age_valid_responses': 0,
             'invalid_responses': 0,
             'evol_class_correct': 0,
             'spectral_letter_correct': 0,
@@ -479,6 +488,9 @@ def analyze_followup_stellar_type(
             'true_Mstar': [],
             'pred_Mstar': [],
             'snr_Mstar': [],
+            'true_Age': [],
+            'pred_Age': [],
+            'snr_Age': [],
         }
 
         # Store examples
@@ -540,11 +552,17 @@ def analyze_followup_stellar_type(
                     else:
                         is_mass_q = False
 
-                    if not (is_luminosity_q or is_mass_q):
+                    if 'age' in question.lower() or ('age' in q_type.lower() if q_type else False):
+                        is_age_q = True
+                    else:
+                        is_age_q = False
+
+                    if not (is_luminosity_q or is_mass_q or is_age_q):
                         continue
                 else:
                     is_luminosity_q = False
                     is_mass_q = False
+                    is_age_q = False
 
                 if is_stellar_type_q:
                     stats['total_stellar_type_questions'] += 1
@@ -552,6 +570,8 @@ def analyze_followup_stellar_type(
                     stats['luminosity_questions'] += 1
                 if is_mass_q:
                     stats['mass_questions'] += 1
+                if is_age_q:
+                    stats['age_questions'] += 1
 
                 # Get generated answer - handle both formats
                 generated = qa.get('generated_response', qa.get('answer', ''))
@@ -674,6 +694,16 @@ def analyze_followup_stellar_type(
                     elif true_M is not None:
                          # Track failed extraction if needed, but for now just count valid
                          pass
+                
+                if is_age_q:
+                    pred_Age = extract_value_from_text(generated, unit='Gyr')
+                    true_Age = qa.get('true_value')
+                    
+                    if true_Age is not None and pred_Age is not None:
+                         param_data['true_Age'].append(float(true_Age))
+                         param_data['pred_Age'].append(pred_Age)
+                         param_data['snr_Age'].append(snr)
+                         stats['age_valid_responses'] += 1
 
                 if is_luminosity_q:
                     # Update valid count if we extracted something
@@ -992,6 +1022,8 @@ def create_followup_plots(
             valid_plots.append(('Lstar', 'Luminosity (Lsun)', param_data['true_Lstar'], param_data['pred_Lstar'], param_data['snr_Lstar']))
         if len(param_data.get('true_Mstar', [])) > 0:
             valid_plots.append(('Mstar', 'Mass (Msun)', param_data['true_Mstar'], param_data['pred_Mstar'], param_data['snr_Mstar']))
+        if len(param_data.get('true_Age', [])) > 0:
+            valid_plots.append(('Age', 'Age (Gyr)', param_data['true_Age'], param_data['pred_Age'], param_data['snr_Age']))
          
         n_plots = len(valid_plots)
         cols = min(n_plots, 3)

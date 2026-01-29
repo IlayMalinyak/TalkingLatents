@@ -17,6 +17,15 @@ class HuggingFaceMultimodalModel(MultimodalBackboneBase):
     def forward(self, batch: Dict[str, Any]) -> Dict[str, torch.Tensor]:
         token_embeddings, cfm_targets = self._prepare_embeddings(batch)
         attention_mask = batch.get('attention_mask', None)
+        # Fix for transformers detecting float mask as boolean if incorrectly shaped
+        # Ensure it is (B, 1, S, S) for additive mask
+        if attention_mask is not None and attention_mask.dim() == 3:
+            attention_mask = attention_mask.unsqueeze(1)
+        
+        # Fix for bias dtype mismatch
+        if attention_mask is not None:
+            attention_mask = attention_mask.to(dtype=token_embeddings.dtype)
+
         hf_kwargs = {
             "inputs_embeds": token_embeddings,
             "attention_mask": attention_mask,
@@ -315,15 +324,73 @@ class HuggingFaceMultimodalModel(MultimodalBackboneBase):
                                      tokenizer=None,
                                      max_new_tokens: int = 100,
                                      temperature: float = 0.7,
-                                     top_p: float = 0.9) -> tuple:
+                                     top_p: float = 0.9,
+                                     truncate_answer: bool = False) -> tuple:
         self.eval()
         device = next(self.parameters()).device
         sample_batch = self._slice_batch(batch_data, batch_idx)
+        
+        # Optional: Truncate input to remove answer (prompt = Feats + Question)
+        # This is critical for inference where we want to generate the answer, not continue it.
+        if truncate_answer:
+            ans_start = sample_batch.get('answer_start_idx')
+            input_ids = sample_batch.get('input_ids')
+            if ans_start is not None and input_ids is not None:
+                # Handle scalar or 1D ans_start
+                if isinstance(ans_start, list): ans_start = ans_start[0]
+                elif torch.is_tensor(ans_start): ans_start = ans_start.item()
+                
+                # Truncate
+                if torch.is_tensor(input_ids):
+                    # Keep [0 : ans_start]
+                    sample_batch['input_ids'] = input_ids[:, :ans_start]
+                elif isinstance(input_ids, list):
+                    sample_batch['input_ids'] = [ids[:ans_start] for ids in input_ids]
+
         token_embeddings, _ = self._prepare_embeddings(sample_batch)
-        attention_mask = sample_batch.get('attention_mask', None)
-        if attention_mask is not None:
-            attention_mask = attention_mask.to(device)
-        token_embeddings = token_embeddings.to(device)
+        # For generation, we're better off using a standard 2D mask derived from input_ids
+        # rather than the complex 4D training mask which breaks HF generate() concatenation.
+        # Since we slice batch_size=1, we can re-derive the padding mask easily.
+        input_ids = sample_batch.get('input_ids')
+        if input_ids is not None:
+             if not torch.is_tensor(input_ids):
+                 input_ids = torch.tensor(input_ids, device=device)
+             else:
+                 input_ids = input_ids.to(device)
+             
+             # Identify pad tokens
+             pad_id = self._get_safe_pad_id()
+             
+             # Identify valid length: Includes Features (start -100s) and Text (>0). 
+             # Ends at the last token > 0 (excluding trailing -100 pads).
+             # We assume right-padding.
+             
+             # Create mask
+             attention_mask = torch.zeros((token_embeddings.shape[0], token_embeddings.shape[1]), 
+                                          dtype=token_embeddings.dtype, device=device)
+             
+             for i in range(input_ids.shape[0]):
+                 # Find last index where id > 0 (i.e. real text token, not feature/pad -100)
+                 # Note: Features are also -100, but they are BEFORE text.
+                 # Pads are -100 AFTER text.
+                 valid_indices = (input_ids[i] > 0).nonzero()
+                 if valid_indices.numel() > 0:
+                     last_valid_idx = valid_indices[-1].item()
+                     # Everything up to and including last text token is valid
+                     attention_mask[i, :last_valid_idx+1] = 1.0
+                 else:
+                     # If no text tokens found (only features?), assume full feature length?
+                     # Fallback to simple != pad_id if available, or all ones
+                     attention_mask[i] = (input_ids[i] != pad_id).to(dtype=token_embeddings.dtype)
+
+             # Ensure shape matches embeddings (handling potential trunction/mismatch if any)
+             if attention_mask.shape[1] != token_embeddings.shape[1]:
+                  # Fallback to ones if mismatch
+                  attention_mask = torch.ones((token_embeddings.shape[0], token_embeddings.shape[1]), 
+                                            dtype=token_embeddings.dtype, device=device)
+        else:
+             attention_mask = torch.ones((token_embeddings.shape[0], token_embeddings.shape[1]), 
+                                       dtype=token_embeddings.dtype, device=device)
 
         # Get pad token (use eos if pad is missing, common in newer models)
         pad_token_id = getattr(tokenizer, 'pad_token_id', None)
@@ -336,9 +403,17 @@ class HuggingFaceMultimodalModel(MultimodalBackboneBase):
         if pad_token_id is None:
             pad_token_id = 0 # Fallback
 
+        # Fix for RoPE broadcasting error with 4D mask + inputs_embeds
+        # Explicitly generate position_ids
+        seq_len = token_embeddings.shape[1]
+        position_ids = torch.arange(seq_len, dtype=torch.long, device=device).unsqueeze(0)
+        if token_embeddings.shape[0] > 1:
+            position_ids = position_ids.repeat(token_embeddings.shape[0], 1)
+
         gen_kwargs = {
             "inputs_embeds": token_embeddings,
             "attention_mask": attention_mask,
+            "position_ids": position_ids,
             "max_new_tokens": max_new_tokens,
             "temperature": max(temperature, 0.0),
             "top_p": top_p,
@@ -395,4 +470,4 @@ class HuggingFaceMultimodalModel(MultimodalBackboneBase):
             generated_text = ""
 
         input_text, target_text = self._extract_text_fields(batch_data, batch_idx)
-        return generated_text, input_text, target_text, []
+        return generated_text, input_text, target_text, [], generated_ids

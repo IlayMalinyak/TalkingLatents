@@ -86,10 +86,10 @@ def plot_loss_comparison(
     # Default labels if not provided
     if labels is None:
         labels = {
-            "ablation_s_fup0_none": "No Followup, No Feature Pred",
+            "ablation_s_fup0_none": "No Followup",
             "ablation_s_fup0_pred_pair_random": "No Followup, Random Pairing",
             "ablation_s_fup0_pred_pair_nn": "No Followup, NN Pairing",
-            "ablation_s_fup1_none": "Followup, No Feature Pred",
+            "ablation_s_fup1_none": "Followup",
             "ablation_s_fup1_pred_pair_random": "Followup, Random Pairing",
             "ablation_s_fup1_pred_pair_nn": "Followup, NN Pairing",
         }
@@ -107,7 +107,7 @@ def plot_loss_comparison(
     # Plot 1: Training Loss
     print("\nPlotting training losses...")
     for exp in experiments:
-        if exp not in data:
+        if exp not in data or 'none' not in exp:
             continue
 
         train_loss = np.array(data[exp]['train_loss'])
@@ -119,20 +119,20 @@ def plot_loss_comparison(
 
         # Plot
         x = np.arange(len(smoothed_loss))
-        ax1.plot(x, smoothed_loss, label=labels.get(exp, exp), linewidth=2, alpha=0.8)
+        ax1.plot(x, smoothed_loss, label=labels.get(exp, exp), linewidth=3, alpha=0.8)
         print(f"  {exp}: min={smoothed_loss.min():.4f}, final={smoothed_loss[-1]:.4f}")
 
-    ax1.set_xlabel('Training Steps', fontsize=12)
-    ax1.set_ylabel('Loss', fontsize=12)
-    ax1.set_title(f'Training Loss Comparison (smoothed over {train_window} steps)',
-                  fontsize=14, fontweight='bold')
-    ax1.legend(fontsize=10, loc='best')
+    ax1.set_xlabel('Training Steps', fontsize=18)
+    ax1.set_ylabel('Loss', fontsize=18)
+    ax1.set_title(f'Training Loss (smoothed over {train_window} steps)',
+                  fontsize=20, fontweight='bold')
+    ax1.legend(fontsize=16, loc='best')
     ax1.grid(True, alpha=0.3)
 
     # Plot 2: Validation Loss
     print("\nPlotting validation losses...")
     for exp in experiments:
-        if exp not in data:
+        if exp not in data or 'none' not in exp:
             continue
 
         val_loss = np.array(data[exp]['val_loss'])
@@ -144,14 +144,14 @@ def plot_loss_comparison(
 
         # Plot
         x = np.arange(len(smoothed_loss))
-        ax2.plot(x, smoothed_loss, label=labels.get(exp, exp), linewidth=2, alpha=0.8)
+        ax2.plot(x, smoothed_loss, label=labels.get(exp, exp), linewidth=3, alpha=0.8)
         print(f"  {exp}: min={smoothed_loss.min():.4f}, final={smoothed_loss[-1]:.4f}")
 
-    ax2.set_xlabel('Validation Steps', fontsize=12)
-    ax2.set_ylabel('Loss', fontsize=12)
-    ax2.set_title(f'Validation Loss Comparison (smoothed over {val_window} steps)',
-                  fontsize=14, fontweight='bold')
-    ax2.legend(fontsize=10, loc='best')
+    ax2.set_xlabel('Validation Steps', fontsize=18)
+    ax2.set_ylabel('Loss', fontsize=18)
+    ax2.set_title(f'Validation Loss (smoothed over {val_window} steps)',
+                  fontsize=20, fontweight='bold')
+    ax2.legend(fontsize=16, loc='best')
     ax2.grid(True, alpha=0.3)
 
     # Save combined plot

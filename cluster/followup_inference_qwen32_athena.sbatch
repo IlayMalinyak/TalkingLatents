@@ -53,5 +53,6 @@ srun --ntasks=$SLURM_NNODES --ntasks-per-node=1 \
   --error=/home/ilay.kamai/athena/logs/%x_%j_%N_%t.err \
   --container=/apps/apptainer/images/pytorch/latest/torch2.7-tf2.20-cu128.sif \
   python -u /home/ilay.kamai/work/TalkingLatents/src/follow_up_inference.py \
-  --checkpoint_path /home/ilay.kamai/work/TalkingLatents/logs/regular_loss1p0_2026-01-03-16-07/fup_qwen32_lora_6_resume_best.pth \
-  --max_samples 100
+  --checkpoint_path /home/ilay.kamai/work/TalkingLatents/logs/qwen32b_lora_6_attn_mask_2026-01-11-08-54/fup_qwen32_lora_6_attn_mask_resume_best.pth \
+  --max_samples 100 \
+  --output_dir follow_up_outputs_2

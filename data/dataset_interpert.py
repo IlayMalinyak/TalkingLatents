@@ -78,7 +78,8 @@ class StellarQuestionsDataset(Dataset):
                  followup_json_file: Optional[str] = None,
                  followup_mode: str = "mixed",
                  multimodal_df: Optional[pd.DataFrame] = None,
-                 index_df: Optional[pd.DataFrame] = None):
+                 index_df: Optional[pd.DataFrame] = None,
+                 apply_norm: bool = True):
         
         assert split in ['train', 'val', 'test'], f"Split must be 'train', 'val', or 'test', got {split}"
         assert abs(train_ratio + val_ratio + test_ratio - 1.0) < 1e-6, "Ratios must sum to 1.0"
@@ -366,7 +367,8 @@ class StellarQuestionsDataset(Dataset):
 
         if self.multimodal_df is not None:
              # Multimodal Followup Logic
-             choice = self.followup_rng.choice(['binarity', 'age', 'stellar_type'])
+            #  choice = self.followup_rng.choice(['binarity', 'age', 'stellar_type'])
+             choice = 'stellar_type' # use only stellar_type for now
              
              if choice == 'binarity':
                  q_text = "Is this star a binary?"
@@ -845,6 +847,25 @@ class StellarQuestionsDataset(Dataset):
         if self.enable_followup:
             followup_text_pairs = self._append_followup_turns(full_sequence,
              target_sequence, stellar_params, sample_idx, obsid=obsid_int)
+        
+        # Create attention mask for leakage prevention
+        # Default: 0.0 (allow attention)
+        # We will set blocked regions to -inf
+        attention_mask = torch.full((self.max_length, self.max_length), float("-inf"), dtype=torch.float32)
+        attention_mask = torch.triu(attention_mask, diagonal=1)
+        
+        if followup_text_pairs and base_answer_length > 0:
+            # Mask out Main Answer from Followup Turns
+            # Followup starts after Main Answer
+            followup_start = answer_start_idx + base_answer_length
+            followup_end = min(len(full_sequence), self.max_length)
+            
+            main_ans_start = answer_start_idx
+            main_ans_end = answer_start_idx + base_answer_length
+            
+            if followup_start < followup_end:
+                 # Block attention: Followup (rows) -> Main Answer (cols)
+                 attention_mask[followup_start:followup_end, main_ans_start:main_ans_end] = float("-inf")
 
         # Pad remaining space with -100 placeholders
         remaining_space = self.max_length - len(full_sequence)
@@ -913,7 +934,10 @@ class StellarQuestionsDataset(Dataset):
             'obsid': obsid,
             'df_index': df_index,
             'sample_index': sample_idx,
+            'df_index': df_index,
+            'sample_index': sample_idx,
             'y_numeric': numeric_tensor,
+            'attention_mask': attention_mask,
         }
     
     def _extract_numeric_tensor(self, stellar_data: Optional[Dict[str, Any]]) -> Optional[torch.Tensor]:
@@ -1113,6 +1137,7 @@ def collate_fn(batch: List[Dict[str, Any]]) -> Dict[str, Any]:
     spectra = [item['spectra'] for item in batch]
     masked_spectra = [item['masked_spectra'] for item in batch]
     y_numeric_list = [item.get('y_numeric') for item in batch]
+    attention_masks = [item.get('attention_mask') for item in batch]
 
     # Handle features - check if any sample has features
     features_list = [item['features'] for item in batch]
@@ -1137,6 +1162,15 @@ def collate_fn(batch: List[Dict[str, Any]]) -> Dict[str, Any]:
     else:
         features_tensor = None
 
+        features_tensor = None
+    
+    # Stack attention masks if present
+    if any(m is not None for m in attention_masks):
+        # Stack and ensure valid shape (B, S, S)
+        stacked_masks = torch.stack([m if m is not None else torch.zeros((input_ids.shape[1], input_ids.shape[1])) for m in attention_masks])
+    else:
+        stacked_masks = None
+
     y_numeric, y_numeric_present = _stack_numeric(y_numeric_list)
     
     return {
@@ -1158,7 +1192,8 @@ def collate_fn(batch: List[Dict[str, Any]]) -> Dict[str, Any]:
         'df_indices': df_indices,
         'stellar_data': stellar_data,
         'y_numeric': y_numeric,
-        'y_numeric_present': y_numeric_present
+        'y_numeric_present': y_numeric_present,
+        'attention_mask': stacked_masks
     }
 
 

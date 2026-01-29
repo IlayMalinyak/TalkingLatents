@@ -634,6 +634,9 @@ def _load_hf_llm_model(args):
             )
         load_kwargs["quantization_config"] = quant_config
         load_kwargs.setdefault("device_map", hf_device_map or "auto")
+    
+    # Force low_cpu_mem_usage to prevent checking entire model into RAM
+    load_kwargs["low_cpu_mem_usage"] = True
 
     # Remove None entries to avoid transformers warnings
     load_kwargs = {k: v for k, v in load_kwargs.items() if v is not None}

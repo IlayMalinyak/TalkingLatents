@@ -2,6 +2,7 @@ import argparse
 import json
 import math
 import os
+import sys
 import random
 from dataclasses import dataclass
 from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
@@ -13,6 +14,13 @@ import pandas as pd
 import torch
 from torch import nn
 from torch.utils.data import Dataset, DataLoader, Subset
+
+# Add project root to path
+ROOT_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+sys.path.append(ROOT_DIR)
+
+# Import updated data pipeline
+from data.dataset_interpert import create_stellar_dataloaders
 
 
 DEFAULT_FEATURES_PATH = os.path.join("logs", "2025-07-29", "features.npy")
@@ -93,6 +101,13 @@ def parse_args() -> argparse.Namespace:
             "stellar parameters."
         )
     )
+    # Data source options (mutually exclusive groups)
+    parser.add_argument(
+        "--json_file",
+        type=str,
+        default=None,
+        help="Path to JSON file (new pipeline). If provided, uses create_stellar_dataloaders.",
+    )
     parser.add_argument(
         "--features_file",
         type=str,
@@ -103,7 +118,31 @@ def parse_args() -> argparse.Namespace:
         "--info_file",
         type=str,
         default=None,
-        help="Path to the CSV file with target parameters. Defaults to info.csv next to the features file.",
+        help="Path to the CSV file with target parameters (legacy). Defaults to info.csv next to features file.",
+    )
+    parser.add_argument(
+        "--feature_stats_file",
+        type=str,
+        default=None,
+        help="Path to .npz file with pre-computed feature normalization stats (mean/std).",
+    )
+    parser.add_argument(
+        "--index_df_file",
+        type=str,
+        default=None,
+        help="Path to CSV file mapping obsid to feature indices.",
+    )
+    parser.add_argument(
+        "--num_spectral_features",
+        type=int,
+        default=8,
+        help="Number of spectral feature tokens (for new pipeline).",
+    )
+    parser.add_argument(
+        "--max_seq_length",
+        type=int,
+        default=128,
+        help="Maximum sequence length (for new pipeline).",
     )
     parser.add_argument(
         "--targets",
@@ -217,8 +256,9 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--save_model",
-        action="store_true",
-        help="Persist the best validation checkpoint to disk.",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Persist the best validation checkpoint to disk (default: True).",
     )
     parser.add_argument(
         "--output_dir",
@@ -450,6 +490,36 @@ def normalize_batch(
     return (features - mean) / std
 
 
+def extract_batch_data(batch, use_new_pipeline: bool = False) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Extract features and targets from batch, handling both pipeline formats."""
+    if use_new_pipeline:
+        # New pipeline: batch is a dict
+        features = batch['features']  # [B, feature_dim]
+        
+        # Extract targets from y_numeric [B, 3] for Teff, logg, FeH
+        # y_numeric is already normalized in the dataset
+        targets = batch['y_numeric']  # [B, 3]
+        
+        return features, targets
+    else:
+        # Legacy pipeline: batch could be tuple or list
+        if isinstance(batch, dict):
+            # Shouldn't happen for legacy, but handle it
+            raise ValueError("Legacy pipeline received dict batch - this shouldn't happen")
+        
+        # Handle tuple/list with variable length
+        if len(batch) == 2:
+            features, targets = batch
+            return features, targets
+        else:
+            # Debug: print what we got
+            raise ValueError(
+                f"Legacy pipeline batch has {len(batch)} elements (expected 2). "
+                f"Batch type: {type(batch)}, "
+                f"Element types: {[type(x) for x in batch]}"
+            )
+
+
 def train_epoch(
     model: nn.Module,
     loader: DataLoader,
@@ -458,12 +528,15 @@ def train_epoch(
     feature_mean: Optional[torch.Tensor],
     feature_std: Optional[torch.Tensor],
     loss_fn: nn.Module,
+    use_new_pipeline: bool = False,
 ) -> float:
     model.train()
     total_loss = 0.0
     total_samples = 0
-    # pbar = tqdm(enumerate(loader))
-    for features, targets in loader:
+    
+    for batch in loader:
+        features, targets = extract_batch_data(batch, use_new_pipeline)
+        
         features = normalize_batch(features.to(device, non_blocking=True), feature_mean, feature_std)
         targets = targets.to(device, non_blocking=True)
 
@@ -477,8 +550,6 @@ def train_epoch(
         total_loss += loss.item() * batch_size
         total_samples += batch_size
 
-        # pbar.set_description(f'loss: {loss.item()}')
-
     if total_samples == 0:
         return float("nan")
     return total_loss / total_samples
@@ -491,6 +562,7 @@ def evaluate(
     feature_mean: Optional[torch.Tensor],
     feature_std: Optional[torch.Tensor],
     loss_fn: nn.Module,
+    use_new_pipeline: bool = False,
 ) -> Optional[EvalResult]:
     if loader is None:
         return None
@@ -501,7 +573,9 @@ def evaluate(
     total_samples = 0
 
     with torch.no_grad():
-        for features, targets in loader:
+        for batch in loader:
+            features, targets = extract_batch_data(batch, use_new_pipeline)
+            
             features = normalize_batch(features.to(device, non_blocking=True), feature_mean, feature_std)
             targets = targets.to(device, non_blocking=True)
 
@@ -538,6 +612,7 @@ def collect_predictions(
     device: torch.device,
     feature_mean: Optional[torch.Tensor],
     feature_std: Optional[torch.Tensor],
+    use_new_pipeline: bool = False,
 ) -> Optional[Tuple[np.ndarray, np.ndarray]]:
     if loader is None:
         return None
@@ -547,7 +622,9 @@ def collect_predictions(
     targets: List[torch.Tensor] = []
 
     with torch.no_grad():
-        for features, batch_targets in loader:
+        for batch in loader:
+            features, batch_targets = extract_batch_data(batch, use_new_pipeline)
+            
             features = normalize_batch(features.to(device, non_blocking=True), feature_mean, feature_std)
             batch_targets = batch_targets.to(device, non_blocking=True)
             outputs = model(features)
@@ -973,69 +1050,126 @@ def main() -> None:
     if args.inference_only and not args.checkpoint_path:
         print("Warning: Inference-only mode requested without a checkpoint; using current model parameters.")
 
-    features_path = args.features_file
-    info_path = args.info_file or os.path.join(os.path.dirname(features_path), "info.csv")
-
-    dataset = StellarFeatureDataset(
-        features_path=features_path,
-        info_path=info_path,
-        target_columns=args.targets,
-        max_samples=args.max_samples,
-    )
-
-    target_denormalizers = build_target_denormalizers(args.targets, args.target_denorm_config)
-
     device_str = args.device or ("cuda" if torch.cuda.is_available() else "cpu")
     device = torch.device(device_str)
     print(f"Using device: {device}")
 
-    print(
-        f"Dataset loaded ({len(dataset)} samples, input dim = {dataset.input_dim}, "
-        f"targets = {list(args.targets)})"
-    )
+    target_denormalizers = build_target_denormalizers(args.targets, args.target_denorm_config)
 
-    train_set, val_set, test_set = split_dataset(
-        dataset,
-        train_ratio=args.train_ratio,
-        val_ratio=args.val_ratio,
-        test_ratio=args.test_ratio,
-        seed=args.seed,
-    )
+    # Determine which data pipeline to use
+    use_new_pipeline = args.json_file is not None
+    
+    if use_new_pipeline:
+        print("Using NEW data pipeline (create_stellar_dataloaders)...")
+        
+        # Load features if provided
+        features_array = None
+        if args.features_file and os.path.exists(args.features_file):
+            print(f"Loading features from {args.features_file}")
+            features_array = np.load(args.features_file)
+        
+        # Load feature stats if provided
+        feature_stats = None
+        if args.feature_stats_file and os.path.exists(args.feature_stats_file):
+            print(f"Loading feature stats from {args.feature_stats_file}")
+            stats_data = np.load(args.feature_stats_file)
+            feature_stats = {'mean': stats_data['mean'], 'std': stats_data['std']}
+        
+        # Load index_df if provided
+        index_df = None
+        if args.index_df_file and os.path.exists(args.index_df_file):
+            print(f"Loading index_df from {args.index_df_file}")
+            index_df = pd.read_csv(args.index_df_file)
+        
+        # Create dataloaders using new pipeline
+        train_loader, val_loader, test_loader = create_stellar_dataloaders(
+            json_file=args.json_file,
+            features_array=features_array,
+            batch_size=args.batch_size,
+            train_ratio=args.train_ratio,
+            val_ratio=args.val_ratio,
+            test_ratio=args.test_ratio,
+            random_state=args.seed,
+            num_workers=args.num_workers,
+            num_spectral_features=args.num_spectral_features,
+            cache_dir=os.path.join(args.output_dir, 'cache'),
+            feature_stats=feature_stats,
+            index_df=index_df,
+            device=device,
+        )
+        
+        # Get input/output dims from first batch
+        sample_batch = next(iter(train_loader))
+        input_dim = sample_batch['features'].shape[1] if sample_batch['features'] is not None else 2048
+        output_dim = len(args.targets)
+        
+        print(f"Dataset loaded via new pipeline (input_dim={input_dim}, output_dim={output_dim})")
+        
+        # Feature normalization is handled by the dataset
+        feature_mean = feature_std = None
+        
+    else:
+        print("Using LEGACY data pipeline (StellarFeatureDataset)...")
+        features_path = args.features_file
+        info_path = args.info_file or os.path.join(os.path.dirname(features_path), "info.csv")
 
-    pin_memory = device.type == "cuda"
+        dataset = StellarFeatureDataset(
+            features_path=features_path,
+            info_path=info_path,
+            target_columns=args.targets,
+            max_samples=args.max_samples,
+        )
 
-    train_loader = DataLoader(
-        train_set,
-        batch_size=args.batch_size,
-        shuffle=True,
-        num_workers=args.num_workers,
-        pin_memory=pin_memory,
-    )
-    val_loader = DataLoader(
-        val_set,
-        batch_size=args.batch_size,
-        shuffle=False,
-        num_workers=args.num_workers,
-        pin_memory=pin_memory,
-    ) if val_set is not None else None
-    test_loader = DataLoader(
-        test_set,
-        batch_size=args.batch_size,
-        shuffle=False,
-        num_workers=args.num_workers,
-        pin_memory=pin_memory,
-    ) if test_set is not None else None
+        print(
+            f"Dataset loaded ({len(dataset)} samples, input_dim = {dataset.input_dim}, "
+            f"targets = {list(args.targets)})"
+        )
 
-    feature_mean = feature_std = None
-    if not args.skip_normalization:
-        print("Computing feature normalization statistics from the training split...")
-        feature_mean, feature_std = compute_feature_stats(train_set, args.batch_size, args.num_workers)
-        feature_mean = feature_mean.to(device)
-        feature_std = feature_std.to(device)
+        train_set, val_set, test_set = split_dataset(
+            dataset,
+            train_ratio=args.train_ratio,
+            val_ratio=args.val_ratio,
+            test_ratio=args.test_ratio,
+            seed=args.seed,
+        )
+        
+        input_dim = dataset.input_dim
+        output_dim = dataset.output_dim
+
+        pin_memory = device.type == "cuda"
+
+        train_loader = DataLoader(
+            train_set,
+            batch_size=args.batch_size,
+            shuffle=True,
+            num_workers=args.num_workers,
+            pin_memory=pin_memory,
+        )
+        val_loader = DataLoader(
+            val_set,
+            batch_size=args.batch_size,
+            shuffle=False,
+            num_workers=args.num_workers,
+            pin_memory=pin_memory,
+        ) if val_set is not None else None
+        test_loader = DataLoader(
+            test_set,
+            batch_size=args.batch_size,
+            shuffle=False,
+            num_workers=args.num_workers,
+            pin_memory=pin_memory,
+        ) if test_set is not None else None
+
+        feature_mean = feature_std = None
+        if not args.skip_normalization:
+            print("Computing feature normalization statistics from the training split...")
+            feature_mean, feature_std = compute_feature_stats(train_set, args.batch_size, args.num_workers)
+            feature_mean = feature_mean.to(device)
+            feature_std = feature_std.to(device)
 
     model = MLPRegressor(
-        input_dim=dataset.input_dim,
-        output_dim=dataset.output_dim,
+        input_dim=input_dim,
+        output_dim=output_dim,
         hidden_dim=args.hidden_dim,
         hidden_layers=args.hidden_layers,
         dropout=args.dropout,
@@ -1080,6 +1214,7 @@ def main() -> None:
                 feature_mean=feature_mean,
                 feature_std=feature_std,
                 loss_fn=loss_fn,
+                use_new_pipeline=use_new_pipeline,
             )
 
             val_metrics = evaluate(
@@ -1089,6 +1224,7 @@ def main() -> None:
                 feature_mean=feature_mean,
                 feature_std=feature_std,
                 loss_fn=loss_fn,
+                use_new_pipeline=use_new_pipeline,
             )
 
             if val_metrics is not None and val_metrics.loss < best_val_loss:
@@ -1157,6 +1293,7 @@ def main() -> None:
         feature_mean=feature_mean,
         feature_std=feature_std,
         loss_fn=loss_fn,
+        use_new_pipeline=use_new_pipeline,
     )
 
     if test_metrics is not None:
@@ -1170,7 +1307,11 @@ def main() -> None:
         )
 
     plot_loader = test_loader if test_loader is not None else val_loader
-    plot_subset = test_set if test_set is not None else val_set
+    # For interpolation analysis: only available in legacy pipeline
+    if use_new_pipeline:
+        plot_subset = None  # New pipeline doesn't expose datasets
+    else:
+        plot_subset = test_set if test_set is not None else val_set
     if not args.skip_plots:
         if plot_loader is None:
             print("Skipping plot generation because no validation/test loader is available.")
@@ -1182,6 +1323,7 @@ def main() -> None:
                 device=device,
                 feature_mean=feature_mean,
                 feature_std=feature_std,
+                use_new_pipeline=use_new_pipeline,
             )
             if prediction_data is not None:
                 preds_array, targets_array = prediction_data

@@ -18,7 +18,7 @@ from src.snr_lookup import load_snr_lookup
 from typing import Dict, List, Optional, Tuple, Any
 import re
 import textwrap
-from sklearn.metrics import mean_squared_error, mean_absolute_error
+from sklearn.metrics import mean_squared_error, mean_absolute_error, median_absolute_error
 
 # ==============================================================================
 # Extraction Logic (Copied from analyze_followup_stellar_type.py for standalone usage)
@@ -79,16 +79,16 @@ def process_experiment(json_path: Path, exp_name: str, snr_map: Dict[str, float]
     param_data = {
         'true_Teff': [], 'pred_Teff': [],
         'true_logg': [], 'pred_logg': [],
-        'true_Teff': [], 'pred_Teff': [],
-        'true_logg': [], 'pred_logg': [],
         'true_FeH': [], 'pred_FeH': [],
         'true_Lstar': [], 'pred_Lstar': [],
         'true_Mstar': [], 'pred_Mstar': [],
+        'true_Age': [], 'pred_Age': [],
         'snr_Teff': [],
         'snr_logg': [],
         'snr_FeH': [],
         'snr_Lstar': [],
         'snr_Mstar': [],
+        'snr_Age': [],
     }
 
     for sample in samples:
@@ -127,15 +127,17 @@ def process_experiment(json_path: Path, exp_name: str, snr_map: Dict[str, float]
                 is_stellar_type = 'type' in q_type.lower() or 'classification' in q_type.lower()
                 is_lum = 'luminosity' in q_type.lower()
                 is_mass = 'mass' in q_type.lower()
+                is_age = 'age' in q_type.lower()
             else:
                 # Fallback to question text if 'type' key is missing
                 is_lum = 'luminosity' in question.lower()
                 is_mass = 'mass' in question.lower()
+                is_age = 'age' in question.lower()
                 
                 # Filter for stellar type questions
                 is_stellar_type = any(k in question.lower() for k in ['stellar classification', 'stellar type', 'what is the stellar', 'what stellar classification', 'what is the type'])
 
-            is_relevant = is_stellar_type or is_lum or is_mass
+            is_relevant = is_stellar_type or is_lum or is_mass or is_age
             
             if not is_relevant:
                 continue
@@ -242,6 +244,14 @@ def process_experiment(json_path: Path, exp_name: str, snr_map: Dict[str, float]
                     param_data['true_Mstar'].append(float(true_M))
                     param_data['pred_Mstar'].append(pred_M)
                     param_data['snr_Mstar'].append(snr)
+            
+            if is_age:
+                pred_Age = extract_value_from_text(generated, unit='Gyr')
+                true_Age = qa.get('true_value')
+                if true_Age is not None and pred_Age is not None:
+                    param_data['true_Age'].append(float(true_Age))
+                    param_data['pred_Age'].append(pred_Age)
+                    param_data['snr_Age'].append(snr)
     print("total questions: ", stats['total_questions'])
     print("valid responses: ", stats['valid_responses'])
     print("correct matches: ", stats['correct_matches'])
@@ -375,8 +385,9 @@ def main():
     print(f"Saved subclass accuracy plot to {out_dir / 'subclass_accuracy_comparison.png'}")
     
     # 2. Parameter MAE Comparison
-    param_names = ['Teff', 'logg', 'FeH', 'Lstar', 'Mstar']
+    param_names = ['Teff', 'logg', 'FeH', 'Lstar', 'Mstar', 'Age']
     mae_data = {p: [] for p in param_names}
+    medae_data = {p: [] for p in param_names}
     
     for params in all_params:
         for p in param_names:
@@ -384,11 +395,14 @@ def main():
             pred_vals = params.get(f'pred_{p}', [])
             if true_vals and pred_vals:
                 mae = mean_absolute_error(true_vals, pred_vals)
+                medae = median_absolute_error(true_vals, pred_vals)
                 mae_data[p].append(mae)
+                medae_data[p].append(medae)
             else:
                 mae_data[p].append(0) # Or NaN? 0 for now to avoid plotting errors
+                medae_data[p].append(0)
 
-    fig, axes = plt.subplots(1, 5, figsize=(max(20, len(valid_names)*4), 5))
+    fig, axes = plt.subplots(1, len(param_names), figsize=(max(20, len(valid_names)*4), 5))
     fig.suptitle('Parameter Prediction MAE (Lower is Better)', fontsize=14)
     
     for idx, p in enumerate(param_names):
@@ -414,6 +428,34 @@ def main():
     plt.tight_layout()
     plt.savefig(out_dir / 'parameter_mae_comparison.png', dpi=300)
     print(f"Saved parameter MAE plot to {out_dir / 'parameter_mae_comparison.png'}")
+
+    # 3. Parameter MedAE Comparison
+    fig, axes = plt.subplots(1, len(param_names), figsize=(max(20, len(valid_names)*4), 5))
+    fig.suptitle('Parameter Prediction MedAE (Lower is Better)', fontsize=14)
+    
+    for idx, p in enumerate(param_names):
+        ax = axes[idx]
+        vals = medae_data[p]
+        
+        bars = ax.bar(x, vals, width, color='mediumpurple', alpha=0.8)
+        
+        ax.set_title(f'{p} MedAE')
+        ax.set_xticks(x)
+        ax.set_xticklabels(valid_names, rotation=45, ha='right')
+        
+        # Add value labels
+        for bar in bars:
+            height = bar.get_height()
+            if height > 0:
+                ax.text(bar.get_x() + bar.get_width()/2., height,
+                        f'{height:.2f}', ha='center', va='bottom', fontsize=9)
+            else:
+                 ax.text(bar.get_x() + bar.get_width()/2., 0,
+                        'N/A', ha='center', va='bottom', fontsize=9)
+
+    plt.tight_layout()
+    plt.savefig(out_dir / 'parameter_medae_comparison.png', dpi=300)
+    print(f"Saved parameter MedAE plot to {out_dir / 'parameter_medae_comparison.png'}")
 
     # 3. Parameter Scatter Plots
     def plot_scatter_grid(param_subset, filename_suffix, title_suffix):
@@ -472,7 +514,8 @@ def main():
 
                     rmse = np.sqrt(mean_squared_error(true_vals, pred_vals))
                     mae = mean_absolute_error(true_vals, pred_vals)
-                    ax.set_title(f'{name} - {p}\nRMSE={rmse:.2f}, MAE={mae:.2f}')
+                    medae = median_absolute_error(true_vals, pred_vals)
+                    ax.set_title(f'{name} - {p}\nRMSE={rmse:.2f}, MAE={mae:.2f}, MedAE={medae:.2f}')
 
                     # Set Log-Log scale for Luminosity and Mass
                     if p in ['Lstar', 'Mstar']:
@@ -496,8 +539,9 @@ def main():
         print(f"Saved {filename_suffix} scatter plot to {save_path}")
 
     # Split parameters
+    # Split parameters
     basic_params = ['Teff', 'logg', 'FeH']
-    phys_params = ['Lstar', 'Mstar']
+    phys_params = ['Lstar', 'Mstar', 'Age']
     
     plot_scatter_grid(basic_params, 'basic', 'Basic Parameters')
     plot_scatter_grid(phys_params, 'physical', 'Physical Parameters')

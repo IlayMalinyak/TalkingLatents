@@ -48,6 +48,10 @@ from src.follow_up_templates import (  # noqa: E402
 )
 from data.dataset_diverse import create_diverse_dataloaders
 from data.dataset_twostar_inference import create_twostar_inference_dataloader
+# Metrics and extraction for final report
+from sklearn.metrics import mean_squared_error, mean_absolute_error, median_absolute_error
+from src.analyze_followup_stellar_type import extract_stellar_params_from_text, extract_value_from_text
+
 
 
 PHYSICAL_BOUNDS = {
@@ -214,7 +218,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument('--max_samples', type=int, default=None, help='Limit the number of test samples to process')
     parser.add_argument('--batch_size', type=int, default=4, help='Batch size for dataloader (overrides config)')
     parser.add_argument('--seed', type=int, default=42, help='Random seed for reproducible follow-up prompts')
-    parser.add_argument('--max_new_tokens', type=int, default=128, help='Max tokens to sample per generation')
+    parser.add_argument('--max_new_tokens', type=int, default=256, help='Max tokens to sample per generation')
     parser.add_argument('--temperature', type=float, default=0.2, help='Sampling temperature for text generation')
     parser.add_argument('--top_p', type=float, default=0.8, help='Top-p nucleus sampling value')
     parser.add_argument('--json_filename', type=str, default='follow_up_answers.json', help='Filename for the saved JSON payload')
@@ -261,14 +265,18 @@ def parse_args() -> argparse.Namespace:
     
     parser.add_argument('--v2', action='store_true', default=False,
                         help='Use V2 features path')
+    parser.add_argument('--no_features_file', action='store_true', default=False,
+                        help='Do not load spectral features file (force on-the-fly generation)')
     parser.add_argument('--use_multimodal', action='store_true', default=False,
-                        help='Use multimodal dataframe features')
+                        help='Use multimodal dataframe features (overrides features file)')
+    parser.add_argument('--use_multimodal_params', action='store_true', default=False,
+                        help='Use multimodal params (binarity/age) merged into current features dataframe')
 
     return parser.parse_args()
 
 
 # Constants for features
-FEATURES_PATH_V2 = '/home/ilay.kamai/work/TalkingLatents/logs/2025-12-16/features.npy'
+FEATURES_PATH_V2 = '/home/ilay.kamai/work/TalkingLatents/logs/2025-12-16/tokens.npy'
 MULTIMODAL_PATH = '/home/ilay.kamai/work/TalkingLatents/logs/2025-07-29/multimodal_features.npy'
 MULTIMODAL_DF_PATH = '/home/ilay.kamai/work/TalkingLatents/logs/2025-07-29/info_full_multimodal.csv'
 
@@ -299,7 +307,7 @@ def create_args_from_config(config: Dict[str, Any], inference_args: argparse.Nam
         'llm_backend', 'hf_model_name', 'hf_revision', 'hf_trust_remote_code',
         'hf_device_map', 'hf_quantization', 'hf_cache_dir', 'hf_max_memory_gb',
         'hf_auth_token', 'llm_precision', 'gradient_checkpointing',
-        'use_multimodal'
+        'use_multimodal', 'use_multimodal_params'
     ]
     for key in override_keys:
         cli_value = getattr(inference_args, key, None)
@@ -476,11 +484,65 @@ def extract_physical_param(sample_dict: Dict[str, Any],
     return None
 
 
-def get_stellar_params(batch: Dict[str, Any], sample_idx: int) -> Dict[str, Optional[float]]:
+def get_stellar_params(batch: Dict[str, Any], sample_idx: int, multimodal_df: Optional[Any] = None) -> Dict[str, Optional[float]]:
     sample_meta = build_sample_metadata(batch, sample_idx)
     params = {}
     for param in ['Teff', 'logg', 'FeH']:
         params[param] = extract_physical_param(sample_meta, param)
+    
+    # Extract multimodal params if available
+    obsid = batch.get('obsids', [])[sample_idx] if batch.get('obsids') and len(batch.get('obsids')) > sample_idx else None
+   
+    if multimodal_df is not None and obsid is not None:
+        try:
+             # Try direct index lookup first
+             if obsid in multimodal_df.index:
+                 row = multimodal_df.loc[obsid]
+                 for col in ['binarity_class_hard', 'final_age', 'age_ref', 'Age']:
+                     if col in row:
+                         val = row[col]
+                         if hasattr(val, 'item'):
+                             val = val.item()
+                         params[col] = val
+             
+             # Try casting obsid to int if it's a string/float and index is int based
+             else:
+                 obsid_int = None
+                 try:
+                     obsid_int = int(float(obsid))
+                 except (ValueError, TypeError):
+                     pass
+                 
+                 if obsid_int is not None and obsid_int in multimodal_df.index:
+                     row = multimodal_df.loc[obsid_int]
+                     for col in ['binarity_class_hard', 'final_age', 'age_ref', 'Age']:
+                         if col in row:
+                             val = row[col]
+                             if hasattr(val, 'item'):
+                                 val = val.item()
+                             params[col] = val
+
+             # Fallback to column lookup
+             if not any(k in params for k in ['binarity_class_hard', 'final_age', 'age_ref', 'Age']):
+                 if 'obsid' in multimodal_df.columns:
+                     # Try string match
+                     rows = multimodal_df[multimodal_df['obsid'] == obsid]
+                     if rows.empty and obsid_int is not None:
+                         # Try int match
+                         rows = multimodal_df[multimodal_df['obsid'] == obsid_int]
+                     
+                     if not rows.empty:
+                         row = rows.iloc[0]
+                         for col in ['binarity_class_hard', 'final_age', 'age_ref', 'Age']:
+                             if col in row:
+                                 val = row[col]
+                                 if hasattr(val, 'item'):
+                                     val = val.item()
+                                 params[col] = val
+        except Exception as e:
+            # print(f"Error extracting multimodal params: {e}")
+            pass
+            
     return params
 
 
@@ -508,6 +570,44 @@ def create_follow_up_questions(params: Dict[str, Optional[float]],
         if snr_val is not None:
             stellar_type_specs[0]['snr'] = snr_val
         followups.append(stellar_type_specs[0])
+
+    # EXTRA followups: Binarity and Age (multimodal)
+    # Binarity
+    bin_class = params.get('binarity_class_hard')
+    if bin_class is not None:
+         q_text = "Is this star a binary?"
+         if bin_class == 1:
+             a_text = "Yes"
+         elif bin_class == 2:
+             a_text = "No"
+         else:
+             a_text = "Probably no"
+         followups.append({
+             'type': 'binarity_followup', 
+             'question': q_text, 
+             'answer': a_text,
+             'true_value': bin_class,
+             'snr': snr_val
+         })
+    # Age
+    final_age = params.get('final_age')
+    age = params.get('Age')
+    age_val = None
+    if final_age is not None and not (isinstance(final_age, float) and math.isnan(final_age)):
+        age_val = final_age
+    elif age is not None and not (isinstance(age, float) and math.isnan(age)):
+        age_val = age
+    
+    if age_val is not None:
+        q_text = "What is the age of this star in Gyrs?"
+        a_text = f"{float(age_val):.2f}"
+        followups.append({
+            'type': 'age_followup', 
+            'question': q_text, 
+            'answer': a_text,
+             'true_value': age_val,
+             'snr': snr_val
+         })
     
     # SECOND followup: Get description from JSON file (if available)
     if followup_data is not None and sample_idx is not None and 0 <= sample_idx < len(followup_data):
@@ -764,7 +864,11 @@ def _prepare_context_inputs(context: Dict[str, Any],
         prepared['star_b_indices'] = context['star_b_indices'].to(device=prompt_device, dtype=torch.long)
     else:
         proj_param = next(base_model.projector.parameters())
-        features = context['input_spectra'].contiguous().view(context['input_spectra'].size(0), -1)
+        features = context['input_spectra']
+        # Encode raw spectra if needed (handles fm_model / raw spectra input)
+        features = base_model._encode_latent_features(features)
+        
+        features = features.contiguous().view(features.size(0), -1)
         prepared['latent_features'] = features.to(device=proj_param.device, dtype=proj_param.dtype)
         feature_idx = context['feature_start_idx'].to(device=prompt_device, dtype=torch.long)
         if feature_idx.ndim == 0:
@@ -1083,12 +1187,20 @@ def main():
     # Handle overrides
     if cli_args.v2:
         print(f"Using V2 features path: {FEATURES_PATH_V2}")
-        args.features_file = FEATURES_PATH_V2
+        if not cli_args.no_features_file:
+            args.features_file = FEATURES_PATH_V2
+        else:
+            print("Skipping features file load due to --no_features_file (will use raw spectra)")
+            args.features_file = None
         
     if getattr(args, 'use_multimodal', False):
         print("Using MULTIMODAL mode")
-        args.features_file = MULTIMODAL_PATH
-        
+        if not cli_args.no_features_file:
+            args.features_file = MULTIMODAL_PATH
+        else:
+            print("Skipping multimodal features file load due to --no_features_file")
+            args.features_file = None
+
     multimodal_df = None
     if getattr(args, 'use_multimodal', False):
         print(f"Loading multimodal dataframe from {MULTIMODAL_DF_PATH}")
@@ -1100,10 +1212,92 @@ def main():
                 pass
         else:
             print(f"Warning: Multimodal DF path {MULTIMODAL_DF_PATH} not found!")
+            
+    elif getattr(args, 'use_multimodal_params', False):
+        print("Using MULTIMODAL PARAMS mode (merging into features DF)")
+        print(f"Loading multimodal dataframe from {MULTIMODAL_DF_PATH}")
+        
+        if os.path.exists(MULTIMODAL_DF_PATH):
+            mm_source_df = pd.read_csv(MULTIMODAL_DF_PATH, index_col=0)
+            try:
+                mm_source_df.index = mm_source_df.index.astype(int)
+            except:
+                pass
+            
+            # Use 'obsid' column for ID if available, otherwise fallback to index
+            if 'obsid' in mm_source_df.columns:
+                mm_source_df['obsid_str'] = mm_source_df['obsid'].astype(str).str.split('.').str[0]
+            elif 'ObsID' in mm_source_df.columns:
+                mm_source_df['obsid_str'] = mm_source_df['ObsID'].astype(str).str.split('.').str[0]
+            else:
+                mm_source_df['obsid_str'] = mm_source_df.index.astype(str)
+
+            # Attempt to merge with the Features Dataframe to preserve alignment
+            features_df_path = None
+            current_features_file = getattr(args, 'features_file', None)
+            if current_features_file:
+                base_dir = os.path.dirname(current_features_file)
+                # Look for info csv
+                for cand in ['info_full.csv', 'info.csv']:
+                    cand_path = os.path.join(base_dir, cand)
+                    if os.path.exists(cand_path):
+                        features_df_path = cand_path
+                        # Prefer info_full if available, but take first match
+                        break
+            
+            if features_df_path:
+                print(f"Merging multimodal params into features dataframe: {features_df_path}")
+                features_df = pd.read_csv(features_df_path)
+                
+                # Identify obsid column in features_df
+                obsid_col = None
+                if 'obsid' in features_df.columns:
+                    obsid_col = 'obsid'
+                elif 'kic_id' in features_df.columns:
+                    obsid_col = 'kic_id'
+                elif 'tic_id' in features_df.columns:
+                    obsid_col = 'tic_id'
+                
+                if obsid_col:
+                    # Prepare for merge
+                    features_df['obsid_str'] = features_df[obsid_col].astype(str).str.strip()
+                    
+                    # Columns to pull from multimodal
+                    cols_to_pull = ['binarity_class_hard', 'final_age', 'age_ref', 'Age']
+                    # Only those that exist
+                    cols_to_pull = [c for c in cols_to_pull if c in mm_source_df.columns]
+                    
+                    if cols_to_pull:
+                        mm_subset = mm_source_df[cols_to_pull + ['obsid_str']].drop_duplicates(subset=['obsid_str'])
+                        
+                        # Drop columns from features_df that we are about to merge in, to avoid _x/_y suffixes
+                        cols_to_drop = [c for c in cols_to_pull if c in features_df.columns]
+                        if cols_to_drop:
+                            features_df = features_df.drop(columns=cols_to_drop)
+                            
+                        merged = features_df.merge(mm_subset, on='obsid_str', how='left')
+                        
+                        # Re-establish index as obsid (int if possible) for compatibility with get_stellar_params lookup
+                        merged.index = merged[obsid_col]
+                        
+                        multimodal_df = merged
+                        print(f"Merged dataframe shape: {multimodal_df.shape} (aligned with features_df)")
+                    else:
+                        print("Warning: No target columns found in multimodal df to merge.")
+                        multimodal_df = mm_source_df
+                else:
+                    print("Warning: Could not identify obsid column in features dataframe. Skipping merge.")
+                    multimodal_df = mm_source_df
+            else:
+                print("Warning: Could not locate features dataframe (info.csv/info_full.csv) to merge with.")
+                multimodal_df = mm_source_df
+        else:
+            print(f"Warning: Multimodal DF path {MULTIMODAL_DF_PATH} not found!")
 
     device, _, _ = setup()
     print(f"Using device: {device}")
-
+    if multimodal_df is not None:
+        print(f"Multimodal DF cols: {multimodal_df.columns}")
     checkpoint_parent = os.path.dirname(cli_args.checkpoint_path)
     output_dir = cli_args.output_dir
     if not os.path.isabs(output_dir):
@@ -1334,7 +1528,7 @@ def main():
                             dataset_target = curr_meta.get('expected_answer', dataset_target)
                     # -------------------------------
 
-                    stellar_params = get_stellar_params(batch, sample_idx)
+                    stellar_params = get_stellar_params(batch, sample_idx, multimodal_df=multimodal_df)
                     
                     # Get full stellar_data dict
                     full_stellar_data = None
@@ -1378,13 +1572,14 @@ def main():
                          entry.update(star_info)
                     
                      # --- Generate Base Answer Immediately ---
-                    base_text, _, _, _ = model.generate_response_from_batch(
+                    base_text, _, _, _, _ = model.generate_response_from_batch(
                         batch_data=batch,
                         batch_idx=sample_idx,
                         tokenizer=tokenizer,
                         max_new_tokens=cli_args.max_new_tokens,
                         temperature=cli_args.temperature,
                         top_p=cli_args.top_p,
+                        truncate_answer=False,
                     )
                     entry['base_answer'] = base_text
                     
@@ -1435,6 +1630,7 @@ def main():
                              'on_answer': _make_on_answer(),
                          })
  
+                     
                      _decode_generation_requests(
                          model=model,
                          requests=round_requests,
@@ -1511,7 +1707,101 @@ def main():
                 profile_path = os.path.join(checkpoint_parent, profile_path)
             with open(profile_path, 'w', encoding='utf-8') as f:
                 json.dump(summary, f, indent=2)
+            with open(profile_path, 'w', encoding='utf-8') as f:
+                json.dump(summary, f, indent=2)
             print(f"[PROFILE] Saved timing summary to {profile_path}")
+
+    # ==============================================================================
+    # Metric Reporting
+    # ==============================================================================
+    print("\n" + "="*80)
+    print("METRICS REPORT")
+    print("="*80)
+    
+    # Accumulate true/pred pairs
+    metrics_data = {
+        'Teff': {'true': [], 'pred': []},
+        'logg': {'true': [], 'pred': []},
+        'FeH': {'true': [], 'pred': []},
+        'Lstar': {'true': [], 'pred': []},
+        'Mstar': {'true': [], 'pred': []},
+        'Age': {'true': [], 'pred': []},
+    }
+    
+    for item in results:
+        # 1. Base params from followups or main answer
+        # The inference script stores 'follow_up_answers' which contains the Q&A pairs
+        # We need to parse the ANSWERS in 'follow_up_answers' to find the predicted values.
+        
+        # We also need the TRUE values. 
+        # 'stellar_params' has Teff/logg/FeH/Age/binarity
+        # 'Lstar'/'Mstar' are stored at root of item if available (from l_m_data)
+
+        # Let's extract from all follow-up answers covering these topics
+        combined_text = ""
+        # Base answer might contain info if it was a direct question, but usually followups define the specific extraction
+        # But let's check all text generated
+        combined_text += item.get('model_answer', '') + " "
+        
+        # Iterate through followups
+        for qa in item.get('follow_up_answers', []):
+            combined_text += qa.get('answer', '') + " "
+            
+            # Check for specific L/M/Age/Binarity stats in the QA metadata
+            q_type = qa.get('type', '')
+            true_val = qa.get('true_value')
+            
+            # Extract and store if we have a true value in the QA pair (most reliable for Age/L/M)
+            if true_val is not None:
+                # Luminosity
+                if 'luminosity' in q_type or 'Lstar' in q_type:
+                    pred = extract_value_from_text(qa.get('answer', ''), unit='Lsun')
+                    if pred is not None and pred < 1000000: # Sanity check
+                        metrics_data['Lstar']['true'].append(float(true_val))
+                        metrics_data['Lstar']['pred'].append(pred)
+                
+                # Mass
+                elif 'mass' in q_type or 'Mstar' in q_type:
+                    pred = extract_value_from_text(qa.get('answer', ''), unit='Msun')
+                    if pred is not None:
+                         metrics_data['Mstar']['true'].append(float(true_val))
+                         metrics_data['Mstar']['pred'].append(pred)
+                
+                # Age
+                elif 'age' in q_type:
+                    pred = extract_value_from_text(qa.get('answer', ''), unit='Gyr')
+                    if pred is not None:
+                        metrics_data['Age']['true'].append(float(true_val))
+                        metrics_data['Age']['pred'].append(pred)
+
+        # Extract Teff/logg/FeH from the combined text (usually the "stellar classification" question covers this)
+        extracted = extract_stellar_params_from_text(combined_text)
+        true_params = item.get('stellar_params', {})
+        
+        for param in ['Teff', 'logg', 'FeH']:
+            t_val = true_params.get(param)
+            p_val = extracted.get(param)
+            if t_val is not None and p_val is not None:
+                 if param == 'Teff' and p_val > 50000: continue # Sanity
+                 metrics_data[param]['true'].append(float(t_val))
+                 metrics_data[param]['pred'].append(float(p_val))
+
+    # Calculate and Print
+    print(f"{'Parameter':<10} | {'N':<5} | {'RMSE':<8} | {'MAE':<8} | {'MedAE':<8}")
+    print("-" * 50)
+    
+    for param, data in metrics_data.items():
+        y_true = data['true']
+        y_pred = data['pred']
+        
+        if len(y_true) > 0:
+            rmse = np.sqrt(mean_squared_error(y_true, y_pred))
+            mae = mean_absolute_error(y_true, y_pred)
+            medae = median_absolute_error(y_true, y_pred)
+            print(f"{param:<10} | {len(y_true):<5} | {rmse:<8.3f} | {mae:<8.3f} | {medae:<8.3f}")
+        else:
+            print(f"{param:<10} | 0     | N/A      | N/A      | N/A")
+    print("-" * 50)
 
 
 if __name__ == '__main__':
