@@ -1,0 +1,99 @@
+\section{Results}\label{sec:results}
+\subsection{singles and pair questions}
+We first test the single and pair questions, comparing two types of Llama-8B models: Llama-3.1 and AstroSage \citep{haan2025_astrosage}, where a Llama-3.1 model was fine-tuned specifically on arXiv astrophysics papers.~\Cref{tab:basemodel} shows the comparison on both datasets. While both models show high performance on both tasks, Astrosage retains a small gain over the vanilla model in seven of the eight cells, across both datasets, which implies that textual domain knowledge is helpful for those tasks. The margins are small and each arm was trained at a single seed, so the pattern across cells carries the claim rather than any one cell.  
+\subsection{scientific reasoning tasks} Single and pair questions consists of description and simple comparisons and requires almost no reasoning beyond the basic properties. It is also similar to protein description tasks as in  \cite{Dotan2026_betadescribe}, and therefore it is not surprising that an LLM performs well on such questions. Next, we test the performance on questions that requires some form of scientific reasoning. As mentioned in~\Cref{sec:data}, those are anomaly detection for the stellar dataset and irregular morphology-SFH correlation in the galaxy dataset.~\Cref{tab:headboth} shows the results of those two tasks using both a template-based verifier and an LLM judge (Qwen3.5-27B). The \emph{no head} column presents the basic model, with no extra information, and the perforemance are poor. The \emph{+ head} column shows the performance with the addition of an extra single token that comes from a dedicated non-LLM model that is meant to highlight the relevant information. In the stellar case this is a flow matching model that was trained to learn the joint distribution of the aligned features and catalog labels, conditioned on the rest of the group. In the galaxy case, this is a cross-modal predictor that is trained to predict one modality from the other. We note that adding this single token significantly improves the performance on both tasks. 
+
+\begin{table}[h]\centering\small
+\caption{\textbf{Base model: Llama-3.1-8B vs.\ AstroSage-8B}, identical
+corpus, recipe and seed; rule-scored, greedy; the better model in bold.
+Metrics: \emph{numeric acc.} = fraction of numbers the text states that fall
+within tolerance of the catalog value; \emph{qualitative acc.} (single) =
+fraction of class words (dwarf/giant, spiral/elliptical, \ldots) that match
+the catalog; \emph{relational acc.} (pair) = fraction of comparisons
+(``hotter than'', ``more massive'') that match; \emph{outlier found} =
+fraction of groups --- among those that contain an odd member --- in which the
+text names the true outlier \emph{and} its property.
+$^\dagger$~Population rows come from an earlier 150-group subsample and are
+comparable only to each other, not to Table~\ref{tab:stellar}.
+}
+\label{tab:basemodel}
+\begin{tabular}{llcc}
+\toprule
+ & metric & Llama-3.1-8B & AstroSage-8B \\
+\midrule
+\multicolumn{4}{l}{\emph{galaxies --- one object}}\\
+ & numeric acc.\     & 0.822 & \textbf{0.826} \\
+ & qualitative acc.\ & 0.812 & \textbf{0.835} \\
+\multicolumn{4}{l}{\emph{galaxies --- pair}}\\
+ & numeric acc.\     & 0.647 & \textbf{0.672} \\
+ & relational acc.\  & \textbf{0.795} & 0.771 \\
+\midrule
+\multicolumn{4}{l}{\emph{stars --- one object}}\\
+ & numeric acc.\     & 0.909 & \textbf{0.911} \\
+ & qualitative acc.\ & 0.575 & \textbf{0.628} \\
+\multicolumn{4}{l}{\emph{stars --- pair}}\\
+ & numeric acc.\     & 0.784 & \textbf{0.801} \\
+ & relational acc.\  & 0.858 & \textbf{0.883} \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+
+\begin{table}[h]\centering\small
+\caption{\textbf{The head fixes the relational task --- on both tracks, under
+both scorers.} Each row is one arm pair on one task, measured two ways. Stars:
+does the text name the true odd member \emph{and} its property, over the
+$1{,}203$ test groups that contain one. Galaxies: does the text call the
+shape-vs-history relation correctly, over the $1{,}484$ galaxies where the two
+genuinely \emph{disagree}. The rule verifier and the LLM judge are independent
+instruments (Sec.~\ref{sec:scoring}); they agree on the size and direction of the
+stellar effect. The galaxy rows are scored differently, and $^{\ast}$ explains why; their
+two rows are two controls (a narrator trained without the token, and the same trained
+narrator with its token removed at test time), not two scorers. Numbers are comparable \emph{within} a row block only --- the two
+tracks are different tasks on different scales.}
+\label{tab:headboth}
+\begin{tabular}{llccc}
+\toprule
+track --- relational task & scorer & no head & $+$ head & $\Delta$ \\
+\midrule
+\emph{stars} --- name the odd member      & verifier & 0.245 & \textbf{0.633} & $+0.388$ \\
+\hspace{1em}and its property              & judge    & 0.332 & \textbf{0.662} & $+0.330$ \\
+\midrule
+\emph{galaxies}$^{\ast}$ --- does shape   & min-stratum AUC & 0.442 & \textbf{0.628} & $+0.186$ \\
+\hspace{1em}agree with history?           & min-stratum AUC & 0.461 & \textbf{0.628} & $+0.167$ \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+$^{\ast}$~The galaxies are scored by how well the model's graded confidence separates
+true mismatches, taken as the minimum over the two star-formation strata ($0.50$ =
+chance), rather than by whether the text states the right verdict. A verdict rate
+saturates here: trained on the same prose, the narrator without the token calls $0.923$
+of the mismatching galaxies correctly and the one with it $0.973$ --- both say the right
+words. What separates them is that the narrator without the token learns
+``spheroid $\Rightarrow$ mismatch'', which is right for the $90\%$ star-forming
+majority and backwards for the quiescent minority.
+
+
+\begin{table}[h]\centering\small
+\caption{\textbf{The catalog-text control}, the $n{=}884$ groups with an odd
+member judged in all four arms, greedy. \textbf{found} $=$ outlier \emph{and}
+property, the paper's consistent metric. \emph{outlier named} is the index
+alone and \emph{lift} divides it by the fraction of the group the arm names
+($1.0$ = chance given that much hedging): the two together show \emph{why} the
+index alone misleads. Under \textbf{found} the text arm's apparent lead is
+gone --- $0.331$ against $0.320$ for latent tokens, both less than half the
+head's $0.652$. \emph{stars named} and \emph{finished} describe all $1{,}500$
+generations, not the judged subset.}
+\label{tab:text}
+\begin{tabular}{lcccccc}
+\toprule
+ & \textbf{found} & outlier named & \textbf{lift} & stars named & contra./group & finished \\
+\midrule
+catalog table, text   & 0.331 & 0.592 & \textbf{0.87}$\times$ & 68\% of group & 6.74 & 0/1500 \\
+catalog table, text, reason first & 0.224 & 0.397 & 2.21$\times$ & 18\% & 2.58 & 1249/1500 \\
+latent tokens         & 0.320 & 0.431 & 3.32$\times$ & 13\% & 1.88 & 1498/1500 \\
+latent tokens $+$ head & \textbf{0.652} & 0.782 & \textbf{3.91}$\times$ & 20\% & 1.58 & 1500/1500 \\
+\bottomrule
+\end{tabular}
+\end{table}

@@ -1,0 +1,21 @@
+\section{Data and Model}
+\label{sec:data}
+We test two different astrophysical datasets, representing different domains and physical properties. The first dataset is a \emph{stellar} multimodal dataset comprising 190,091 stars, observed by $5$ different modalities coming from different telescopes - \emph{Kepler}\citep{kepler:mission}, TESS\citep{tess:mission}, LAMOST\citep{lamost:survey}, APOGEE\citep{apogee:mission}, and Gaia\citep{gaia:mission}. Each modality is processed through a specific encoder, and the modalities are aligned with a model that factorizes the latent space into shared and specific subspaces. The result is one shared feature and $5$ per-modality features, each projected to the token embedding space of the LLM as its own small group of tokens. The second dataset is galaxies from the COSMOS-Web survey \citep{Casey2023_cosmos-web}, including two modalities: images and star-formation history (SFH). Similar to the stellar dataset, we use a pretrained model that aligns the two modalities (here using CLIP \cite{Radford2021_CLIP}) and project the frozen features into the LLM's token embedding. Notably, the two datasets are different in many aspects: number and type of modalities, pretrained models, and scientific questions. Using the two datasets in the same pipeline highlights general vs data-specific conclusions.\\  
+\textbf{training prose}. One of the challenges in this pipeline is creating the training dataset. This should include ground-truth prose per object. Contrary to other fields, in astrophysics data is usually stored only in numerical catalogs, so one needs to create the prose from scratch. Our main method is a \emph{template-based} method: a deterministic program that picks a subset of facts from the catalog, chooses a phrasing from a bank of templates, and
+writes prose. Every sentence is checked against the record by a verifier before it enters the corpus. The
+check is per-fact: it guarantees that the facts a description states are true of the object, not
+that the description mentions every unusual object in a group. Both datasets share two types of prose: description of a single object (single), and comparison between pairs (pair). We also test deeper reasoning capabilities with two additional tasks. In the stellar dataset we use population prose: a group of $N$ objects with description of the typical members, and a callout
+of the one that does not belong and on which property. In the galaxy dataset we are interested in non trivial cross modal correlation and check if the model highlight those in the prose. In~\Cref{sec:results} we compare the template-based method with a second method: an \emph{LLM-based} generation, where we let DeepSeekV4 write the population prose from catalog facts, and verify their correctness.  
+\textbf{Input tokens.} To improve the diversity of the data and reduce overfitting, we apply several augmentations to the input. First, we add a random number of sentences from general astrophysics papers (from arXiv) and insert them around the data tokens. Second, we add label smoothing and a cosine learning-rate schedule. These augmentations apply to the single and pair records; population records are presented as the data tokens alone. 
+
+
+\begin{figure}[h]
+  \centering
+  \input{figs/architecture_body}
+ \caption{\textbf{The pipeline.} An adapter projects each object's multimodal
+  features into tokens placed between brackets; the
+  model continues from them into prose, and the loss is taken on the prose
+  alone. The language model is adapted either by
+  full fine-tuning or with LoRA.}
+  \label{fig:arch}
+\end{figure}

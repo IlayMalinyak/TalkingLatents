@@ -1,0 +1,130 @@
+% =====================================================================
+% NEW CITATIONS NEEDED
+%
+% -- Essential --
+% Tsimpoukelli2021_frozen   Multimodal Few-Shot Learning with Frozen LMs (NeurIPS 2021)
+% Alayrac2022_flamingo      Flamingo (NeurIPS 2022)
+% Li2023_blip2              BLIP-2 (ICML 2023)
+% Liu2023_llava             Visual Instruction Tuning (NeurIPS 2023)
+% Hu2022_lora               LoRA (ICLR 2022)
+% Nalisnick2019_dgm         Do Deep Generative Models Know What They Don't Know? (ICLR 2019)
+% MerrillSabharwal2023      The Parallelism Tradeoff: Limitations of Log-Precision
+%                           Transformers (TACL 2023)
+% Dziri2023_faithfate       Faith and Fate: Limits of Transformers on Compositionality
+%                           (NeurIPS 2023)
+% Gekhman2024               Does Fine-Tuning LLMs on New Knowledge Encourage
+%                           Hallucinations? (EMNLP 2024, pp. 7765-7784)
+% Golkar2023_xval           xVal: A Continuous Numerical Tokenization for Scientific LMs
+%
+% -- Recommended --
+% Zaheer2017_deepsets       Deep Sets (NeurIPS 2017)
+% Kang2024_unfamiliar       Unfamiliar Finetuning Examples Control How LMs Hallucinate
+% Schick2023_toolformer     Toolformer (NeurIPS 2023)
+% Lochner2021_astronomaly   Astronomaly: personalised anomaly detection in astronomy
+%
+% -- Cut first if tight --
+% MerrillSmith2022_saturated  Saturated Transformers are Constant-Depth Threshold
+%                             Circuits (TACL 2022)
+% Lee2019_settransformer      Set Transformer (ICML 2019)
+% Gruver2023_llmtime          LLMs Are Zero-Shot Time Series Forecasters (NeurIPS 2023)
+% Gao2023_pal                 PAL: Program-Aided Language Models (ICML 2023)
+% Zheng2023_judge             Judging LLM-as-a-Judge with MT-Bench (NeurIPS 2023)
+%
+% VERIFY BEFORE SUBMITTING: only Gekhman2024, MerrillSabharwal2023, Dziri2023 and
+% Golkar2023_xval were checked against a source. The rest are from memory.
+% =====================================================================
+
+\section{Introduction}\label{sec:intro}
+The integration of Large Language Models (LLMs) into the scientific workflow marks a
+paradigm shift in how researchers interface with information. While these models have
+demonstrated remarkable proficiency in some scientific tasks, their utility remains
+largely confined to the textual and visual domains. A critical frontier in ``AI for
+Science'' is the transition from processing scientific text to reasoning directly over
+the physical data that defines scientific discovery. Standard LLM
+architectures struggle with numerical reasoning \citep{Rahman2025}, in part because
+subword tokenization does not preserve the magnitude and continuity of numerical values
+\citep{Golkar2023_xval}, creating a gap between natural language and empirical data.
+
+The main motivation of this work is the need to combine physics foundation models and
+LLMs in a scientifically useful manner. Each has distinct advantages, and the potential
+for knowledge alignment between them has far-reaching outcomes. One is interpretability:
+an LLM that operates over both natural language and learned scientific representations
+could serve as a `bridge' between humans and machine learning representations, which are
+usually hard to interpret. A second is scientific discovery: foundation models trained on
+large and diverse datasets encapsulate latent information beyond their downstream tasks,
+and that information can support non-trivial population analysis or complex cross-modal
+correlations. Unfolding it, however, requires analysing high-dimensional features
+directly, whereas the common practice of projecting them to a low-dimensional summary
+discards exactly the structure such analyses depend on. Most current uses of LLMs with
+scientific data take the form of textual descriptions, or of agents that delegate the
+analysis to dedicated models and read off their results. Whether an LLM can perform
+scientific reasoning \emph{directly} from learned data representations is therefore still
+an open question, and it is the question we study here.
+
+\textbf{Contribution.}
+We connect frozen survey encoders to an 8B language model through a trained
+projector, adapting the language model itself with either LoRA or full fine-tuning, and evaluate it on two independent astrophysical datasets (Kepler-field stars,
+COSMOS-Web galaxies) across per-object and pairwise questions, and on a relational
+question for each: the odd member of a set of stars, and the agreement between two
+views of a single galaxy.
+%
+\emph{First}, we find a sharp asymmetry: reading learned tokens, the model describes a
+single object and compares two objects accurately, but fails when asked about a set of objects, like identifying an anomalous object in a group. A linear probe on the same tokens recovers most of that
+signal, so the failure is one of computation rather than representation; a relational
+bias added inside attention did not improve the fit; and supplying the same catalog
+values as text in the prompt leaves the model at chance once its verbosity is corrected
+for, and prompting it to reason through the objects first lifts it off chance but not to the
+level the tokens already reach.
+%
+\emph{Second}, we show that performing the set-level computation outside the model and
+returning it as a single extra token recovers the ability: $+0.33$ on outlier
+identification over the full test fold, and $+0.47$ on an adversarial split where the
+odd member was never an odd member during training. Scrambling or zeroing the token's
+contents costs significantly on every axis but coverage.
+%
+\emph{Third}, the head must match the question. A density-based head recovers rarity
+among stars but is at chance on cross-modal agreement among galaxies, where a
+discriminative cross-modal predictor works instead. 
+%
+\emph{Finally}, we report two evaluation traps that each would have produced a
+confidently wrong result, and find that verified templated prose yields a substantially
+more factual model than fluent LLM-written prose on the same task.
+
+\section{Related Work}\label{sec:related_work}
+
+\paragraph{LLMs as scientific assistants.}
+Advances in LLMs have already had a wide-ranging impact on how we do science. LLM agents
+can now review and write scientific papers \citep{Villaescusa-Navarro2025_denario,
+Zhuang2025}, act as a `virtual lab' that suggests and implements novel research ideas
+\citep{swanson_virtual_2025}, or perform equation discovery \citep{Yang2026ThinkLA}.
+However, these agents typically access scientific data indirectly, by writing code to an
+external tool (e.g., ESM, AlphaFold-multimer), an approach formalised in the
+tool-augmentation literature \citep{Schick2023_toolformer, Gao2023_pal}. Recently there
+has been growing interest in predicting physical properties of proteins with LLMs
+\citep{Zhuo2024ProtLLMAI,Dotan2026_betadescribe}. That line is
+close to ours, but asks a different question: property prediction and textual description
+from sequential data, rather than comparative and population analysis over continuous
+data.
+
+\paragraph{Scientific foundation models and scientific LLMs.}
+Foundation models have become popular across scientific fields and show strong
+performance in many domains \citep[e.g.,][]{Leung2024, Parker2025_aion, Smith2024_astropt,
+euclid_2025_multimodal, Bardhan2025, Hayes2025_ESM3, bodnar_2025_aurora,
+abramson_2024_alphafold3}. Notably, these models do not treat natural language as a
+modality, so a clear separation persists between scientific foundation models and LLMs.
+The term scientific-LLM usually refers instead to injecting scientific knowledge into
+existing LLMs \citep[for reviews, see][]{Hu2025_sci_llm, Eger2025_sci_llm}, most often by
+fine-tuning on high-quality text and images to improve reasoning \citep{Xie2023_darwin,
+Bai2025_intern_s1, Cherian2024_llmphy}, object description \citep{Mishra-Sharma2024},
+search \citep{Koblischke2025}, and chat \citep{Zaman2025}. Such models outperform general
+LLMs on domain tasks \citep{haan2025_astrosage}, but remain confined to text and images.
+
+\paragraph{Connecting frozen encoders to frozen language models.}
+The architecture we use is standard outside the sciences: a trained projector maps a
+frozen encoder's outputs into the embedding space of a frozen language model, which is
+adapted with a small number of trainable parameters \citep{Tsimpoukelli2021_frozen,
+Alayrac2022_flamingo, Li2023_blip2, Liu2023_llava}. This recipe is
+well-established for producing descriptions of a single input. Whether it supports
+comparison across several inputs, which is what population-level scientific questions
+require, has received little attention.
+

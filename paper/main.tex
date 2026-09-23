@@ -1,0 +1,105 @@
+\PassOptionsToPackage{numbers,compress}{natbib}
+\documentclass{article}
+
+\usepackage{neurips_2026}
+
+\usepackage[utf8]{inputenc}
+\usepackage[T1]{fontenc}
+\usepackage{wrapfig}
+\usepackage{placeins}
+\usepackage{notations}
+\usepackage{subcaption}  % in the preamble
+\usepackage{stmaryrd}
+\usepackage{amsmath}
+\usepackage{xcolor}
+\usepackage{tikz}
+\usetikzlibrary{positioning,arrows.meta,fit,backgrounds,calc}
+
+
+\newcommand{\aap}{A\&A}      
+\newcommand{\aj}{AJ}
+\newcommand{\mnras}{MNRAS}   
+\newcommand{\pasp}{PASP}
+\newcommand{\apj}{ApJ}       
+\newcommand{\apjs}{ApJS}
+\newcommand{\apjl}{ApJL}
+
+% Cleveref for cross-referencing
+\usepackage[colorlinks=false]{hyperref}
+\usepackage[capitalize,noabbrev]{cleveref}
+
+% TikZ for graphics
+\usepackage{tikz}
+\usetikzlibrary{
+    decorations.pathmorphing,
+    positioning,
+    decorations.shapes,
+    shapes.geometric,  
+    arrows.meta,      
+    fit,             
+}
+\usepackage{placeins}
+\usepackage{xcolor}
+\newcommand{\hugues}[1]{\textcolor{blue}{\textbf{Hugues:} #1}}
+\newcommand{\ilay}[1]{\textcolor{red}{\textbf{Ilay:} #1}}
+
+% colours used by figs/architecture_body (Fig. 1)
+\definecolor{deepteal}{HTML}{264653}
+\definecolor{coral}{HTML}{E76F51}
+\definecolor{neutral}{HTML}{8A8A8A}
+\definecolor{paleteal}{HTML}{CFE6E1}
+\definecolor{palecoral}{HTML}{F8D6C9}
+\definecolor{palegrey}{HTML}{F2F2F2}
+\usepackage[most]{tcolorbox}
+\newtcolorbox{conclusionbox}{
+  colback=blue!5,        % Background color
+  colframe=blue!75!black, % Border color
+  coltitle=black,        % Title text color
+  fonttitle=\bfseries,   % Title font style
+  boxrule=1pt,           % Border thickness
+  arc=1mm,               % Rounded corners
+  left=2mm,              % Left padding
+  right=2mm,             % Right padding
+  top=1mm,               % Top padding
+  bottom=1mm,            % Bottom padding
+}
+
+% Optional: todonotes for comments (remove if not needed)
+\usepackage[textsize=tiny]{todonotes}
+
+\title{Talk with your latent - can LLM do scientific reasoning directly from data?}
+\author{%
+  Ilay Kamai\thanks{Corresponding author.} \\
+  Technion \\
+  \texttt{ilay.kamai@campus.technion.ac.il} \\
+  \And
+  Alex M.\ Bronstein \\
+  Technion \\
+  ISTA \\
+  \And
+  Hagai B.\ Perets \\
+  Technion \\
+}
+\date{}
+
+\begin{document}
+
+\maketitle
+\input{sections/abstract}
+\input{sections/intro}
+\input{sections/data}
+% \input{sections/model}
+\input{sections/results}
+\input{sections/conclusions}
+
+\clearpage
+\bibliographystyle{unsrtnat}
+\bibliography{main}
+% \newpage
+\appendix
+\input{sections/appendix}
+
+%=============================================================================
+
+
+\end{document}
