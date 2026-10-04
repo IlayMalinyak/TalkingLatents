@@ -69,12 +69,15 @@ question for each: the odd member of a set of stars, and the agreement between t
 views of a single galaxy.
 %
 \emph{First}, we find a sharp asymmetry: reading learned tokens, the model describes a
-single object and compares two objects accurately, but fails when asked about a set of objects, like identifying an anomalous object in a group. A linear probe on the same tokens recovers most of that
-signal, so the failure is one of computation rather than representation; a relational
-bias added inside attention did not improve the fit; and supplying the same catalog
-values as text in the prompt leaves the model at chance once its verbosity is corrected
-for, and prompting it to reason through the objects first lifts it off chance but not to the
-level the tokens already reach.
+single object and compares two objects accurately on both datasets, but fails on the
+scientific reasoning tasks --- identifying the anomalous member of a group of stars, and
+recognising when a galaxy's morphology and star-formation history disagree --- where it
+performs at or below chance. A probe on the underlying representation recovers most of
+that signal in both cases, so the failure is one of computation rather than
+representation; and for the stellar task, supplying the same catalog values as text in
+the prompt leaves the model at chance once its verbosity is corrected for, while
+prompting it to reason through the objects first lifts it off chance but not to the level
+the tokens already reach.
 %
 \emph{Second}, we show that performing the set-level computation outside the model and
 returning it as a single extra token recovers the ability: $+0.33$ on outlier

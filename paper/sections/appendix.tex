@@ -1,3 +1,92 @@
 \section{Appendix}\label{sec:appendix}
 
+\subsection{Is the signal in the features? The ranking probe}\label{app:probe}
+The group task asks which member does not belong. We test whether that is
+answerable from the aligned features alone, without a language model in the
+loop. For each group we rank its members by one quantity and ask where a
+qualifying star lands. Two readouts are compared on exactly the same groups:
+the true catalog value, and a cross-fit ridge regression that predicts the same
+quantity from the aligned feature (5-fold, so no star is scored by a model that
+saw it). If the probe tracks the catalog, the signal survives the alignment.
 
+Two details matter. First, only the three continuous axes can be ranked by a
+scalar; binarity and cluster membership are categorical and are excluded
+($103$ of $259$ anomalies). Second, the composer designates one intruder but
+leaves the other members unconstrained on that axis, so a group often contains
+several stars carrying the same label --- $60.5\%$ of anomalies on the full
+fold, and $81.7\%$ on dwarf/giant. Naming any of them is a true statement about
+the group, so a readout is credited for the best-placed qualifying star rather
+than only the designated one. ``Extreme'' is distance from the group median in
+units of its median absolute deviation, which does not reveal which direction
+the answer lies in.
+
+\begin{table}[h]\centering\small
+\caption{\textbf{Ranking the odd member from the features alone.} $n{=}156$
+continuous-axis anomalies over $129$ groups. \emph{rank-1} = a qualifying star
+is the single most extreme member; \emph{top-3} = one is among the three most
+extreme. The probe reads only what the language model reads.}
+\label{tab:probe}
+\begin{tabular}{lcc}
+\toprule
+readout & rank-1 & top-3 \\
+\midrule
+catalog values (oracle)      & 0.660 & \textbf{0.942} \\
+probe, shared subspace (64-d) & 0.660 & 0.840 \\
+probe, full feature (1024-d)  & \textbf{0.686} & 0.891 \\
+\midrule
+\multicolumn{3}{l}{\emph{by axis, full feature vs.\ catalog}}\\
+dwarf / giant     & 0.911 \emph{vs} 0.857 & 1.000 \emph{vs} 0.929 \\
+hot / cool        & 0.755 \emph{vs} 0.694 & 0.939 \emph{vs} 0.959 \\
+metal rich / poor & 0.373 \emph{vs} 0.412 & 0.725 \emph{vs} 0.941 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+The probe matches the catalog at rank-1 and keeps $89$--$95\%$ of it at top-3;
+on the gravity axis it is ahead of the catalog. The information the group task
+needs is in the features.
+
+The catalog row is not a ceiling on the task. It bounds what a \emph{single
+ranked quantity} can do, and it falls short of $1.0$ because the label is a
+threshold test (``$[\mathrm{Fe/H}] > 0.3$'') while a ranking is a distance test:
+a star can sit far from the group median without crossing the threshold. A
+readout that models the group jointly --- the head of
+\Cref{tab:headboth} --- is not bound by it.
+
+Scoring the narrators by the same rule, crediting any equally-qualifying star,
+raises both arms and leaves the head's lead intact: $+0.361 \to +0.318$
+($n{=}1{,}203$ groups, $p{=}6\times10^{-85}$).
+
+\subsection{The regime control: same prose, same LoRA, no token}\label{app:2x2}
+The head arms are trained with LoRA on a frozen base while the no-head arms are
+full fine-tunes, so ``head vs.\ no head'' is also ``LoRA vs.\ full fine-tune''.
+We closed that on the galaxy track, where one cell costs $\sim$10 GPU-hours: a
+narrator trained on the \emph{same} concordance prose, with the \emph{same} LoRA
+rank and schedule as the head arm, and no cross-modal token. It is one variable
+away from the head arm.
+
+\begin{table}[h]\centering\small
+\caption{\textbf{The complete $2\times2$}, galaxy cross-modal task, minimum-AUC
+over the two star-formation strata ($0.50$ = chance; brackets are $95\%$
+intervals on the minority stratum). A score above $0.5$ in \emph{both} strata
+detects the interaction; below it, the arm is reading morphology alone.}
+\label{tab:2x2}
+\begin{tabular}{lccc}
+\toprule
+ & full fine-tune & LoRA & read \\
+\midrule
+no token  & 0.442 [0.409,0.477] & 0.498 [0.462,0.535] & morphology-only \\
+$+$ token & ---                 & \textbf{0.628} [0.593,0.665] & interaction \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+Neither training regime produces an interaction detector on its own: both
+no-token arms sit at chance on the quiescent stratum, and the LoRA arm's
+interval contains $0.5$. The full fine-tune is in fact the more confident
+shortcut learner --- it posts the highest \emph{marginal} AUC in the study
+($0.885$) while scoring $0.442$ on the minority stratum, which is why we never
+quote marginal AUC here. Only the arm with the token is above chance in both
+strata. We take this as evidence, by analogy, for the stellar track as well,
+where the equivalent control would cost $\sim$700--1{,}000 GPU-hours and was
+not run.

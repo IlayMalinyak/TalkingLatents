@@ -12,7 +12,6 @@
 \usepackage{booktabs}
 \usepackage{algorithm,algorithmic}
 \usepackage{wrapfig}
-\usepackage{thm-restate}
 \usepackage{enumitem}
 \usepackage{multirow}
 
@@ -28,6 +27,11 @@
 \theoremstyle{remark}
 \newtheorem*{remark}{Remark}
 \newtheorem*{example}{Example}
+
+% thm-restate patches \newtheorem and pre-creates the shared counters, so it
+% must be loaded AFTER the declarations above (otherwise amsthm reports
+% "\c@proposition already defined").
+\usepackage{thm-restate}
 
 
 \newcommand{\E}{\mathbb{E}}
