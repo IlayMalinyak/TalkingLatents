@@ -1,0 +1,126 @@
+% =====================================================================
+% Talking Latents — the pipeline.  \input by the paper.  HORIZONTAL.
+%
+% General on purpose: no survey, no modality, no base-model, no track name in
+% the STRUCTURE. The example strings are necessarily from one track (stellar);
+% the caption says so.
+%
+% Trained vs frozen is shown with icons, in the "fire / ice" convention:
+%   flame     = parameters updated by the prose loss
+%   snowflake = parameters never updated here
+%   multimodal features  ICE   (frozen encoders + frozen alignment upstream)
+%   adapter network      FIRE
+%   LLM                  ICE, with a small LoRA tag marked FIRE
+% (The new bracket / token embeddings are trained too; they are not a
+% computation block, so they carry no icon -- the caption says it.)
+%
+% Both example texts are VERBATIM, not invented:
+%   question -> configs/stellar/filler_queries.yaml : single_target[0]
+%   prose    -> cache/stellar_gen_eval/generations/astrosage8b.jsonl, a single-
+%               mode generation at T=0.6, quoted in full. NB greedy (T=0) output
+%               from this arm is a bullet list, not free prose -- the free-form
+%               register appears once the template attractor is broken. State
+%               the temperature if the figure is ever queried on this.
+% Prompt order matches training_prompt_builder.py:_build_filler_before:
+%   <BOS> <question> [OBJECTS] <emb...> [/OBJECTS] <prose> <EOS>
+%
+% Scope note: single/pair records and the pair bias exist on BOTH tracks; they
+% are omitted for simplicity. The head is omitted here too -- this is the base
+% pipeline; the head enters in Sec. 3.
+%
+% Icons are drawn in TikZ (no icon font in this TinyTeX). Previous vertical
+% version: paper/archive/architecture_body_vertical_2026-09-06.tex.
+% NB body file, not standalone: TinyTeX here lacks grfext.sty.
+% =====================================================================
+\definecolor{ice}{HTML}{3F87C4}
+\definecolor{flameyellow}{HTML}{FFD166}
+\resizebox{\textwidth}{!}{%
+\begin{tikzpicture}[
+  font=\small,
+  >={Stealth[length=2.6mm,width=2.0mm]},
+  box/.style   ={draw=deepteal, fill=palegrey, line width=1.0pt,
+                 rounded corners=2.5pt, align=center, inner sep=5pt,
+                 minimum height=13mm},
+  tok/.style   ={draw=deepteal, fill=paleteal, line width=0.8pt,
+                 rounded corners=1pt, minimum size=5.0mm, inner sep=0pt},
+  brak/.style  ={font=\scriptsize\ttfamily, text=deepteal},
+  ex/.style    ={font=\scriptsize\itshape, text=deepteal},
+  dnote/.style ={font=\scriptsize, text=neutral},
+  arr/.style   ={->, line width=1.0pt, draw=deepteal},
+  % ---- icons -------------------------------------------------------
+  pics/snow/.style={code={
+    \fill[white] (0,0) circle (0.215);
+    \foreach \a in {0,60,...,300}{
+      \draw[ice, line width=0.55pt, line cap=round] (0,0) -- (\a:0.17);
+      \draw[ice, line width=0.45pt, line cap=round]
+        (\a:0.105) -- ++(\a+50:0.06)  (\a:0.105) -- ++(\a-50:0.06);
+    }}},
+  pics/flame/.style={code={
+    \fill[white] (0,0.02) circle (0.215);
+    \fill[coral]
+      (0,-0.17) .. controls (-0.21,-0.14) and (-0.19,0.10) .. (-0.06,0.19)
+                .. controls (-0.03,0.11) and (0.02,0.08) .. (0.03,0.02)
+                .. controls (0.11,0.07) and (0.15,0.14) .. (0.13,0.21)
+                .. controls (0.24,0.10) and (0.22,-0.14) .. (0,-0.17) -- cycle;
+    \fill[flameyellow]
+      (0,-0.16) .. controls (-0.09,-0.12) and (-0.08,0.00) .. (-0.01,0.05)
+                .. controls (0.03,0.00) and (0.07,0.00) .. (0.09,-0.03)
+                .. controls (0.11,-0.10) and (0.07,-0.15) .. (0,-0.16) -- cycle;
+  }},
+]
+
+% ------------------------------------------------ input block (the anchor)
+% token row chained with relative spacing so it survives any document font size
+\node[brak] (ob) at (0,0) {[OBJECTS]};
+\node[tok, right=1.8mm of ob] (g0) {};
+\node[tok, right=1.2mm of g0] (g1) {};
+\node[text=deepteal, right=1.0mm of g1, inner sep=0pt] (dots) {$\cdots$};
+\node[tok, right=1.0mm of dots] (k0) {};
+\node[tok, right=1.2mm of k0] (k1) {};
+\node[brak, right=1.8mm of k1] (cb) {[/OBJECTS]};
+\coordinate (rowmid) at ($(ob.west)!0.5!(cb.east)$);
+\node[ex] (q) at ($(rowmid)+(0,0.50)$) {``Describe this star.''};
+\begin{scope}[on background layer]
+  \node[draw=deepteal, line width=1.0pt, rounded corners=2.5pt, fill=white,
+        fit=(q)(ob)(cb), inner sep=4pt] (input) {};
+\end{scope}
+\node[dnote, anchor=north] at ($(input.south)+(0,-1mm)$) {\textbf{input}};
+
+% ------------------------------------------------ upstream (left)
+\node[box, left=7mm of input] (adapt) {\textbf{adapter}\\\textbf{network}};
+\node[box, left=7mm of adapt]  (feat)
+  {\textbf{multimodal}\\\textbf{features}\\[-1pt] \scriptsize $N$ objects};
+\draw[arr] (feat) -- (adapt);
+\draw[arr] (adapt) -- (input);
+
+% ------------------------------------------------ LLM (right)
+\node[box, right=7mm of input, minimum width=21mm] (llm) {\textbf{LLM}\\[3pt]
+  {\scriptsize\ttfamily\color{deepteal} LoRA\hspace{5mm}}};
+\draw[arr] (input) -- (llm);
+
+% ------------------------------------------------ output prose (right)
+\node[draw=deepteal, line width=1.0pt, rounded corners=2.5pt, fill=white,
+      right=7mm of llm, align=left, inner sep=4pt, font=\scriptsize,
+      text width=54mm]
+  (prose)
+  {This source presents as a catalogued main-sequence dwarf. Catalog values:
+   spectroscopic Teff 6485 K; stellar log g 4.07 $(+0.03/{-}0.04)$; reported age
+   (derived from isochrone) 2.1 Gyr. This star's [Fe/H] falls in the
+   above-median quartile of the Kepler field.};
+\node[dnote, anchor=north] at ($(prose.south)+(0,-1mm)$) {\textbf{prose}};
+\draw[arr] (llm) -- (prose);
+
+% ------------------------------------------------ icons: trained / frozen
+\pic at ($(feat.north east)+(-0.6mm,-0.6mm)$)  {snow};
+\pic at ($(adapt.north east)+(-0.6mm,-1.0mm)$) {flame};
+\pic at ($(llm.north east)+(-0.6mm,-0.6mm)$)   {snow};
+\pic at ($(llm.south)+(4.6mm,3.6mm)$)          {flame};
+
+% ------------------------------------------------ legend
+\node[dnote, anchor=north west] (leg) at ($(feat.south west)+(0,-2.0mm)$) {};
+\pic at ($(leg.north west)+(2.0mm,-1.8mm)$) {flame};
+\node[dnote, anchor=west] at ($(leg.north west)+(5.0mm,-1.8mm)$) {trained};
+\pic at ($(leg.north west)+(21.0mm,-1.8mm)$) {snow};
+\node[dnote, anchor=west] at ($(leg.north west)+(24.0mm,-1.8mm)$) {frozen};
+
+\end{tikzpicture}}

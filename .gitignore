@@ -12,7 +12,7 @@ data/dataset_noiseless.tar.gz
 data/dataset_noiseless/
 data/dataset/
 cache/
-figs/
+/figs/
 papers/
 diagrams/
 concepts_v2/
@@ -51,3 +51,16 @@ data/stellar_topology_neighbors.json
 data/stellar_topology_questions.json
 data/stellar_topology_questions_small.json
 data/stellar_topology_neighbors_small.json
+
+# LaTeX build outputs
+*.aux
+*.bbl
+*.blg
+*.log
+*.fls
+*.fdb_latexmk
+*.synctex.gz
+*.toc
+*.lof
+*.lot
+paper/main.pdf
