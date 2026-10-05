@@ -23,15 +23,19 @@ points between individual cells --- particularly in \Cref{tab:basemodel} --- are
 within the noise we cannot measure. The claims rest on the pattern across cells
 and on effects large enough that a seed is not a plausible explanation.
 
-\paragraph{The stellar gain is only partly attributed.} The stellar head
-narrator differs from the narrator without the head in its training (LoRA instead
-of full fine-tuning) as well as in the token. Breaking the token in the trained
-model shows that its content is worth $0.06$--$0.10$ of the $0.33$ gain; the rest
-cannot be separated from the change in training without a stellar narrator trained
-with LoRA and no head token ($\sim$700--1{,}100 GPU-hours, not yet run). On
-galaxies, where we ran this control, the training change alone accounts for the
-whole gain (\Cref{tab:2x2}), so the same could be true in part for stars.
+\paragraph{The stellar gain is not yet attributed to the head.} The stellar
+head narrator differs from the narrator without the head in its training (LoRA
+instead of full fine-tuning) as well as in the token. Separating the two requires
+a stellar narrator trained with LoRA and no head token, about $2{,}000$ GPU-hours
+for $20$ epochs and about $5{,}000$ to match the head narrator's $50$; it has not
+been run. On galaxies, where we ran this control, the training change alone
+accounts for the whole gain (\Cref{tab:2x2}), so the same could be true, at least
+in part, for stars. The same control would show whether the head narrator's
+stability across group sizes (\Cref{fig:groupsize}) comes from the head or from
+the training.
 
+% Set aside with Section 4.3 (token ablations):
+\iffalse
 \paragraph{We can show the token is used, not how.} The ablations establish that
 the token's contents are read (\Cref{tab:ablate}), but not the mechanism. Two
 things remain unexplained. When the head's own top pick is wrong, the narrator
@@ -41,6 +45,7 @@ re-sampling --- eight of eleven have a run-to-run spread comparable to their
 spread across objects --- so the information the narrator uses is probably
 carried by the few channels that are stable, not by the token as a whole. We
 report the effect; we do not claim to have explained it.
+\fi
 
 \paragraph{The judge is an LLM, not a human.} Population records are scored by the
 judge, a $27$B model. It agrees closely with the independent rule-based verifier, which
