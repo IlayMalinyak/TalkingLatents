@@ -64,7 +64,7 @@ an open question, and it is the question we study here.
 \textbf{Contribution.}
 We connect frozen survey encoders to an 8B language model through a trained
 projector, adapting the language model itself with either LoRA or full fine-tuning, and evaluate it on two independent astrophysical datasets (Kepler-field stars,
-COSMOS-Web galaxies) across per-object and pairwise questions, and on a relational
+COSMOS-Web galaxies) across per-object and pairwise questions, and on a more challenging 
 question for each: the odd member of a set of stars, and the agreement between two
 views of a single galaxy.
 %
@@ -74,18 +74,15 @@ scientific reasoning tasks --- identifying the anomalous member of a group of st
 recognising when a galaxy's morphology and star-formation history disagree --- where it
 performs at or below chance. A probe on the underlying representation recovers most of
 that signal in both cases, so the failure is one of computation rather than
-representation; and for the stellar task, supplying the same catalog values as text in
+representation. For the stellar task, supplying the same catalog values as text in
 the prompt leaves the model at chance once its verbosity is corrected for, while
 prompting it to reason through the objects first lifts it off chance but not to the level
 the tokens already reach.
 %
-\emph{Second}, we show that performing the set-level computation outside the model and
-returning it as a single extra token recovers the ability: $+0.33$ on outlier
-identification over the full test fold, and $+0.47$ on an adversarial split where the
-odd member was never an odd member during training. Scrambling or zeroing the token's
-contents costs significantly on every axis but coverage.
+\emph{Second}, we show that performing the computation outside the model and
+returning it as a single extra token recovers the ability.
 %
-\emph{Third}, the head must match the question. A density-based head recovers rarity
+\emph{Third}, the computation must match the question. A density-based head recovers rarity
 among stars but is at chance on cross-modal agreement among galaxies, where a
 discriminative cross-modal predictor works instead. 
 %

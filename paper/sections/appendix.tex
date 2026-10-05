@@ -42,16 +42,14 @@ metal rich / poor & 0.373 \emph{vs} 0.412 & 0.725 \emph{vs} 0.941 \\
 \end{tabular}
 \end{table}
 
-The probe matches the catalog at rank-1 and keeps $89$--$95\%$ of it at top-3;
-on the gravity axis it is ahead of the catalog. The information the group task
-needs is in the features.
+The probe matches the catalog at rank-1 and keeps $89$--$95\%$ of it at top-3. The information for this task is therefore in the features.
 
 The catalog row is not a ceiling on the task. It bounds what a \emph{single
 ranked quantity} can do, and it falls short of $1.0$ because the label is a
 threshold test (``$[\mathrm{Fe/H}] > 0.3$'') while a ranking is a distance test:
 a star can sit far from the group median without crossing the threshold. A
-readout that models the group jointly --- the head of
-\Cref{tab:headboth} --- is not bound by it.
+readout that models the group jointly, the head of
+\Cref{tab:headboth}, is not bound by it.
 
 Scoring the narrators by the same rule, crediting any equally-qualifying star,
 raises both arms and leaves the head's lead intact: $+0.361 \to +0.318$
@@ -90,3 +88,53 @@ quote marginal AUC here. Only the arm with the token is above chance in both
 strata. We take this as evidence, by analogy, for the stellar track as well,
 where the equivalent control would cost $\sim$700--1{,}000 GPU-hours and was
 not run.
+
+
+\subsection{Computation to match the question}
+The two computation heads are not interchangeable. This is expected, and we demonstrate it by using a flow matching head in the galaxy dataset
+
+\Cref{tab:wronghead} shows why we abandoned it. For each axis we compare the
+density head reading the full galaxy features against the \emph{same} head given
+only the catalog labels. If the features carried usable signal for this head,
+the first column should beat the second. On eight of the nine axes it is worse,
+including the cross-modal axis this paper cares about ($0.589$ against
+$0.662$). The features are not adding anything the head can use.
+
+\begin{table}[h]\centering\small
+\caption{\textbf{The wrong head on galaxies.} AUC for ranking the odd member of
+a group ($400$ populations, test fold), for a density head reading the full
+aligned features vs.\ the same head given only catalog labels. Negative gain
+means the features make it worse.}
+\label{tab:wronghead}
+\begin{tabular}{lccc}
+\toprule
+axis & features & labels only & gain \\
+\midrule
+morphology--SFH mismatch & 0.589 & 0.662 & $-0.073$ \\
+S\'ersic shape           & 0.477 & 0.915 & $-0.438$ \\
+quenching                & 0.588 & 0.902 & $-0.314$ \\
+redshift                 & 0.462 & 0.725 & $-0.263$ \\
+age                      & 0.435 & 0.624 & $-0.189$ \\
+mass                     & 0.687 & 0.844 & $-0.157$ \\
+SFH trend                & 0.567 & 0.680 & $-0.113$ \\
+cluster member           & 0.508 & 0.557 & $-0.049$ \\
+disturbed                & 0.544 & 0.527 & $+0.017$ \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\textbf{What it says.} This is not a broken model or a useless representation:
+the \emph{same} galaxy features, read by a cross-modal predictor instead of a
+density model, support the task at $0.628$ (\Cref{tab:headboth}). What changed
+is the question the head asks. A density model scores \emph{rarity} --- how
+unlikely is this object. The galaxy question is \emph{disagreement} --- does the
+image agree with the star-formation history. A star-forming spheroid is a
+perfectly ordinary galaxy that happens to sit on the wrong side of a boundary,
+so it is not rare, and a likelihood cannot see it however well it is trained.
+The stellar anomalies, by contrast, genuinely are rare.
+
+So the recipe is not ``attach a head''. It is ``attach a head that computes the
+quantity the question turns on''. Deciding which one that is --- rarity, or
+agreement between two views --- is a modelling choice made before any training,
+and getting it wrong costs everything: the same pipeline, the same data and the
+same narrator produce a result at chance.
