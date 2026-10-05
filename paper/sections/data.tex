@@ -17,7 +17,7 @@ We test two different astrophysical datasets, representing different domains and
 writes prose. Every sentence is checked against the record by the verifier before it enters the corpus. The
 check is per-fact: it guarantees that the facts a description states are true of the object, not
 that the description mentions every unusual object in a group. Both datasets share two types of prose: description of a single object (single), and comparison between pairs (pair). We also test deeper reasoning capabilities with two additional tasks. In the stellar dataset we use population prose: a group of $N$ objects with description of the typical members, and a callout
-of the one that does not belong and on which property. In the galaxy dataset we are interested in non trivial cross modal correlation and check if the model highlight those in the prose. In~\Cref{sec:results} we compare the template-based method with a second method: an \emph{LLM-based} generation, where the writer produces the population prose from the same catalog facts, and every claim is verified.
+of the one that does not belong and on which property. In the galaxy dataset, the task is to judge whether a galaxy's shape agrees with its star-formation history, a relation between its two modalities. In~\Cref{sec:results} we compare the template-based method with a second method: an \emph{LLM-based} generation, where the writer produces the population prose from the same catalog facts, and every claim is verified.
 
 \textbf{Objects, facts and descriptions.} The stellar set has $190{,}091$
 stars, of which we evaluate on a held-out set of $19{,}010$. Because every star is
@@ -80,7 +80,19 @@ oversampled to $33\%$.
   \label{fig:example}
 \end{figure*}
 
-\textbf{Training recipe.} To improve the diversity of the data and reduce overfitting, we train with one fixed recipe of three ingredients: (i) a cosine learning-rate schedule with label smoothing ($0.05$); (ii) a more varied mixture of training prompts, with more multi-object prompts and longer context; and (iii) filler text around the data tokens, $30\%$ of which are real sentences from astrophysics papers on arXiv ($64{,}726$ sentences, filtered so that none states a relation between two properties we later test). The filler applies to the single and pair records; population records are presented as the data tokens alone. We treat the three as a single recipe: it was tuned once on the galaxy data and reused unchanged for stars. \Cref{app:recipe} compares it against training without it.
+\textbf{Training recipe.} A narrator trained on templated text can learn to
+reproduce the templates instead of reading the data. We counter this with two
+changes to the input. First, we vary its format: an object's data tokens appear
+alone, after a question or a short passage, separated from the description by
+intervening text, or among the tokens of several other objects together with a
+request to describe one of them. Second, part of the intervening text consists of
+real sentences from astrophysics papers, filtered so that none states a relation
+between properties we later test. The two are needed together
+(\Cref{app:recipe}). Varying the format alone improves accuracy but makes the
+narrator copy training descriptions almost verbatim; adding the paper sentences
+removes that copying, and accuracy improves further. Population records are always
+presented as the data tokens alone. The recipe was chosen on the galaxy data and
+reused unchanged for stars.
 
 
 \begin{figure}[h]

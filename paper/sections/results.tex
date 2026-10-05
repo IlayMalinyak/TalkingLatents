@@ -1,28 +1,24 @@
 \section{Results}\label{sec:results}
 \subsection{singles and pair questions}
 We first test the single and pair questions, comparing two types of Llama-8B models: Llama-3.1 and AstroSage \citep{haan2025_astrosage}, a Llama-3.1 model that was fine-tuned specifically on arXiv astrophysics papers.~\Cref{tab:basemodel} shows the comparison on both datasets. Single and pair descriptions are scored by the verifier, which extracts every numeric and categorical claim from the generated text and checks it against the catalog: \emph{numeric accuracy} is the fraction of stated values within a per-quantity tolerance of the catalog value, and \emph{qualitative} (single) or \emph{relational} (pair) accuracy is the fraction of class words or comparisons that match it (tolerances and definitions in \Cref{app:eval}). While both models show high performance on both tasks, Astrosage retains a small gain over the vanilla model in seven of the eight cells, across both datasets, which implies that textual domain knowledge is helpful for those tasks. Therefore, the Astrosage model was chosen for further analysis. 
-\subsection{scientific reasoning tasks} Single and pair questions consists of description and simple comparisons and requires almost no reasoning beyond the basic properties. It is also similar to the protein description tasks as in  \cite{Dotan2026_betadescribe}, and therefore it is not surprising that an LLM performs well on such questions. Next, we test the performance on questions that requires some form of scientific reasoning. As mentioned in~\Cref{sec:data}, those are anomaly detection for the stellar dataset and irregular morphology-SFH correlation in the galaxy dataset.~\Cref{tab:headboth} shows the results of those two tasks. The \emph{narrator} column is the narrator alone, reading only the data tokens, and its performance is poor. Before adding anything to the model, we check whether this is a failure of information. A cross-fit linear probe on the same aligned features, asked to rank the members of a group, matches what the true catalog values achieve (rank-1 $0.660$ from the shared subspace and $0.686$ from the full feature, against $0.660$ for the catalog itself; \Cref{sec:appendix}). The signal the task needs is present in the features the model reads, so the failure is in the readout and not in the representation. The \emph{+ head} column adds the head token (\Cref{sec:data}). In the stellar case the head is a flow matching model that was trained to learn the joint distribution of the aligned features and catalog labels, conditioned on the rest of the group. In the galaxy case, this is a cross-modal predictor that is trained to predict one modality from the other. We note that adding this single token significantly improves the performance on both tasks. 
+\subsection{scientific reasoning tasks} Single and pair questions consists of description and simple comparisons and requires almost no reasoning beyond the basic properties. It is also similar to the protein description tasks as in  \cite{Dotan2026_betadescribe}, and therefore it is not surprising that an LLM performs well on such questions. Next, we test the performance on questions that requires some form of scientific reasoning. As mentioned in~\Cref{sec:data}, those are finding the odd member of a group of stars, and judging whether a galaxy's shape agrees with its star-formation history.~\Cref{tab:headboth} shows the results of both tasks. The two tasks behave differently. On stars, the narrator alone, reading only the data tokens, fails: it names the odd member and its property in only a third of the groups. On galaxies, the narrator alone succeeds: trained with LoRA, it gives the right verdict for $97$--$99\%$ of galaxies, and even fully fine-tuned for $88$--$98\%$. Before adding anything to the stellar narrator, we check whether its failure is a failure of information. A cross-fit linear probe on the same aligned features, asked to rank the members of a group, matches what the true catalog values achieve (rank-1 $0.660$ from the shared subspace and $0.686$ from the full feature, against $0.660$ for the catalog itself; \Cref{sec:appendix}). The signal the task needs is present in the features the model reads, so the failure is in the readout and not in the representation. The last column of \Cref{tab:headboth} adds the head token (\Cref{sec:data}). In the stellar case the head is a flow matching model that was trained to learn the joint distribution of the aligned features and catalog labels, conditioned on the rest of the group. In the galaxy case, it is a cross-modal predictor trained to predict one modality from the other. On stars, the head narrator doubles the score ($0.33 \to 0.66$). On galaxies, it is no better than a narrator trained the same way without the token. We discuss what each gain can be attributed to in \Cref{sec:tokenortraining}.
 
-\textbf{Scoring the galaxy task.}\label{sec:galaxyscore} The galaxy question is
-whether a galaxy's shape agrees with its star-formation history, and the test set
-is imbalanced in a way that decides how this must be scored. Disagreement means
-opposite things for the two kinds of galaxies: a \emph{spheroid} that is still
-forming stars, or a \emph{disk} that has stopped forming them (a quiescent
-galaxy). Because $90\%$ of the galaxies are star-forming, a narrator that looks
-only at the shape and learns ``spheroid $\Rightarrow$ disagreement'' is right on
-the star-forming majority, backwards on the quiescent minority, and still looks
-good on the sample as a whole. Checking whether the text states the right
-verdict does not catch this: trained on the same text, the narrator without the
-head token gives the right verdict for $92.3\%$ of the disagreeing galaxies and
-the one with it for $97.3\%$. We therefore score each galaxy by the narrator's own
-confidence --- the log-probability that it opens its description by flagging the
-galaxy as unusual rather than describing it as typical, with no fitted weights
---- and compute the AUC separately on star-forming and on quiescent galaxies. We
-report the lower of the two, the \emph{worst-case AUC} ($0.50$ = chance), so a
-narrator scores well only if it is right on both kinds. \Cref{fig:concordance}
-shows why this matters. On star-forming galaxies every narrator is high; on
-quiescent galaxies the two narrators without the head token are at or below
-chance, and only the one with it is above.
+A plausible reason for the difference between the tasks is what each one asks. The galaxy verdict concerns a single object and follows from two of its own properties, its shape and whether it still forms stars, which the narrator can read from that galaxy's tokens; the training text also states the rule in every description (e.g., ``spheroids are typically quiescent''). Finding the odd star requires comparing every member with the rest of the group, a computation over the whole set that no single star's tokens contain.
+
+\textbf{Scoring the galaxy task.}\label{sec:galaxyscore} We read three statements
+from each galaxy description: the galaxy's shape (disk or spheroid), whether it
+still forms stars, and the verdict, i.e., whether the description calls the two in
+agreement. Each is read with a short list of words. For the verdict, ``mismatch'',
+``disagree'', ``outlier'' or ``unusual'' mark disagreement, and ``concordant'',
+``in accord'', ``concur'' or ``agree'' mark agreement. In the training text these
+words are exact: every description containing a disagreement word belongs to a
+disagreeing galaxy, and every one containing an agreement word to an agreeing
+galaxy (\Cref{app:eval}). We report the fraction of galaxies with the correct
+verdict, separately for star-forming and quiescent galaxies. The split matters
+because $90\%$ of the test galaxies are star-forming, and the errors concentrate in
+the quiescent minority, where a narrator must notice that a galaxy has stopped
+forming stars. Whenever a narrator's verdict is right, its stated shape and
+star-formation state are also right in more than $99.9\%$ of cases.
 
 \begin{table}[h]\centering\small
 \caption{\textbf{Base model: Llama-3.1-8B vs.\ AstroSage-8B}, identical
@@ -57,45 +53,34 @@ the catalog; \emph{relational acc.} (pair) = fraction of comparisons
 
 
 \begin{table}[h]\centering\small
-\caption{\textbf{The head fixes the reasoning task on both datasets.} Each
-block compares the narrator with and without the head token. Stars: does the text
-name the true odd member \emph{and} its property, over the $1{,}203$ test groups
-that contain one, scored by the verifier and by the judge; the two independent
-scorers agree on the size and direction of the effect. Galaxies: worst-case AUC
-(\Cref{sec:galaxyscore}) for separating the $1{,}484$ test galaxies whose
-morphology and SFH disagree from the $9{,}193$ where they agree. The two galaxy
-rows are two controls, not two scorers: a narrator trained without the token
-(top), and the head narrator with its token scrambled at test time (bottom).
-Numbers are comparable \emph{within} a block only.}
+\caption{\textbf{The reasoning tasks.} Each row is one task and scorer; the
+columns are narrators that differ in how they were trained and whether they read
+the head token. Stars: the fraction of the $1{,}203$ test groups with an odd member
+in which the text names it \emph{and} its property, scored by the verifier and by
+the judge, which agree on the size of the effect. Galaxies: the fraction of test
+galaxies with the correct agreement verdict (\Cref{sec:galaxyscore}), on the
+$9{,}609$ star-forming and $1{,}068$ quiescent galaxies. The stellar narrator
+trained with LoRA and no head token was not run (\Cref{sec:tokenortraining}).}
 \label{tab:headboth}
 \begin{tabular}{llccc}
 \toprule
-dataset --- task & scorer & narrator & $+$ head & $\Delta$ \\
+ & & \multicolumn{2}{c}{narrator, no head token} & narrator $+$ head \\
+\cmidrule(lr){3-4}
+task & scorer & full fine-tune & LoRA & LoRA \\
 \midrule
-\emph{stars} --- name the odd member      & verifier & 0.245 & \textbf{0.633} & $+0.388$ \\
-\hspace{1em}and its property              & judge    & 0.332 & \textbf{0.662} & $+0.330$ \\
+\emph{stars} --- name the odd member  & verifier & 0.245 & --- & \textbf{0.633} \\
+\hspace{1em}and its property          & judge    & 0.332 & --- & \textbf{0.662} \\
 \midrule
-\emph{galaxies} --- does shape   & worst-case AUC & 0.442 & \textbf{0.628} & $+0.186$ \\
-\hspace{1em}agree with history?           & worst-case AUC & 0.461 & \textbf{0.628} & $+0.167$ \\
+\emph{galaxies} --- shape vs.\ history, & star-forming & 0.980 & \textbf{0.988} & 0.986 \\
+\hspace{1em}correct verdict             & quiescent    & 0.884 & 0.974 & \textbf{0.978} \\
 \bottomrule
 \end{tabular}
 \end{table}
 
-\begin{figure}[h]
-  \centering
-  \includegraphics[width=0.85\linewidth]{figs/concordance_imbalance.pdf}
-  \caption{\textbf{Why the galaxy task is scored separately on star-forming
-  and quiescent galaxies.} Mismatch AUC of the three galaxy narrators
-  (\Cref{app:2x2}), all trained on the same text. Error bars are $95\%$
-  bootstrap intervals. A mismatch is a spheroid among star-forming galaxies and a
-  disk among quiescent ones, so reading the shape alone wins the $90\%$
-  star-forming majority and is backwards on the quiescent minority. Below the
-  dashed line the score is anti-correlated with mismatch.}
-  \label{fig:concordance}
-\end{figure}
 
 
-\subsection{is it the token, or the training that came with it?}
+
+\subsection{is it the token, or the training that came with it?}\label{sec:tokenortraining}
 The narrators with and without the head are two separately trained models, and
 they differ in more than the token: the head narrator is trained with LoRA on a
 frozen base model, while the narrator without it is fully fine-tuned. The gain in
@@ -128,22 +113,32 @@ head narrator, token intact      & \textbf{0.662}  \\
 \end{table}
 
 Breaking the token costs the same model $0.056$ (scrambled) to $0.101$ (zeroed),
-both significant, so what the token contains is read and used. The galaxy
-narrator shows the same: scrambling its token drops its worst-case AUC from
-$0.628$ to $0.461$ (\Cref{tab:headboth}). Even with a broken token, however, the
-stellar head narrator stays far above the narrator trained without one ($0.561$
-against $0.332$). A zeroed token carries no information about the group, so this
-gap is a difference between the two trained models, not something the token
-supplies at test time. It reflects how the head narrator was trained (LoRA on a
-frozen base instead of full fine-tuning, and alongside a head token), and a
-test-time ablation cannot tell these apart. To separate them, we trained a
-galaxy narrator with LoRA and no head token. Its worst-case AUC is $0.498$
-($[0.462, 0.535]$, indistinguishable from chance), against $0.442$ for the fully
-fine-tuned narrator and $0.628$ with the token (\Cref{fig:concordance},
-\Cref{app:2x2}). On galaxies, then, LoRA training alone does not produce the
-ability; the token does. The stellar equivalent would cost
-$\sim$700--1{,}000 GPU-hours and was not run. For stars, the token's content
-accounts for $0.06$--$0.10$ of the $0.33$ gain, and we do not attribute the rest.
+both significant, so what the token contains is read and used. Even with a broken
+token, however, the head narrator stays far above the narrator trained without
+one ($0.561$ against $0.332$). A zeroed token carries no information about the
+group, so this gap is a difference between the two trained models, not something
+the token supplies at test time: it comes from how the head narrator was trained
+(LoRA on a frozen base instead of full fine-tuning, and alongside a head token),
+and a test-time ablation cannot tell these apart.
+
+On galaxies we ran the missing control: a narrator trained with LoRA and
+\emph{no} head token (\Cref{tab:headboth}, \Cref{app:2x2}). It matches the head
+narrator on quiescent galaxies ($0.974$ against $0.978$, not significant) and is
+slightly better on star-forming ones ($0.988$ against $0.986$). The full
+fine-tune is the outlier: on quiescent galaxies it gives the wrong verdict for
+$12\%$ of them, mostly because it misreads whether the galaxy still forms stars
+($9\%$ of quiescent galaxies). On galaxies,
+then, the gain over the fully fine-tuned narrator comes from the training, not from
+the token. The galaxy narrator does read its token, since scrambling it costs a
+little on star-forming galaxies ($0.986 \to 0.978$), but the token adds nothing
+the data tokens do not already provide; this is expected, since the galaxy head is
+computed from the same image and star-formation embeddings the narrator reads.
+
+For stars, the same control would require training a stellar narrator with LoRA
+and no head token, about $700$--$1{,}100$ GPU-hours, which we have not yet done.
+Until then, the stellar evidence supports a narrower claim: the head token's
+content is worth $0.06$--$0.10$ of the $0.33$ gain, and the remaining $0.23$
+coincides with a change in training that we cannot yet separate from the token.
 
 \subsection{is this reasoning, or memorization?}\label{sec:memorization}
 As described in \Cref{sec:data}, $99.2\%$ of the stars we evaluate on appear in

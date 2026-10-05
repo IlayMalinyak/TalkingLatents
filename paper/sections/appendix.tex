@@ -55,115 +55,100 @@ Scoring the narrators by the same rule, crediting any equally-qualifying star,
 raises both narrators and leaves the head's lead intact: $+0.361 \to +0.318$
 ($n{=}1{,}203$ groups, $p{=}6\times10^{-85}$).
 
-\subsection{The regime control: same prose, same LoRA, no token}\label{app:2x2}
-The head narrators are trained with LoRA on a frozen base while the narrators
-without a head are full fine-tunes, so ``head vs.\ no head'' is also ``LoRA vs.\
-full fine-tune''.
-We closed that on the galaxy track, where one cell costs $\sim$10 GPU-hours: a
-narrator trained on the \emph{same} concordance prose, with the \emph{same} LoRA
-rank and schedule as the head narrator, and no head token. It is one variable
-away from the head narrator.
+\subsection{The galaxy narrators: token or training?}\label{app:2x2}
+The galaxy head narrator differs from the fully fine-tuned narrator in two ways:
+it reads the head token, and it is trained with LoRA on a frozen base. To separate
+the two, we trained a third narrator on the \emph{same} text with the \emph{same}
+LoRA settings and no head token, and we also ran the head narrator with its token
+scrambled at test time (each galaxy receives the head token of another test
+galaxy). All four narrators describe the same $10{,}677$ test galaxies, decoded
+greedily, and are scored as in \Cref{sec:galaxyscore}.
 
 \begin{table}[h]\centering\small
-\caption{\textbf{The complete $2\times2$}, galaxy agreement task, worst-case
-AUC (\Cref{sec:galaxyscore}; $0.50$ = chance; brackets are $95\%$ intervals on
-the quiescent galaxies). A score above $0.5$ on \emph{both} star-forming and
-quiescent galaxies means the narrator detects disagreement; below it, the
-narrator is reading the shape alone.}
+\caption{\textbf{Galaxy agreement task, four narrators.} Fraction of test
+galaxies with the correct verdict. $p$-values are exact McNemar tests on the same
+galaxies, against the LoRA narrator with the head token.}
 \label{tab:2x2}
-\begin{tabular}{lccc}
+\begin{tabular}{lcc}
 \toprule
- & full fine-tune & LoRA & read \\
+ & star-forming ($9{,}609$) & quiescent ($1{,}068$) \\
 \midrule
-no token  & 0.442 [0.409,0.477] & 0.498 [0.462,0.535] & shape only \\
-$+$ head token & ---                 & \textbf{0.628} [0.593,0.665] & disagreement \\
+full fine-tune, no head token          & 0.980 ($p{=}5{\times}10^{-6}$) & 0.884 ($p{=}2{\times}10^{-23}$) \\
+LoRA, no head token                    & \textbf{0.988} ($p{=}0.002$) & 0.974 ($p{=}0.50$) \\
+LoRA $+$ head token                    & 0.986 & \textbf{0.978} \\
+LoRA $+$ head token, scrambled         & 0.978 ($p{=}3{\times}10^{-9}$) & 0.972 ($p{=}0.34$) \\
 \bottomrule
 \end{tabular}
 \end{table}
-
-Neither training regime detects disagreement on its own: both narrators without
-the token sit at chance on quiescent galaxies, and the LoRA narrator's interval
-contains $0.5$. The fully fine-tuned narrator is in fact the more confident
-shortcut learner: over all galaxies together it posts the highest AUC in the
-study ($0.885$) while scoring $0.442$ on quiescent galaxies, which is why we never
-quote the all-galaxy AUC. Only the narrator with the token is above chance on
-both kinds. We take this as evidence, by analogy, for the stellar track as well,
-where the equivalent control would cost $\sim$700--1{,}000 GPU-hours and was
-not run.
-
-
-\subsection{Computation to match the question}
-The two computation heads are not interchangeable. This is expected, and we demonstrate it by using a flow matching head in the galaxy dataset
-
-\Cref{tab:wronghead} shows why we abandoned it. For each axis we compare the
-density head reading the full galaxy features against the \emph{same} head given
-only the catalog labels. If the features carried usable signal for this head,
-the first column should beat the second. On eight of the nine axes it is worse,
-including the cross-modal axis this paper cares about ($0.589$ against
-$0.662$). The features are not adding anything the head can use.
-
-\begin{table}[h]\centering\small
-\caption{\textbf{The wrong head on galaxies.} AUC for ranking the odd member of
-a group ($400$ populations, test fold), for a density head reading the full
-aligned features vs.\ the same head given only catalog labels. Negative gain
-means the features make it worse.}
-\label{tab:wronghead}
-\begin{tabular}{lccc}
-\toprule
-axis & features & labels only & gain \\
-\midrule
-morphology--SFH mismatch & 0.589 & 0.662 & $-0.073$ \\
-S\'ersic shape           & 0.477 & 0.915 & $-0.438$ \\
-quenching                & 0.588 & 0.902 & $-0.314$ \\
-redshift                 & 0.462 & 0.725 & $-0.263$ \\
-age                      & 0.435 & 0.624 & $-0.189$ \\
-mass                     & 0.687 & 0.844 & $-0.157$ \\
-SFH trend                & 0.567 & 0.680 & $-0.113$ \\
-cluster member           & 0.508 & 0.557 & $-0.049$ \\
-disturbed                & 0.544 & 0.527 & $+0.017$ \\
-\bottomrule
-\end{tabular}
-\end{table}
-
-\textbf{What it says.} This is not a broken model or a useless representation:
-the \emph{same} galaxy features, read by a cross-modal predictor instead of a
-density model, support the task at $0.628$ (\Cref{tab:headboth}). What changed
-is the question the head asks. A density model scores \emph{rarity} --- how
-unlikely is this object. The galaxy question is \emph{disagreement} --- does the
-image agree with the star-formation history. A star-forming spheroid is a
-perfectly ordinary galaxy that happens to sit on the wrong side of a boundary,
-so it is not rare, and a likelihood cannot see it however well it is trained.
-The stellar anomalies, by contrast, genuinely are rare.
-
-So the recipe is not ``attach a head''. It is ``attach a head that computes the
-quantity the question turns on''. Deciding which one that is --- rarity, or
-agreement between two views --- is a modelling choice made before any training,
-and getting it wrong costs everything: the same pipeline, the same data and the
-same narrator produce a result at chance.
-
-
-\subsection{The training recipe}\label{app:recipe}
-\Cref{fig:recipe} compares a narrator trained with the full recipe of
-\Cref{sec:data} (cosine schedule with label smoothing, varied prompts and arXiv
-filler, applied together) against the same narrator trained with none of the three
-ingredients (constant learning rate, no label smoothing, the original prompt
-mixture, no arXiv filler). Both use the
-galaxy corpus, Llama-3.1-8B, and the same seed. We evaluate the recipe as a single unit and do not report its ingredients separately.
-The recipe raises every accuracy, and its largest effect is on memorization:
-without it, $85\%$ of single-object descriptions copy a training template
-verbatim (defined in \Cref{app:eval}); with it, $46\%$ do.
 
 \begin{figure}[h]
   \centering
-  \includegraphics[width=\linewidth]{figs/recipe_ablation.pdf}
-  \caption{\textbf{Training recipe}, galaxies, Llama-3.1-8B, greedy,
-  rule-scored. \emph{Grounded} $=1-$ the fraction of claims not supported by
-  the record; \emph{novel phrasing} $=1-$ the fraction of generated descriptions that
-  copy a training description (\Cref{app:eval}). The \emph{full recipe} bars are the
-  Llama-3.1-8B galaxy column of \Cref{tab:basemodel}.}
-  \label{fig:recipe}
+  \includegraphics[width=0.8\linewidth]{figs/agreement_verdicts.pdf}
+  \caption{\textbf{Galaxy agreement task}, the numbers of \Cref{tab:2x2}. Error
+  bars are $95\%$ intervals.}
+  \label{fig:agreement}
 \end{figure}
 
+Three things follow. First, the LoRA narrator without the head token is as good
+as the one with it: indistinguishable on quiescent galaxies and slightly better
+on star-forming ones. Second, the fully fine-tuned narrator is clearly worse on
+quiescent galaxies; most of its errors there come from stating that a quiescent
+galaxy still forms stars. Third, scrambling the head narrator's token costs it a
+little on star-forming galaxies, so the narrator does read the token, but the
+information it carries is already available from the data tokens. On galaxies,
+the improvement over the fully fine-tuned narrator therefore comes from the
+training, not from the head token. The stellar equivalent of this control was not
+run (\Cref{sec:tokenortraining}).
+
+\subsection{The training recipe}\label{app:recipe}
+\Cref{tab:recipe} tests the two input changes of \Cref{sec:data} on the galaxy
+data with Llama-3.1-8B. \emph{Novel phrasing} is the fraction of generated
+descriptions that do not copy a training description (\Cref{app:eval}); low
+values mean the narrator recites the templates.
+
+The upper block adds the components one at a time on a $95$k-record subset,
+with everything else fixed. Varying the input format raises accuracy on single
+objects, but the narrator starts reciting its training text: novel phrasing
+falls from $0.40$ to $0.18$ on single objects and from $0.42$ to $0.04$ on pairs,
+and pair accuracy drops. Adding the paper sentences reverses this (novel
+phrasing $0.39$ and $0.68$) and gives the highest accuracy on every metric.
+
+The lower block, on the full $288$k-record corpus, adds the paper sentences
+\emph{without} varying the format. On single objects this does not help: accuracy
+is unchanged and copying increases (novel phrasing $0.15 \to 0.06$). Pairs do
+improve. This comparison differs from the upper block in corpus size, learning-rate
+schedule and the share of intervening text taken from papers, so we read it only
+as consistent with the claim that the paper sentences help when the input format
+is varied. A one-variable test of the paper sentences without varied formats is
+in progress.
+
+\begin{table}[h]\centering\small
+\caption{\textbf{Training recipe}, galaxies, Llama-3.1-8B, greedy, scored by the
+verifier. \emph{num.}: numeric accuracy; \emph{qual.}/\emph{rel.}: qualitative
+(single) or relational (pair) accuracy; \emph{novel}: novel phrasing. Upper
+block: cosine learning-rate schedule with label smoothing in every row. Lower
+block: the first two rows use a constant learning rate and no label smoothing;
+the last row is the full recipe used throughout the paper. Blocks are not
+comparable with each other.}
+\label{tab:recipe}
+\begin{tabular}{lcccccc}
+\toprule
+ & \multicolumn{3}{c}{single object} & \multicolumn{3}{c}{pair} \\
+\cmidrule(lr){2-4}\cmidrule(lr){5-7}
+ & num. & qual. & novel & num. & rel. & novel \\
+\midrule
+\multicolumn{7}{l}{\emph{$95$k-record subset}}\\
+baseline                         & 0.604 & 0.776 & 0.404 & 0.650 & 0.731 & 0.419 \\
+$+$ varied formats               & 0.686 & 0.807 & 0.180 & 0.560 & 0.695 & 0.043 \\
+$+$ varied formats $+$ papers    & \textbf{0.710} & \textbf{0.817} & 0.386 & \textbf{0.618} & \textbf{0.750} & \textbf{0.682} \\
+\midrule
+\multicolumn{7}{l}{\emph{full corpus ($288$k records)}}\\
+baseline                         & 0.687 & 0.748 & 0.151 & 0.607 & 0.622 & 0.268 \\
+$+$ papers only                  & 0.670 & 0.758 & 0.060 & \textbf{0.661} & \textbf{0.806} & \textbf{0.631} \\
+full recipe                      & \textbf{0.822} & \textbf{0.812} & \textbf{0.537} & 0.647 & 0.795 & 0.355 \\
+\bottomrule
+\end{tabular}
+\end{table}
 
 \subsection{Evaluation}\label{app:eval}
 \textbf{Rule-based verifier (single and pair records).} A deterministic program
@@ -234,5 +219,40 @@ than the verifier: of the numeric contradictions it lists that we could parse, $
 the verifier's tolerance. Its contradiction counts are therefore an upper bound,
 and they inflate more for a narrator that states more numbers.
 
-\textbf{Galaxy agreement task.} Scored by worst-case AUC over star-forming and
-quiescent galaxies (\Cref{sec:galaxyscore}).
+\textbf{Galaxy agreement task.} Each description is reduced to three statements,
+read with fixed word lists taken from the nine single-galaxy templates of the
+training text. \emph{Shape}: ``late-type disk'' or ``early-type disk'' (disk),
+``elliptical'' or ``lenticular'' (spheroid); general phrases that state the rule,
+such as ``spheroidal systems'', are ignored. \emph{Star formation}: the first of
+``star-forming'' or ``still forming stars'' (star-forming) and ``quiescent'' or
+``has quenched'' (quiescent); the galaxy's own state always precedes the rule
+clause, as in ``This disk is quiescent --- \ldots{} disks usually remain
+star-forming''. \emph{Verdict}: the words in \Cref{tab:verdictwords}; a
+description containing words from both lists, or from neither, has no verdict.
+\Cref{tab:verdictwords} checks every word against the ground truth of the
+$36{,}654$ single-galaxy training descriptions; the shape and star-formation
+rules are likewise correct on $100\%$ of them. A galaxy's verdict is scored
+correct if it matches the catalog. No narrator left a galaxy without a verdict.
+
+\begin{table}[h]\centering\small
+\caption{\textbf{Verdict words in the galaxy training text.} For each word, the
+number of the $36{,}654$ single-galaxy training descriptions that contain it, and
+the fraction of those that describe a galaxy whose shape and star-formation
+history truly disagree.}
+\label{tab:verdictwords}
+\begin{tabular}{llcc}
+\toprule
+ & word & descriptions & galaxy disagrees \\
+\midrule
+disagreement & mismatch   & $4{,}012$ & $100\%$ \\
+                              & disagree   & $3{,}961$ & $100\%$ \\
+                              & outlier    & $4{,}123$ & $100\%$ \\
+                              & unusual(ly)& $6{,}893$ & $100\%$ \\
+\midrule
+agreement    & concordant & $8{,}177$ & $0\%$ \\
+                              & in accord  & $8{,}054$ & $0\%$ \\
+                              & concur     & $8{,}327$ & $0\%$ \\
+                              & agree      & $8{,}177$ & $0\%$ \\
+\bottomrule
+\end{tabular}
+\end{table}

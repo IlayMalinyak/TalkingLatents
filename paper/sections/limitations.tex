@@ -23,10 +23,14 @@ points between individual cells --- particularly in \Cref{tab:basemodel} --- are
 within the noise we cannot measure. The claims rest on the pattern across cells
 and on effects large enough that a seed is not a plausible explanation.
 
-\paragraph{The regime control exists only on galaxies.} \Cref{tab:2x2} closes
-the LoRA-vs-full-fine-tune confound on the galaxy track. The stellar equivalent
-would cost $\sim$700--1{,}000 GPU-hours and was not run, so the stellar claim
-inherits that control by analogy rather than directly.
+\paragraph{The stellar gain is only partly attributed.} The stellar head
+narrator differs from the narrator without the head in its training (LoRA instead
+of full fine-tuning) as well as in the token. Breaking the token in the trained
+model shows that its content is worth $0.06$--$0.10$ of the $0.33$ gain; the rest
+cannot be separated from the change in training without a stellar narrator trained
+with LoRA and no head token ($\sim$700--1{,}100 GPU-hours, not yet run). On
+galaxies, where we ran this control, the training change alone accounts for the
+whole gain (\Cref{tab:2x2}), so the same could be true in part for stars.
 
 \paragraph{We can show the token is used, not how.} The ablations establish that
 the token's contents are read (\Cref{tab:ablate}), but not the mechanism. Two
