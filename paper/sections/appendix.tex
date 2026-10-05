@@ -52,40 +52,42 @@ readout that models the group jointly, the head of
 \Cref{tab:headboth}, is not bound by it.
 
 Scoring the narrators by the same rule, crediting any equally-qualifying star,
-raises both arms and leaves the head's lead intact: $+0.361 \to +0.318$
+raises both narrators and leaves the head's lead intact: $+0.361 \to +0.318$
 ($n{=}1{,}203$ groups, $p{=}6\times10^{-85}$).
 
 \subsection{The regime control: same prose, same LoRA, no token}\label{app:2x2}
-The head arms are trained with LoRA on a frozen base while the no-head arms are
-full fine-tunes, so ``head vs.\ no head'' is also ``LoRA vs.\ full fine-tune''.
+The head narrators are trained with LoRA on a frozen base while the narrators
+without a head are full fine-tunes, so ``head vs.\ no head'' is also ``LoRA vs.\
+full fine-tune''.
 We closed that on the galaxy track, where one cell costs $\sim$10 GPU-hours: a
 narrator trained on the \emph{same} concordance prose, with the \emph{same} LoRA
-rank and schedule as the head arm, and no cross-modal token. It is one variable
-away from the head arm.
+rank and schedule as the head narrator, and no head token. It is one variable
+away from the head narrator.
 
 \begin{table}[h]\centering\small
-\caption{\textbf{The complete $2\times2$}, galaxy cross-modal task, minimum-AUC
-over the two star-formation strata ($0.50$ = chance; brackets are $95\%$
-intervals on the minority stratum). A score above $0.5$ in \emph{both} strata
-detects the interaction; below it, the arm is reading morphology alone.}
+\caption{\textbf{The complete $2\times2$}, galaxy agreement task, worst-case
+AUC (\Cref{sec:galaxyscore}; $0.50$ = chance; brackets are $95\%$ intervals on
+the quiescent galaxies). A score above $0.5$ on \emph{both} star-forming and
+quiescent galaxies means the narrator detects disagreement; below it, the
+narrator is reading the shape alone.}
 \label{tab:2x2}
 \begin{tabular}{lccc}
 \toprule
  & full fine-tune & LoRA & read \\
 \midrule
-no token  & 0.442 [0.409,0.477] & 0.498 [0.462,0.535] & morphology-only \\
-$+$ token & ---                 & \textbf{0.628} [0.593,0.665] & interaction \\
+no token  & 0.442 [0.409,0.477] & 0.498 [0.462,0.535] & shape only \\
+$+$ head token & ---                 & \textbf{0.628} [0.593,0.665] & disagreement \\
 \bottomrule
 \end{tabular}
 \end{table}
 
-Neither training regime produces an interaction detector on its own: both
-no-token arms sit at chance on the quiescent stratum, and the LoRA arm's
-interval contains $0.5$. The full fine-tune is in fact the more confident
-shortcut learner --- it posts the highest \emph{marginal} AUC in the study
-($0.885$) while scoring $0.442$ on the minority stratum, which is why we never
-quote marginal AUC here. Only the arm with the token is above chance in both
-strata. We take this as evidence, by analogy, for the stellar track as well,
+Neither training regime detects disagreement on its own: both narrators without
+the token sit at chance on quiescent galaxies, and the LoRA narrator's interval
+contains $0.5$. The fully fine-tuned narrator is in fact the more confident
+shortcut learner: over all galaxies together it posts the highest AUC in the
+study ($0.885$) while scoring $0.442$ on quiescent galaxies, which is why we never
+quote the all-galaxy AUC. Only the narrator with the token is above chance on
+both kinds. We take this as evidence, by analogy, for the stellar track as well,
 where the equivalent control would cost $\sim$700--1{,}000 GPU-hours and was
 not run.
 
@@ -149,15 +151,15 @@ mixture, no arXiv filler). Both use the
 galaxy corpus, Llama-3.1-8B, and the same seed. We evaluate the recipe as a single unit and do not report its ingredients separately.
 The recipe raises every accuracy, and its largest effect is on memorization:
 without it, $85\%$ of single-object descriptions copy a training template
-verbatim; with it, $46\%$ do.
+verbatim (defined in \Cref{app:eval}); with it, $46\%$ do.
 
 \begin{figure}[h]
   \centering
   \includegraphics[width=\linewidth]{figs/recipe_ablation.pdf}
   \caption{\textbf{Training recipe}, galaxies, Llama-3.1-8B, greedy,
   rule-scored. \emph{Grounded} $=1-$ the fraction of claims not supported by
-  the record; \emph{novel phrasing} $=1-$ the fraction of generations that
-  copy a training template verbatim. The \emph{full recipe} bars are the
+  the record; \emph{novel phrasing} $=1-$ the fraction of generated descriptions that
+  copy a training description (\Cref{app:eval}). The \emph{full recipe} bars are the
   Llama-3.1-8B galaxy column of \Cref{tab:basemodel}.}
   \label{fig:recipe}
 \end{figure}
@@ -182,9 +184,14 @@ it against the object's catalog record. No model is involved.
   older, higher $\log g$, more luminous, more metal-rich, and their opposites).
   For galaxies: same or different morphology, star-formation-history trend,
   disturbance and density cluster.
-\item \emph{Grounded} $=1-$ the fraction of claims not supported by the record;
-  \emph{novel phrasing} $=1-$ the fraction of generations that copy a training
-  template verbatim.
+\item \emph{Grounded} $=1-$ the fraction of claims not supported by the record.
+\item \emph{Novel phrasing} measures whether the narrator writes its own
+  sentences or recites training text. For each generated description we find
+  the most similar description in the training corpus (MinHash nearest
+  neighbour over word $5$-grams) and compute the fraction of the generation's
+  $5$-word sequences that appear verbatim in it. A generation \emph{copies} a
+  training description if at least half of its $5$-word sequences do. Novel
+  phrasing is $1-$ the fraction of generations that copy.
 \end{itemize}
 
 \begin{table}[h]\centering\small
@@ -210,9 +217,9 @@ parallax & mas & 0.20 & & & \\
 \end{tabular}
 \end{table}
 
-\textbf{LLM judge (stellar population records).} The verifier's extractors
-expect the template's phrasing, so the population task is scored by a separate
-text-only model (Qwen3.5-27B) that never sees any token. It reads each group
+\textbf{The judge (stellar population records).} The verifier's extractors
+expect the template's phrasing, so the population task is also scored by the
+judge (Qwen3.5-27B), a text-only model that never sees any token. It reads each group
 description against the ground-truth record and is instructed to judge factual
 content only, not style. It returns: whether the text names the true odd member
 (\emph{named}); whether it attributes it to the correct property
@@ -220,13 +227,12 @@ content only, not style. It returns: whether the text names the true odd member
 members (\emph{covered}); and a list of claims that contradict the record
 (\emph{contradictions}). We derive \emph{score} = named \emph{and} property,
 and \emph{all correct} = score, covered, and no contradiction. Only groups that
-contain an odd member are scored. All arms are judged on the same groups, so
+contain an odd member are scored. All narrators are judged on the same groups, so
 comparisons are paired (exact McNemar for yes/no outcomes, Wilcoxon for
 contradiction counts). The judge is given no numeric tolerance and is stricter
-than the verifier: of the numeric contradictions it lists that we could parse, $56$--$60\%$ (by arm) are within
+than the verifier: of the numeric contradictions it lists that we could parse, $56$--$60\%$ (depending on the narrator) are within
 the verifier's tolerance. Its contradiction counts are therefore an upper bound,
-and they inflate more for an arm that states more numbers.
+and they inflate more for a narrator that states more numbers.
 
-\textbf{Galaxy concordance.} Scored per star-formation stratum by the model's
-graded confidence, as described under \Cref{tab:headboth} and in
-\Cref{fig:concordance}.
+\textbf{Galaxy agreement task.} Scored by worst-case AUC over star-forming and
+quiescent galaxies (\Cref{sec:galaxyscore}).

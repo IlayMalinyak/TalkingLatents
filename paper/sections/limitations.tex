@@ -1,7 +1,7 @@
 \section{Limitations}\label{sec:limitations}
 
 \paragraph{The corpus is not split-aware.} $99.2\%$ of test-fold stars appear in
-some training description. The contrast is symmetric across arms so the paired
+some training description. The contrast is symmetric across narrators so the paired
 comparisons hold, but absolute rates are optimistic, and the adversarial set
 (\Cref{tab:adversarial}) is the answer to the recall objection rather than a
 clean test. A split-aware rebuild is the right fix and we have not done it.
@@ -10,7 +10,7 @@ clean test. A split-aware rebuild is the right fix and we have not done it.
 composer designates one off-axis member and leaves the others unconstrained on
 that axis, so $60.5\%$ of anomalies sit in a group containing at least one other
 member with the same label ($81.7\%$ on dwarf/giant). Naming any of them is a
-true statement, but only one is scored correct. Re-scoring both arms to credit
+true statement, but only one is scored correct. Re-scoring both narrators to credit
 any qualifying member raises both and leaves the head's lead intact
 ($+0.361 \to +0.318$), so this does not drive the result --- but every absolute
 rate in this paper is a lower bound for that reason. The same construction makes
@@ -18,7 +18,7 @@ the ``no anomaly'' groups unreliable: $71.4\%$ of them contain a member that
 crosses a threshold on some axis the composer did not check, which is why groups
 with no designated odd member are excluded from every number we report.
 
-\paragraph{One seed per arm.} Every cell was trained once. Differences of a few
+\paragraph{One seed per narrator.} Every cell was trained once. Differences of a few
 points between individual cells --- particularly in \Cref{tab:basemodel} --- are
 within the noise we cannot measure. The claims rest on the pattern across cells
 and on effects large enough that a seed is not a plausible explanation.
@@ -38,8 +38,8 @@ spread across objects --- so the information the narrator uses is probably
 carried by the few channels that are stable, not by the token as a whole. We
 report the effect; we do not claim to have explained it.
 
-\paragraph{The judge is an LLM, not a human.} Population records are scored by a
-$27$B model. It agrees closely with the independent rule-based verifier, which
+\paragraph{The judge is an LLM, not a human.} Population records are scored by the
+judge, a $27$B model. It agrees closely with the independent rule-based verifier, which
 is the evidence we have that it is not inventing its own standard, but there is
 no human-labelled subset. A few hundred hand-scored groups would settle it.
 
@@ -50,7 +50,7 @@ within one object rather than comparison across a group. Where a claim rests on
 one track we have said so.
 
 \paragraph{No claim about scale.} A $70$B narrator was trained on galaxies and
-is excluded here: it was not a controlled comparison against the $8$B arms
+is excluded here: it was not a controlled comparison against the $8$B narrators
 (batch $16$ vs $128$ at the same unscaled learning rate), and it degenerates
 into repetition on long outputs. We therefore say nothing about how these
 results move with model size.

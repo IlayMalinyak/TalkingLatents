@@ -1,11 +1,85 @@
 \section{Data and Model}
 \label{sec:data}
+\textbf{Terminology.} We use six names throughout. The \emph{narrator} is
+the 8B language model we train: it reads an object's data tokens and writes
+about the object. The \emph{head} is a small model, not a language model,
+trained separately to compute one quantity that a question depends on
+(\Cref{sec:results}); its output enters the narrator as one extra token, the
+\emph{head token}. The \emph{templater} is the deterministic program that writes
+our training text from catalog facts, and the \emph{writer} (DeepSeek-V4) is the
+LLM we use in its place in one comparison. Generated text is scored by the
+\emph{verifier}, a program that checks every stated fact against the catalog, and
+by the \emph{judge} (Qwen3.5-27B), an LLM that reads each description against
+the ground truth.
+
 We test two different astrophysical datasets, representing different domains and physical properties. The first dataset is a \emph{stellar} multimodal dataset comprising 190,091 stars, observed by $5$ different modalities coming from different telescopes - \emph{Kepler}\citep{kepler:mission}, TESS\citep{tess:mission}, LAMOST\citep{lamost:survey}, APOGEE\citep{apogee:mission}, and Gaia\citep{gaia:mission}. Each modality is processed through a specific encoder, and the modalities are aligned with a model that factorizes the latent space into shared and specific subspaces. The result is one shared feature and $5$ per-modality features, each projected to the token embedding space of the LLM as its own small group of tokens. The second dataset is galaxies from the COSMOS-Web survey \citep{Casey2023_cosmos-web}, including two modalities: images and star-formation history (SFH). Similar to the stellar dataset, we use a pretrained model that aligns the two modalities (here using CLIP \cite{Radford2021_CLIP}) and project the frozen features into the LLM's token embedding. Notably, the two datasets are different in many aspects: number and type of modalities, pretrained models, and scientific questions. Using the two datasets in the same pipeline highlights general vs data-specific conclusions.\\  
 \textbf{training prose}. One of the challenges in this pipeline is creating the training dataset. This should include ground-truth prose per object. Contrary to other fields, in astrophysics data is usually stored only in numerical catalogs, so one needs to create the prose from scratch. Our main method is a \emph{template-based} method: a deterministic program that picks a subset of facts from the catalog, chooses a phrasing from a bank of templates, and
-writes prose. Every sentence is checked against the record by a verifier before it enters the corpus. The
+writes prose. Every sentence is checked against the record by the verifier before it enters the corpus. The
 check is per-fact: it guarantees that the facts a description states are true of the object, not
 that the description mentions every unusual object in a group. Both datasets share two types of prose: description of a single object (single), and comparison between pairs (pair). We also test deeper reasoning capabilities with two additional tasks. In the stellar dataset we use population prose: a group of $N$ objects with description of the typical members, and a callout
-of the one that does not belong and on which property. In the galaxy dataset we are interested in non trivial cross modal correlation and check if the model highlight those in the prose. In~\Cref{sec:results} we compare the template-based method with a second method: an \emph{LLM-based} generation, where we let DeepSeekV4 write the population prose from catalog facts, and verify their correctness. \todo{here we should elaborate slightly more - how the raw data looks like, what properties, how we create the training prose (random selsection of features, different styles, etc.). we shold also have visual example of raw data and resulting treaining prose in at least two different styles. this example should be neat, clean and visually clear}\\
+of the one that does not belong and on which property. In the galaxy dataset we are interested in non trivial cross modal correlation and check if the model highlight those in the prose. In~\Cref{sec:results} we compare the template-based method with a second method: an \emph{LLM-based} generation, where the writer produces the population prose from the same catalog facts, and every claim is verified.
+
+\textbf{Objects, facts and descriptions.} The stellar set has $190{,}091$
+stars, of which we evaluate on a held-out set of $19{,}010$. Because every star is
+described in many training records and the stellar training text was not built
+split by split, $99.2\%$ of these evaluation stars appear in \emph{some} training
+description; \Cref{sec:memorization} tests whether this matters. The galaxy set
+has $137{,}696$ galaxies, split $80/10/10$ into training, validation and test
+galaxies, and all galaxy training text is written about training galaxies only,
+so the test galaxies are never seen in training.
+
+Each star's catalog record holds $13$ numbers ($T_\mathrm{eff}$, $\log g$,
+$[\mathrm{Fe/H}]$, mass, radius, age, luminosity, distance, parallax, Gaia's
+astrometric quality index RUWE, apparent and absolute brightness, and rotation
+period) and categorical facts: evolutionary state (dwarf, subgiant, giant); how
+the star compares with the rest of the sample (e.g., among the most metal-rich
+quarter, or hotter, older or faster-rotating than most); its Galactic disk
+population and $\alpha$-element abundance; its activity level; and flags for
+binarity, planet hosts, flares and open-cluster membership. Each galaxy's record
+holds stellar mass, star-formation rate and state (quiescent to starburst),
+redshift, S\'ersic index (how centrally concentrated its light is), visual
+morphology and disturbance, formation age, and the shape of its star-formation
+history (rising or falling, recent activity, quenching, formation time).
+
+The templater writes each description by sampling, independently, which facts
+to state (a random three to six), a style, and a framing. For stars it also adds,
+each with probability one half, a chemistry block (disk population,
+$\alpha$-abundance) and an activity block (chromospheric activity, variability
+amplitude). Stars have three styles (natural prose, observation log, bullet
+list) and four framings (plain description, outlier flag, comparison with other
+stars, comparison with the Sun). Galaxies have four styles (technical paper,
+observation log, teaching text, concise summary), four framings (plain
+description, comparison with the galaxy population, comparison with the
+star-forming main sequence, outlier flag) and three lengths. On stars, each fact
+is then worded by drawing from a bank of alternative phrasings ($917$
+alternatives at $141$ points in the text); the galaxy templater has one wording
+per fact and style, so its variety comes from the facts, style, framing and
+length. A star is described about five times, each time with different facts
+and words (\Cref{fig:example}). The result is highly diverse: every stellar
+single and pair description is unique, and $99.9\%$ remain unique with all
+numbers masked; for galaxies, $99.9\%$ of single descriptions are unique and
+$70\%$ remain so with numbers masked. In total, the stellar corpus has $1.93$M
+records ($1.01$M single, $0.69$M pair, $0.23$M population); each population
+record is a group of $4$ to $32$ stars with an odd member on one of six
+properties. The galaxy corpus has $288$k records ($90$k single, $198$k pair).
+The galaxy agreement task uses a separate, deliberately narrow corpus of
+$45{,}817$ records (three phrasings per case, also from training galaxies only)
+in which galaxies whose morphology and star-formation history disagree are
+oversampled to $33\%$.
+
+\begin{figure*}[t]
+  \centering
+  \resizebox{\textwidth}{!}{\input{figs/example_star}}
+  \caption{\textbf{From observations to training text}, for one star
+  (KIC~7680114). \emph{Left}: two of its observations, the Kepler light curve
+  (6-hour bins over 30-minute data) and the LAMOST spectrum. The frozen encoders
+  read these; the language model never sees them directly. \emph{Middle}: its
+  catalog record (abridged). \emph{Right}: two of the six training descriptions
+  written about it, verbatim, in two styles. Each draws a different random
+  subset of facts. Dots mark which facts each description uses.}
+  \label{fig:example}
+\end{figure*}
+
 \textbf{Training recipe.} To improve the diversity of the data and reduce overfitting, we train with one fixed recipe of three ingredients: (i) a cosine learning-rate schedule with label smoothing ($0.05$); (ii) a more varied mixture of training prompts, with more multi-object prompts and longer context; and (iii) filler text around the data tokens, $30\%$ of which are real sentences from astrophysics papers on arXiv ($64{,}726$ sentences, filtered so that none states a relation between two properties we later test). The filler applies to the single and pair records; population records are presented as the data tokens alone. We treat the three as a single recipe: it was tuned once on the galaxy data and reused unchanged for stars. \Cref{app:recipe} compares it against training without it.
 
 

@@ -1,7 +1,28 @@
 \section{Results}\label{sec:results}
 \subsection{singles and pair questions}
-We first test the single and pair questions, comparing two types of Llama-8B models: Llama-3.1 and AstroSage \citep{haan2025_astrosage}, a Llama-3.1 model that was fine-tuned specifically on arXiv astrophysics papers.~\Cref{tab:basemodel} shows the comparison on both datasets. Single and pair descriptions are scored by a rule-based verifier that extracts every numeric and categorical claim from the generated text and checks it against the catalog: \emph{numeric accuracy} is the fraction of stated values within a per-quantity tolerance of the catalog value, and \emph{qualitative} (single) or \emph{relational} (pair) accuracy is the fraction of class words or comparisons that match it (tolerances and definitions in \Cref{app:eval}). While both models show high performance on both tasks, Astrosage retains a small gain over the vanilla model in seven of the eight cells, across both datasets, which implies that textual domain knowledge is helpful for those tasks. Therefore, the Astrosage model was chosen for further analysis. 
-\subsection{scientific reasoning tasks} Single and pair questions consists of description and simple comparisons and requires almost no reasoning beyond the basic properties. It is also similar to the protein description tasks as in  \cite{Dotan2026_betadescribe}, and therefore it is not surprising that an LLM performs well on such questions. Next, we test the performance on questions that requires some form of scientific reasoning. As mentioned in~\Cref{sec:data}, those are anomaly detection for the stellar dataset and irregular morphology-SFH correlation in the galaxy dataset.~\Cref{tab:headboth} shows the results of those two tasks using both a template-based verifier and an LLM judge (Qwen3.5-27B). The \emph{no head} column presents the basic model, with no extra information, and the performance is poor. Before adding anything to the model, we check whether this is a failure of information. A cross-fit linear probe on the same aligned features, asked to rank the members of a group, matches what the true catalog values achieve (rank-1 $0.660$ from the shared subspace and $0.686$ from the full feature, against $0.660$ for the catalog itself; \Cref{sec:appendix}). The signal the task needs is present in the features the model reads, so the failure is in the readout and not in the representation. The \emph{+ head} column shows the performance with the addition of an extra single token that comes from a dedicated non-LLM model that is meant to highlight the relevant information. In the stellar case this is a flow matching model that was trained to learn the joint distribution of the aligned features and catalog labels, conditioned on the rest of the group. In the galaxy case, this is a cross-modal predictor that is trained to predict one modality from the other. We note that adding this single token significantly improves the performance on both tasks. 
+We first test the single and pair questions, comparing two types of Llama-8B models: Llama-3.1 and AstroSage \citep{haan2025_astrosage}, a Llama-3.1 model that was fine-tuned specifically on arXiv astrophysics papers.~\Cref{tab:basemodel} shows the comparison on both datasets. Single and pair descriptions are scored by the verifier, which extracts every numeric and categorical claim from the generated text and checks it against the catalog: \emph{numeric accuracy} is the fraction of stated values within a per-quantity tolerance of the catalog value, and \emph{qualitative} (single) or \emph{relational} (pair) accuracy is the fraction of class words or comparisons that match it (tolerances and definitions in \Cref{app:eval}). While both models show high performance on both tasks, Astrosage retains a small gain over the vanilla model in seven of the eight cells, across both datasets, which implies that textual domain knowledge is helpful for those tasks. Therefore, the Astrosage model was chosen for further analysis. 
+\subsection{scientific reasoning tasks} Single and pair questions consists of description and simple comparisons and requires almost no reasoning beyond the basic properties. It is also similar to the protein description tasks as in  \cite{Dotan2026_betadescribe}, and therefore it is not surprising that an LLM performs well on such questions. Next, we test the performance on questions that requires some form of scientific reasoning. As mentioned in~\Cref{sec:data}, those are anomaly detection for the stellar dataset and irregular morphology-SFH correlation in the galaxy dataset.~\Cref{tab:headboth} shows the results of those two tasks. The \emph{narrator} column is the narrator alone, reading only the data tokens, and its performance is poor. Before adding anything to the model, we check whether this is a failure of information. A cross-fit linear probe on the same aligned features, asked to rank the members of a group, matches what the true catalog values achieve (rank-1 $0.660$ from the shared subspace and $0.686$ from the full feature, against $0.660$ for the catalog itself; \Cref{sec:appendix}). The signal the task needs is present in the features the model reads, so the failure is in the readout and not in the representation. The \emph{+ head} column adds the head token (\Cref{sec:data}). In the stellar case the head is a flow matching model that was trained to learn the joint distribution of the aligned features and catalog labels, conditioned on the rest of the group. In the galaxy case, this is a cross-modal predictor that is trained to predict one modality from the other. We note that adding this single token significantly improves the performance on both tasks. 
+
+\textbf{Scoring the galaxy task.}\label{sec:galaxyscore} The galaxy question is
+whether a galaxy's shape agrees with its star-formation history, and the test set
+is imbalanced in a way that decides how this must be scored. Disagreement means
+opposite things for the two kinds of galaxies: a \emph{spheroid} that is still
+forming stars, or a \emph{disk} that has stopped forming them (a quiescent
+galaxy). Because $90\%$ of the galaxies are star-forming, a narrator that looks
+only at the shape and learns ``spheroid $\Rightarrow$ disagreement'' is right on
+the star-forming majority, backwards on the quiescent minority, and still looks
+good on the sample as a whole. Checking whether the text states the right
+verdict does not catch this: trained on the same text, the narrator without the
+head token gives the right verdict for $92.3\%$ of the disagreeing galaxies and
+the one with it for $97.3\%$. We therefore score each galaxy by the narrator's own
+confidence --- the log-probability that it opens its description by flagging the
+galaxy as unusual rather than describing it as typical, with no fitted weights
+--- and compute the AUC separately on star-forming and on quiescent galaxies. We
+report the lower of the two, the \emph{worst-case AUC} ($0.50$ = chance), so a
+narrator scores well only if it is right on both kinds. \Cref{fig:concordance}
+shows why this matters. On star-forming galaxies every narrator is high; on
+quiescent galaxies the two narrators without the head token are at or below
+chance, and only the one with it is above.
 
 \begin{table}[h]\centering\small
 \caption{\textbf{Base model: Llama-3.1-8B vs.\ AstroSage-8B}, identical
@@ -36,134 +57,125 @@ the catalog; \emph{relational acc.} (pair) = fraction of comparisons
 
 
 \begin{table}[h]\centering\small
-\caption{\textbf{The head fixes the relational task --- on both tracks, under
-both scorers.} Each row is one arm pair on one task, measured two ways. Stars:
-does the text name the true odd member \emph{and} its property, over the
-$1{,}203$ test groups that contain one. Galaxies: does the model separate the $1{,}484$ test galaxies whose
-morphology and SFH genuinely \emph{disagree} from the $9{,}193$ where they
-agree. The rule verifier and the LLM judge are independent
-instruments; they agree on the size and direction of the
-stellar effect. The galaxy rows are scored differently$^{\ast}$; their
-two rows are two controls (a model trained without the token, and the same trained
-modell with its token removed at test time), not two scorers. Numbers are comparable \emph{within} a row block only --- the two
-tracks are different tasks on different scales.}
+\caption{\textbf{The head fixes the reasoning task on both datasets.} Each
+block compares the narrator with and without the head token. Stars: does the text
+name the true odd member \emph{and} its property, over the $1{,}203$ test groups
+that contain one, scored by the verifier and by the judge; the two independent
+scorers agree on the size and direction of the effect. Galaxies: worst-case AUC
+(\Cref{sec:galaxyscore}) for separating the $1{,}484$ test galaxies whose
+morphology and SFH disagree from the $9{,}193$ where they agree. The two galaxy
+rows are two controls, not two scorers: a narrator trained without the token
+(top), and the head narrator with its token scrambled at test time (bottom).
+Numbers are comparable \emph{within} a block only.}
 \label{tab:headboth}
 \begin{tabular}{llccc}
 \toprule
-track --- relational task & scorer & no head & $+$ head & $\Delta$ \\
+dataset --- task & scorer & narrator & $+$ head & $\Delta$ \\
 \midrule
 \emph{stars} --- name the odd member      & verifier & 0.245 & \textbf{0.633} & $+0.388$ \\
 \hspace{1em}and its property              & judge    & 0.332 & \textbf{0.662} & $+0.330$ \\
 \midrule
-\emph{galaxies}$^{\ast}$ --- does shape   & min-stratum AUC & 0.442 & \textbf{0.628} & $+0.186$ \\
-\hspace{1em}agree with history?           & min-stratum AUC & 0.461 & \textbf{0.628} & $+0.167$ \\
+\emph{galaxies} --- does shape   & worst-case AUC & 0.442 & \textbf{0.628} & $+0.186$ \\
+\hspace{1em}agree with history?           & worst-case AUC & 0.461 & \textbf{0.628} & $+0.167$ \\
 \bottomrule
 \end{tabular}
 \end{table}
 
-$^{\ast}$~The galaxy task is imbalanced, and the imbalance decides how it must be
-scored. A morphology--SFH mismatch means a \emph{spheroid} among star-forming
-galaxies but a \emph{disk} among quiescent ones, and $90\%$ of the test galaxies
-are star-forming. A narrator that reads morphology alone and learns ``spheroid
-$\Rightarrow$ mismatch'' is therefore right on the majority, backwards on the
-minority, and still looks excellent on the pooled sample. Whether the text states
-the right verdict does not catch this. Trained on the same prose, the model
-without the token calls $0.923$ of the mismatching galaxies correctly and the
-model with it $0.973$, so both use the right words. Instead, we score each galaxy by the model's own
-graded confidence, the log-probability of opening its description with a mismatch
-framing rather than a neutral one (no fitted weights). We compute the AUC separately within each
-star-formation stratum and report the minimum ($0.50$ = chance). \Cref{fig:concordance}
-shows why. On the star-forming majority every arm is high. On the quiescent
-minority, the two arms without the token are at or below chance and only the arm
-with the token is above it. Pooled, the shortcut learner posts the best score of
-all ($0.885$), which is why we never report pooled AUC for this task.
-
 \begin{figure}[h]
   \centering
   \includegraphics[width=0.85\linewidth]{figs/concordance_imbalance.pdf}
-  \caption{\textbf{Why the galaxy task is scored per stratum.} Mismatch AUC of
-  the three galaxy arms (\Cref{app:2x2}), all trained on the same prose, within
-  each star-formation stratum and pooled. Error bars are $95\%$ bootstrap
-  intervals. Mismatch means a spheroid among star-forming galaxies and a disk
-  among quiescent ones, so reading morphology alone wins the $90\%$ majority
-  and is backwards on the minority. Below the dashed line the score is
-  anti-correlated with mismatch.}
+  \caption{\textbf{Why the galaxy task is scored separately on star-forming
+  and quiescent galaxies.} Mismatch AUC of the three galaxy narrators
+  (\Cref{app:2x2}), all trained on the same text. Error bars are $95\%$
+  bootstrap intervals. A mismatch is a spheroid among star-forming galaxies and a
+  disk among quiescent ones, so reading the shape alone wins the $90\%$
+  star-forming majority and is backwards on the quiescent minority. Below the
+  dashed line the score is anti-correlated with mismatch.}
   \label{fig:concordance}
 \end{figure}
 
 
-\subsection{is it the token, or the retraining that came with it?}
-The head arms differ from the no-head arms in more than the token: they are
-trained with LoRA on a frozen base, while the no-head arms are full fine-tunes.
-A reader is entitled to ask whether the gain is the token at all. The test that
-does not depend on the training regime is to take the \emph{same trained model}
-and destroy the token at generation time, leaving everything else untouched.
-\Cref{tab:ablate} does this two ways: replacing the token with zeros, and
-scrambling its contents across the group so that it carries the same statistics
-but no longer describes the star it is attached to.
+\subsection{is it the token, or the training that came with it?}
+The narrators with and without the head are two separately trained models, and
+they differ in more than the token: the head narrator is trained with LoRA on a
+frozen base model, while the narrator without it is fully fine-tuned. The gain in
+\Cref{tab:headboth} could therefore come from the token or from the training.
+The test that does not depend on training is to take the trained head narrator
+and break its token at generation time, leaving everything else unchanged.
+\Cref{tab:ablate} does this two ways: scrambling the token across the group, so
+that it has the right statistics but describes a different star, and replacing
+it with zeros.
 
 \begin{table}[h]\centering\small
 \caption{\textbf{Breaking the token at test time}, stellar group task, full test
-fold ($n{=}1{,}203$ groups with an odd member, greedy, judge-scored).
-\emph{score} is the fraction of times the text names the true odd member and its property. The middle
-two rows are the \emph{same} trained model as the last one, with its token
-damaged at generation time.}
+set ($n{=}1{,}203$ groups with an odd member, greedy, judge-scored).
+\emph{score} is the fraction of descriptions that name the true odd member and
+its property. The last three rows are one trained model, the head narrator, with
+its token intact or damaged at generation time; the first row is a separately
+trained model.}
 \label{tab:ablate}
 \begin{tabular}{lc}
 \toprule
  & score  \\
 \midrule
-no head token at all        & 0.332 \\
-\;+ head token, zeroed      & 0.561  \\
-\;+ head token, scrambled   & 0.606 \\
-\;+ head token, intact      & \textbf{0.662}  \\
+narrator, trained without a head token & 0.332 \\
+\midrule
+head narrator, token zeroed      & 0.561  \\
+head narrator, token scrambled   & 0.606 \\
+head narrator, token intact      & \textbf{0.662}  \\
 \bottomrule
 \end{tabular}
 \end{table}
 
-Scrambling the token costs $0.056$ and zeroing it costs
-$0.101$, both significant. The token is not a flag whose mere presence helps:
-what it \emph{contains} is read and used. The galaxy track shows the same thing:
-removing the cross-modal token at test time drops the trained narrator from
-$0.628$ to $0.461$ (\Cref{tab:headboth}).
-The gap between no
-token at all ($0.332$) and a zeroed token ($0.561$) still mixes the token being
-there with the LoRA regime that came with it. To separate them, we trained a model with LoRA and no token on the galaxy dataset. 
-It reaches a min-stratum AUC of $0.498$
-($[0.462, 0.535]$, indistinguishable from chance), against $0.442$ for the
-full fine-tuned no-token arm and $0.628$ with the token. This implies that the token,
-not the fine-tuning pipeline, is what carries the result. \Cref{sec:appendix} gives the
-complete $2\times2$. To save compute, we conducted this experiment only on the galaxy dataset.
+Breaking the token costs the same model $0.056$ (scrambled) to $0.101$ (zeroed),
+both significant, so what the token contains is read and used. The galaxy
+narrator shows the same: scrambling its token drops its worst-case AUC from
+$0.628$ to $0.461$ (\Cref{tab:headboth}). Even with a broken token, however, the
+stellar head narrator stays far above the narrator trained without one ($0.561$
+against $0.332$). A zeroed token carries no information about the group, so this
+gap is a difference between the two trained models, not something the token
+supplies at test time. It reflects how the head narrator was trained (LoRA on a
+frozen base instead of full fine-tuning, and alongside a head token), and a
+test-time ablation cannot tell these apart. To separate them, we trained a
+galaxy narrator with LoRA and no head token. Its worst-case AUC is $0.498$
+($[0.462, 0.535]$, indistinguishable from chance), against $0.442$ for the fully
+fine-tuned narrator and $0.628$ with the token (\Cref{fig:concordance},
+\Cref{app:2x2}). On galaxies, then, LoRA training alone does not produce the
+ability; the token does. The stellar equivalent would cost
+$\sim$700--1{,}000 GPU-hours and was not run. For stars, the token's content
+accounts for $0.06$--$0.10$ of the $0.33$ gain, and we do not attribute the rest.
 
-\subsection{is this reasoning, or memorization?}
-Since each star creates multiple training prose, each time with different labels and framing, the datasets are not split-aware, sample-wise: $99.2\%$ of the stars in the
-stellar test fold appear in \emph{some} training description. That is symmetric across
-experiments, so the paired contrasts above are fair, but it leaves an obvious
-objection: the head arm might be recalling which star was called unusual
+\subsection{is this reasoning, or memorization?}\label{sec:memorization}
+As described in \Cref{sec:data}, $99.2\%$ of the stars we evaluate on appear in
+\emph{some} training description. That is the same for every narrator, so the
+paired comparisons above are fair, but it leaves an obvious objection: the head
+narrator might be recalling which star was called unusual
 during training rather than working it out.
 
 We test this directly, on the stellar track. From the test fold we keep only
 groups whose odd member was \emph{never} an odd member anywhere in training:
 the star may have been described many times, but never as the one that stands
 out. Only $2.3\%$ of candidate groups survive that filter, leaving $1{,}000$.
-If the head is recalling, it should lose most of its advantage here. Table~\ref{tab:adversarial} shows this experiment. The advantage does not shrink where memorisation is
+If the head narrator is recalling, it should lose most of its advantage here. Table~\ref{tab:adversarial} shows this experiment. The advantage does not shrink where memorisation is
 impossible; it grows. The head is worth $+0.469$ on this set against
-$+0.330$ on the full fold, and the two arms move in opposite directions when
-they are moved onto it: the arm without the head falls ($0.332 \to 0.279$)
-while the arm with it does not. That is the opposite of what a memorization
+$+0.330$ on the full test set, and the two narrators move in opposite directions
+on it: the narrator without the head falls ($0.332 \to 0.279$) while the head
+narrator does not. That is the opposite of what a memorization
 explanation predicts.
 
 \begin{table}[h]\centering\small
 \caption{$1{,}000$ stellar groups whose odd member
-was never an odd member in training, greedy, judge-scored. \emph{score} is the fraction of times the
-text names the true odd member and its property. \emph{named} are the times when the text only names the true odd member, and \emph{property} is when it names the true odd property.}
+was never an odd member in training, greedy, judge-scored. \emph{score} is the fraction of descriptions that name the
+true odd member and its property; \emph{named} counts naming the odd member
+regardless of property, and \emph{property} naming the right property regardless
+of member.}
 \label{tab:adversarial}
 \begin{tabular}{lccc}
 \toprule
  & score & named & property  \\
 \midrule
-latent tokens (baseline) & 0.279 & 0.329 & 0.343  \\
-latent tokens $+$ head   & \textbf{0.748} & \textbf{0.782} & \textbf{0.761}  \\
+narrator & 0.279 & 0.329 & 0.343  \\
+narrator $+$ head   & \textbf{0.748} & \textbf{0.782} & \textbf{0.761}  \\
 $\Delta$  & $+0.469$ & $+0.453$ & $+0.418$ \\
 \bottomrule
 \end{tabular}
@@ -180,38 +192,38 @@ $\Delta$  & $+0.469$ & $+0.453$ & $+0.418$ \\
 If the features carry the signal and the model cannot use it, an obvious
 alternative is to skip the features and hand the model the catalog numbers
 directly. We test this on the stellar dataset only, where the group task
-has a written form: the same base model is shown each group as an indexed table
-of numeric fields (more fields than the flow matching head ever sees, as each prose uses a subset of the fields) and asked, in
+has a written form: the base AstroSage-8B model, without our training, is shown each group as an indexed table
+of numeric fields (more fields than the head ever sees) and asked, in
 words, to name the member that stands out and the property it differs on. We
 also test a version that is told to reason through the stars one at a time
 before committing to an answer. \Cref{tab:text} shows both against the two
-latent arms on the same groups.
-At first sight, the text arm looks competitive on naming the odd member alone ($0.592$)
+narrators on the same groups.
+At first sight, the text-reading model looks competitive on naming the odd member alone ($0.592$)
 but it names $68\%$ of the group and never stops generating, so the rate is
 mostly hedging: corrected for how much it names, it is below chance
 ($0.87\times$). On \textbf{score}, where it must also name the right property,
-it scores $0.331$ against $0.320$ for the latent tokens, and both are less than half the head's
-$0.652$. Reasoning first makes the arm commit ($18\%$ of the group named
+it scores $0.331$ against $0.320$ for the narrator, and both are less than half the head
+narrator's $0.652$. Reasoning first makes the model commit ($18\%$ of the group named
 instead of $68\%$, and it terminates) but does not rescue it: $0.224$, the
-lowest of any arm that finishes. Reading the same numbers as text is therefore
+lowest of any model that finishes. Reading the same numbers as text is therefore
 not successful, with or without explicit reasoning.
 
 \begin{table}[h]\centering\small
 \caption{\textbf{The catalog-text control}, the $n{=}884$ groups with an odd
-member judged in all four arms, greedy. \emph{score} and \emph{named} are the same as in Table~\ref{tab:adversarial}. \emph{lift} divides it by the fraction of the group the arm names
+member judged for all four models, greedy. \emph{score} and \emph{named} are the same as in Table~\ref{tab:adversarial}. \emph{lift} divides \emph{named} by the fraction of the group the model names
 ($1.0$ = chance given that much hedging): the two together show why the
-name alone misleads. Under \emph{score} the text arm's apparent lead is
-gone --- $0.331$ against $0.320$ for latent tokens, both less than half the
-head's $0.652$.}
+name alone misleads. Under \emph{score} the text-reading model's apparent lead is
+gone --- $0.331$ against $0.320$ for the narrator, both less than half the
+head narrator's $0.652$.}
 \label{tab:text}
 \begin{tabular}{lcccc}
 \toprule
  & score & named & lift & stars named \\
 \midrule
-catalog table, text   & 0.331 & 0.592 & 0.87$\times$ & 68\%   \\
-catalog table, text, reason first & 0.224 & 0.397 & 2.21$\times$ & 18\%  \\
-latent tokens         & 0.320 & 0.431 & 3.32$\times$ & 13\%  \\
-latent tokens $+$ head & \textbf{0.652} & 0.782 & \textbf{3.91}$\times$ & 20\% \\
+AstroSage, catalog as text   & 0.331 & 0.592 & 0.87$\times$ & 68\%   \\
+AstroSage, catalog as text, reason first & 0.224 & 0.397 & 2.21$\times$ & 18\%  \\
+narrator         & 0.320 & 0.431 & 3.32$\times$ & 13\%  \\
+narrator $+$ head & \textbf{0.652} & 0.782 & \textbf{3.91}$\times$ & 20\% \\
 \bottomrule
 \end{tabular}
 \end{table}
@@ -219,31 +231,31 @@ latent tokens $+$ head & \textbf{0.652} & 0.782 & \textbf{3.91}$\times$ & 20\% \
 
 \subsection{Templates vs. LLM prose}
 Everything above is trained on prose written by the deterministic templater.
-The obvious alternative is to let a capable LLM write it, which has the potential for better diversity and fluency. To compare the two, we built an LLM-based corpus: DeepSeek-V4 was given the same
+The obvious alternative is to let a capable LLM write it, which has the potential for better diversity and fluency. To compare the two, we built an LLM-based corpus: the writer (DeepSeek-V4) was given the same
 catalog facts and asked to write the group descriptions, and every claim it made
 was checked against the record before the text was accepted. The training text
 is, in that sense, true. \Cref{tab:corpus} compares the two corpora with
-everything else held fixed: same base model, same prompt, and no head (both narrators read the latent tokens only and are fully fine-tuned). We see that training on fluent LLM prose makes the model invent:
+everything else held fixed: same base model, same prompt, and no head (both narrators read the data tokens only and are fully fine-tuned). We see that training on the writer's fluent prose makes the narrator invent:
 contradictions per group go from $1.9$ to $7.2$, and not one group out of
 $1{,}191$ is described fully correctly. The training text was verified true; the
 model trained on it is not. This is aligned with the finding of \cite{Hegselmann2022TabLLMFC} who showed that template-based serialization outperforms LLM-based serialization for tabular data. The two corpora differ in how much they commit to. Per group description, the
 templater writes a median of $21$ words containing $5$ numbers and names $17\%$
 of the members; it states the population and the member that does not belong,
-and says nothing about the rest. The teacher-LLM writes $82$ words containing $17$
+and says nothing about the rest. The writer uses $82$ words containing $17$
 numbers and names $83\%$ of the members, giving most of them a full quantitative
-profile. Training on the second teaches the model to do the same. On the test groups,
-the model trained on LLM prose writes a median of $78$ words against $17$, states
+profile. Training on the second teaches the narrator to do the same. On the test groups,
+the narrator trained on writer prose writes a median of $78$ words against $17$, states
 $8$ values per group against $1$, and names $72\%$ of the members against
 $26\%$. Most of its extra contradictions ($70\%$) are such numeric claims, and
 most of those concern members \emph{other} than the outlier, whose values the
-template-trained model rarely states at all. Per stated value, the two models are
-contradicted at a similar rate ($0.52$ vs.\ $0.46$): the LLM-prose model is
+template-trained narrator rarely states at all. Per stated value, the two narrators are
+contradicted at a similar rate ($0.52$ vs.\ $0.46$): the writer-trained narrator is
 wrong more often mainly because it says more. Values for the typical members are hard to read
-for both models: in either arm about $40\%$ of them contradict the record
-(rule verifier). A model trained to state them for every member therefore
-mostly adds errors. This is not the whole story: on the outlier itself, the LLM-prose
-model's stated values contradict the record far more often ($18\%$ vs.\ $2\%$ of
-values, rule verifier). Verification of the training text does not help in either
+for both narrators: for either one about $40\%$ of them contradict the record
+(verifier). A narrator trained to state them for every member therefore
+mostly adds errors. This is not the whole story: on the outlier itself, the writer-trained
+narrator's stated values contradict the record far more often ($18\%$ vs.\ $2\%$ of
+values, verifier). Verification of the training text does not help in either
 case, because the problem is not that the text is false; it is that it asserts
 more than the input determines.
 
@@ -251,7 +263,7 @@ more than the input determines.
 \begin{table}[h]\centering\small
 \caption{\textbf{Which prose to train on.} AstroSage-8B, same prompt, latent
 tokens only (no head), full fine-tune; greedy, judge-scored, on the $1{,}191$
-groups with an odd member judged in both arms (paired; hence $0.333$ here
+groups with an odd member judged for both narrators (paired; hence $0.333$ here
 vs.\ $0.332$ on the $1{,}203$ groups of \Cref{tab:ablate}). \emph{score} is as
 in \Cref{tab:ablate}; \emph{covered} = the text correctly describes the typical
 (non-odd) members; \emph{contradictions/group} = the number of statements the
@@ -263,7 +275,7 @@ and no contradiction. Covered, contradictions and all correct differ at $p<10^{-
 training prose & score & covered & contradictions/group & all correct \\
 \midrule
 template (ours)       & \textbf{0.333} & \textbf{0.573} & \textbf{1.88} & \textbf{0.128} \\
-DeepSeek-V4 (verified) & 0.258 & 0.178 & 7.16 & 0.000 \\
+writer (DeepSeek-V4), verified & 0.258 & 0.178 & 7.16 & 0.000 \\
 \bottomrule
 \end{tabular}
 \end{table}
