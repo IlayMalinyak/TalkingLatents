@@ -1,6 +1,6 @@
 \section{Results}\label{sec:results}
 \subsection{singles and pair questions}
-We first test the single and pair questions, comparing two types of Llama-8B models: Llama-3.1 and AstroSage \citep{haan2025_astrosage}, a Llama-3.1 model that was fine-tuned specifically on arXiv astrophysics papers.~\Cref{tab:basemodel} shows the comparison on both datasets. \todo{add a sentence on evaluations - numerical and qualitative accuracies. add the full description including thresholds for numerical accuracy in appendix} While both models show high performance on both tasks, Astrosage retains a small gain over the vanilla model in seven of the eight cells, across both datasets, which implies that textual domain knowledge is helpful for those tasks. Therefore, the Astrosage model was chosen for further analysis. 
+We first test the single and pair questions, comparing two types of Llama-8B models: Llama-3.1 and AstroSage \citep{haan2025_astrosage}, a Llama-3.1 model that was fine-tuned specifically on arXiv astrophysics papers.~\Cref{tab:basemodel} shows the comparison on both datasets. Single and pair descriptions are scored by a rule-based verifier that extracts every numeric and categorical claim from the generated text and checks it against the catalog: \emph{numeric accuracy} is the fraction of stated values within a per-quantity tolerance of the catalog value, and \emph{qualitative} (single) or \emph{relational} (pair) accuracy is the fraction of class words or comparisons that match it (tolerances and definitions in \Cref{app:eval}). While both models show high performance on both tasks, Astrosage retains a small gain over the vanilla model in seven of the eight cells, across both datasets, which implies that textual domain knowledge is helpful for those tasks. Therefore, the Astrosage model was chosen for further analysis. 
 \subsection{scientific reasoning tasks} Single and pair questions consists of description and simple comparisons and requires almost no reasoning beyond the basic properties. It is also similar to the protein description tasks as in  \cite{Dotan2026_betadescribe}, and therefore it is not surprising that an LLM performs well on such questions. Next, we test the performance on questions that requires some form of scientific reasoning. As mentioned in~\Cref{sec:data}, those are anomaly detection for the stellar dataset and irregular morphology-SFH correlation in the galaxy dataset.~\Cref{tab:headboth} shows the results of those two tasks using both a template-based verifier and an LLM judge (Qwen3.5-27B). The \emph{no head} column presents the basic model, with no extra information, and the performance is poor. Before adding anything to the model, we check whether this is a failure of information. A cross-fit linear probe on the same aligned features, asked to rank the members of a group, matches what the true catalog values achieve (rank-1 $0.660$ from the shared subspace and $0.686$ from the full feature, against $0.660$ for the catalog itself; \Cref{sec:appendix}). The signal the task needs is present in the features the model reads, so the failure is in the readout and not in the representation. The \emph{+ head} column shows the performance with the addition of an extra single token that comes from a dedicated non-LLM model that is meant to highlight the relevant information. In the stellar case this is a flow matching model that was trained to learn the joint distribution of the aligned features and catalog labels, conditioned on the rest of the group. In the galaxy case, this is a cross-modal predictor that is trained to predict one modality from the other. We note that adding this single token significantly improves the performance on both tasks. 
 
 \begin{table}[h]\centering\small
@@ -8,13 +8,9 @@ We first test the single and pair questions, comparing two types of Llama-8B mod
 corpus, recipe and seed; rule-scored, greedy; the better model in bold.
 Metrics: \emph{numeric acc.} = fraction of numbers the text states that fall
 within tolerance of the catalog value; \emph{qualitative acc.} (single) =
-fraction of class words (dwarf/giant, spiral/elliptical, \ldots) that match
+fraction of class words (dwarf/giant, disk/elliptical, \ldots) that match
 the catalog; \emph{relational acc.} (pair) = fraction of comparisons
-(``hotter than'', ``more massive'') that match; \emph{outlier found} =
-fraction of groups --- among those that contain an odd member --- in which the
-text names the true outlier \emph{and} its property.
-$^\dagger$~Population rows come from an earlier 150-group subsample and are
-comparable only to each other, not to the full-fold population results.
+(``hotter than'', ``more massive'') that match.
 }
 \label{tab:basemodel}
 \begin{tabular}{llcc}
@@ -43,9 +39,9 @@ comparable only to each other, not to the full-fold population results.
 \caption{\textbf{The head fixes the relational task --- on both tracks, under
 both scorers.} Each row is one arm pair on one task, measured two ways. Stars:
 does the text name the true odd member \emph{and} its property, over the
-$1{,}203$ test groups that contain one. Galaxies: does the text call the
-morphology-vs-SFH relation correctly, over the $1{,}484$ galaxies where the two
-genuinely \emph{disagree}. The rule verifier and the LLM judge are independent
+$1{,}203$ test groups that contain one. Galaxies: does the model separate the $1{,}484$ test galaxies whose
+morphology and SFH genuinely \emph{disagree} from the $9{,}193$ where they
+agree. The rule verifier and the LLM judge are independent
 instruments; they agree on the size and direction of the
 stellar effect. The galaxy rows are scored differently$^{\ast}$; their
 two rows are two controls (a model trained without the token, and the same trained
@@ -65,14 +61,35 @@ track --- relational task & scorer & no head & $+$ head & $\Delta$ \\
 \end{tabular}
 \end{table}
 
-$^{\ast}$~The galaxies are scored by how well the model's graded confidence separates
-true mismatches, taken as the minimum over the two star-formation strata ($0.50$ =
-chance), rather than by whether the text states the right verdict. A verdict rate
-saturates here: trained on the same prose, the model without the token calls $0.923$
-of the mismatching galaxies correctly and the one with it $0.973$ --- both say the right
-words. What separates them is that the narrator without the token learns
-``spheroid $\Rightarrow$ mismatch'', which is right for the $90\%$ star-forming
-majority and backwards for the quiescent minority \todo{we should use the figure here}.
+$^{\ast}$~The galaxy task is imbalanced, and the imbalance decides how it must be
+scored. A morphology--SFH mismatch means a \emph{spheroid} among star-forming
+galaxies but a \emph{disk} among quiescent ones, and $90\%$ of the test galaxies
+are star-forming. A narrator that reads morphology alone and learns ``spheroid
+$\Rightarrow$ mismatch'' is therefore right on the majority, backwards on the
+minority, and still looks excellent on the pooled sample. Whether the text states
+the right verdict does not catch this. Trained on the same prose, the model
+without the token calls $0.923$ of the mismatching galaxies correctly and the
+model with it $0.973$, so both use the right words. Instead, we score each galaxy by the model's own
+graded confidence, the log-probability of opening its description with a mismatch
+framing rather than a neutral one (no fitted weights). We compute the AUC separately within each
+star-formation stratum and report the minimum ($0.50$ = chance). \Cref{fig:concordance}
+shows why. On the star-forming majority every arm is high. On the quiescent
+minority, the two arms without the token are at or below chance and only the arm
+with the token is above it. Pooled, the shortcut learner posts the best score of
+all ($0.885$), which is why we never report pooled AUC for this task.
+
+\begin{figure}[h]
+  \centering
+  \includegraphics[width=0.85\linewidth]{figs/concordance_imbalance.pdf}
+  \caption{\textbf{Why the galaxy task is scored per stratum.} Mismatch AUC of
+  the three galaxy arms (\Cref{app:2x2}), all trained on the same prose, within
+  each star-formation stratum and pooled. Error bars are $95\%$ bootstrap
+  intervals. Mismatch means a spheroid among star-forming galaxies and a disk
+  among quiescent ones, so reading morphology alone wins the $90\%$ majority
+  and is backwards on the minority. Below the dashed line the score is
+  anti-correlated with mismatch.}
+  \label{fig:concordance}
+\end{figure}
 
 
 \subsection{is it the token, or the retraining that came with it?}
@@ -205,9 +222,8 @@ Everything above is trained on prose written by the deterministic templater.
 The obvious alternative is to let a capable LLM write it, which has the potential for better diversity and fluency. To compare the two, we built an LLM-based corpus: DeepSeek-V4 was given the same
 catalog facts and asked to write the group descriptions, and every claim it made
 was checked against the record before the text was accepted. The training text
-is, in that sense, true. \Cref{tab:corpus} \todo{is 'outlier found' the same as 'score' in the previous tables? if yes, we show change the name accordingly. Also, does the model trained without head (only latent tokens)?. We shouold explain how 'covered' 'contradiction/group
- and 'all correct' are calculated as they appear only here} compares the two corpora with
-everything else held fixed: same base model, same prompt, no head. We see that training on fluent LLM prose makes the model invent:
+is, in that sense, true. \Cref{tab:corpus} compares the two corpora with
+everything else held fixed: same base model, same prompt, and no head (both narrators read the latent tokens only and are fully fine-tuned). We see that training on fluent LLM prose makes the model invent:
 contradictions per group go from $1.9$ to $7.2$, and not one group out of
 $1{,}191$ is described fully correctly. The training text was verified true; the
 model trained on it is not. This is aligned with the finding of \cite{Hegselmann2022TabLLMFC} who showed that template-based serialization outperforms LLM-based serialization for tabular data. The two corpora differ in how much they commit to. Per group description, the
@@ -215,20 +231,36 @@ templater writes a median of $21$ words containing $5$ numbers and names $17\%$
 of the members; it states the population and the member that does not belong,
 and says nothing about the rest. The teacher-LLM writes $82$ words containing $17$
 numbers and names $83\%$ of the members, giving most of them a full quantitative
-profile. Training on the second teaches the model to produce that profile for every object in every group. At generation time on a group it has not seen, the
-tokens do not support reading off five exact values per object, so it supplies them anyway \todo{explain this better. what does it mean 'the
-tokens do not support reading off five exact values per object, so it supplies them anyway'}. Verification of the training text does not help here, because the
-problem is not that the text is false; it is that it asserts more than the input determines.
+profile. Training on the second teaches the model to do the same. On the test groups,
+the model trained on LLM prose writes a median of $78$ words against $17$, states
+$8$ values per group against $1$, and names $72\%$ of the members against
+$26\%$. Most of its extra contradictions ($70\%$) are such numeric claims, and
+most of those concern members \emph{other} than the outlier, whose values the
+template-trained model rarely states at all. Per stated value, the two models are
+contradicted at a similar rate ($0.52$ vs.\ $0.46$): the LLM-prose model is
+wrong more often mainly because it says more. Values for the typical members are hard to read
+for both models: in either arm about $40\%$ of them contradict the record
+(rule verifier). A model trained to state them for every member therefore
+mostly adds errors. This is not the whole story: on the outlier itself, the LLM-prose
+model's stated values contradict the record far more often ($18\%$ vs.\ $2\%$ of
+values, rule verifier). Verification of the training text does not help in either
+case, because the problem is not that the text is false; it is that it asserts
+more than the input determines.
 
 
 \begin{table}[h]\centering\small
-\caption{\textbf{Which prose to train on.} Same base model, same prompt, no
-head; the $1{,}191$ groups with an odd member judged in both arms, paired,
-greedy.}
+\caption{\textbf{Which prose to train on.} AstroSage-8B, same prompt, latent
+tokens only (no head), full fine-tune; greedy, judge-scored, on the $1{,}191$
+groups with an odd member judged in both arms (paired; hence $0.333$ here
+vs.\ $0.332$ on the $1{,}203$ groups of \Cref{tab:ablate}). \emph{score} is as
+in \Cref{tab:ablate}; \emph{covered} = the text correctly describes the typical
+(non-odd) members; \emph{contradictions/group} = the number of statements the
+judge marks as contradicting the record; \emph{all correct} = score, covered,
+and no contradiction. Covered, contradictions and all correct differ at $p<10^{-45}$, score at $p=9{\times}10^{-6}$ (exact McNemar; Wilcoxon for contradictions).}
 \label{tab:corpus}
 \begin{tabular}{lcccc}
 \toprule
-training prose & outlier found & covered & contradictions/group & all correct \\
+training prose & score & covered & contradictions/group & all correct \\
 \midrule
 template (ours)       & \textbf{0.333} & \textbf{0.573} & \textbf{1.88} & \textbf{0.128} \\
 DeepSeek-V4 (verified) & 0.258 & 0.178 & 7.16 & 0.000 \\

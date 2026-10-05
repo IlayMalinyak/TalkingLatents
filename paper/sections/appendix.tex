@@ -138,3 +138,95 @@ quantity the question turns on''. Deciding which one that is --- rarity, or
 agreement between two views --- is a modelling choice made before any training,
 and getting it wrong costs everything: the same pipeline, the same data and the
 same narrator produce a result at chance.
+
+
+\subsection{The training recipe}\label{app:recipe}
+\Cref{fig:recipe} compares a narrator trained with the full recipe of
+\Cref{sec:data} (cosine schedule with label smoothing, varied prompts and arXiv
+filler, applied together) against the same narrator trained with none of the three
+ingredients (constant learning rate, no label smoothing, the original prompt
+mixture, no arXiv filler). Both use the
+galaxy corpus, Llama-3.1-8B, and the same seed. We evaluate the recipe as a single unit and do not report its ingredients separately.
+The recipe raises every accuracy, and its largest effect is on memorization:
+without it, $85\%$ of single-object descriptions copy a training template
+verbatim; with it, $46\%$ do.
+
+\begin{figure}[h]
+  \centering
+  \includegraphics[width=\linewidth]{figs/recipe_ablation.pdf}
+  \caption{\textbf{Training recipe}, galaxies, Llama-3.1-8B, greedy,
+  rule-scored. \emph{Grounded} $=1-$ the fraction of claims not supported by
+  the record; \emph{novel phrasing} $=1-$ the fraction of generations that
+  copy a training template verbatim. The \emph{full recipe} bars are the
+  Llama-3.1-8B galaxy column of \Cref{tab:basemodel}.}
+  \label{fig:recipe}
+\end{figure}
+
+
+\subsection{Evaluation}\label{app:eval}
+\textbf{Rule-based verifier (single and pair records).} A deterministic program
+extracts every numeric and categorical claim from the generated text and checks
+it against the object's catalog record. No model is involved.
+\begin{itemize}\itemsep1pt
+\item \emph{Numeric accuracy}: the fraction of stated values whose absolute error
+  is within the per-quantity tolerance of \Cref{tab:tol}. A value off by more than
+  three times the tolerance counts as a \emph{contradiction}.
+\item \emph{Qualitative accuracy} (single): the fraction of class words that
+  match the catalog. For stars: evolutionary state (dwarf, subgiant, giant) and
+  group-relative classes (metal-poor/rich, fast/slow rotator, young/old,
+  luminous/faint, Sun-like). For galaxies: morphology class (early/late disk,
+  elliptical, mixed), star-formation state (quiescent, green valley,
+  star-forming, starburst) and mass class.
+\item \emph{Relational accuracy} (pair): the fraction of comparisons that match the
+  catalog. For stars: directional comparatives (hotter, more massive, larger,
+  older, higher $\log g$, more luminous, more metal-rich, and their opposites).
+  For galaxies: same or different morphology, star-formation-history trend,
+  disturbance and density cluster.
+\item \emph{Grounded} $=1-$ the fraction of claims not supported by the record;
+  \emph{novel phrasing} $=1-$ the fraction of generations that copy a training
+  template verbatim.
+\end{itemize}
+
+\begin{table}[h]\centering\small
+\caption{\textbf{Numeric tolerances} of the rule verifier (absolute, in the
+quantity's native unit). A stated value within the tolerance is correct; one
+off by more than $3\times$ the tolerance is a contradiction.}
+\label{tab:tol}
+\begin{tabular}{llcllc}
+\toprule
+\multicolumn{3}{c}{stars} & \multicolumn{3}{c}{galaxies} \\
+\cmidrule(lr){1-3}\cmidrule(lr){4-6}
+quantity & unit & tol. & quantity & unit & tol. \\
+\midrule
+$T_\mathrm{eff}$ & K & 200 & $\log M_\star$ & dex & 0.10 \\
+$\log g$ & dex & 0.20 & $\log \mathrm{SFR}$ & dex & 0.15 \\
+$[\mathrm{Fe/H}]$ & dex & 0.15 & $\log \mathrm{sSFR}$ & dex & 0.15 \\
+$P_\mathrm{rot}$ & d & 3.0 & redshift & --- & 0.10 \\
+radius & $R_\odot$ & 0.15 & S\'ersic index & --- & 0.30 \\
+mass & $M_\odot$ & 0.10 & formation age & Gyr & 0.50 \\
+age & Gyr & 1.5 & SFH mean time & --- & 0.05 \\
+parallax & mas & 0.20 & & & \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\textbf{LLM judge (stellar population records).} The verifier's extractors
+expect the template's phrasing, so the population task is scored by a separate
+text-only model (Qwen3.5-27B) that never sees any token. It reads each group
+description against the ground-truth record and is instructed to judge factual
+content only, not style. It returns: whether the text names the true odd member
+(\emph{named}); whether it attributes it to the correct property
+(\emph{property}); whether the population statement describes the typical
+members (\emph{covered}); and a list of claims that contradict the record
+(\emph{contradictions}). We derive \emph{score} = named \emph{and} property,
+and \emph{all correct} = score, covered, and no contradiction. Only groups that
+contain an odd member are scored. All arms are judged on the same groups, so
+comparisons are paired (exact McNemar for yes/no outcomes, Wilcoxon for
+contradiction counts). The judge is given no numeric tolerance and is stricter
+than the verifier: of the numeric contradictions it lists that we could parse, $56$--$60\%$ (by arm) are within
+the verifier's tolerance. Its contradiction counts are therefore an upper bound,
+and they inflate more for an arm that states more numbers.
+
+\textbf{Galaxy concordance.} Scored per star-formation stratum by the model's
+graded confidence, as described under \Cref{tab:headboth} and in
+\Cref{fig:concordance}.
