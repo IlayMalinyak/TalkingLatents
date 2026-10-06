@@ -203,6 +203,21 @@ parallax & mas & 0.20 & & & \\
 \end{tabular}
 \end{table}
 
+\textbf{Scoring the galaxy task.}\label{sec:galaxyscore} We read three statements
+from each galaxy description: the galaxy's shape (disk or spheroid), whether it
+still forms stars, and the verdict, i.e., whether the description calls the two in
+agreement. Each is read with a short list of words. For the verdict, ``mismatch'',
+``disagree'', ``outlier'' or ``unusual'' mark disagreement, and ``concordant'',
+``in accord'', ``concur'' or ``agree'' mark agreement. In the training text these
+words are exact: every description containing a disagreement word belongs to a
+disagreeing galaxy, and every one containing an agreement word to an agreeing
+galaxy (\Cref{app:eval}). We report the fraction of galaxies with the correct
+verdict, separately for star-forming and quiescent galaxies. The split matters
+because $90\%$ of the test galaxies are star-forming, and the errors concentrate in
+the quiescent minority, where a narrator must notice that a galaxy has stopped
+forming stars. Whenever a narrator's verdict is right, its stated shape and
+star-formation state are also right in more than $99.9\%$ of cases.
+
 \textbf{The judge (stellar population records).} The verifier's extractors
 expect the template's phrasing, so the population task is also scored by the
 judge (Qwen3.5-27B), a text-only model that never sees any token. It reads each group
