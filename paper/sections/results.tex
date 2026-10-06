@@ -5,28 +5,33 @@ We first test the single and pair questions, comparing two types of Llama-8B mod
 
 The asymmetry in performance, together with the results in~\Cref{tab:basemodel}, points to the number of objects in the question as the important factor for successful generation of the \emph{narrator}. The galaxy verdict concerns a single object and follows from two of its own properties, its shape and whether it still forms stars, which the narrator can read from that galaxy's tokens. Even though morphology-SFH disagreement is deeper than mere description, the \emph{narrator} still performs almost perfectly. In the stellar case, finding the odd star requires comparing every member with the rest of the group, a computation over the whole set that no single star's tokens contain. The narrator's strong performance on single and pair questions supports the hypothesis that population-related questions are inherently more challenging for the narrator. To test this, we vary only the number of stars while keeping the question fixed:
 the test groups contain between $4$ and $32$ stars, and \Cref{fig:groupsize} shows
-the score as a function of group size. Without the head, the score falls steadily
-as the group grows, from $0.45$ with $4$ stars to $0.06$ with $32$ (Spearman
-$\rho=-0.24$, $p=10^{-16}$), close to the rate of picking a star at random. With
-the head, the score stays between $0.56$ and $0.71$ at every size, with no
-significant trend. The difficulty of the stellar task therefore grows with the
-number of objects the narrator must compare, and the head narrator does not suffer
-from it. Because the two narrators also differ in training (LoRA against full
-fine-tuning), part of this stability may come from the training rather than the
-head (\Cref{sec:limitations}). Since every star
-adds the same number of tokens, a larger group is also a longer input, and our data
-cannot separate the two.
+the score as a function of group size. Here we count a description as correct if it
+names \emph{any} star that truly has the odd property, together with that property:
+the test groups designate one odd star, but larger groups more often contain a
+second star with the same property ($24\%$ of groups with $4$ stars, $84\%$ with
+$32$), and naming it is a true statement. Without the head, the score falls
+steadily as the group grows, from $0.51$ with $4$ stars to $0.15$ with $32$
+(Spearman $\rho=-0.21$, $p=10^{-13}$). With the head, it stays between $0.69$ and
+$0.81$ at every size and does not decline. Counting only the designated star gives
+the same picture at lower values (dotted lines). The difficulty of the stellar task
+therefore grows with the number of objects the narrator must compare, and the head
+narrator does not suffer from it. Because the two narrators also differ in training
+(LoRA against full fine-tuning), part of this stability may come from the training
+rather than the head (\Cref{sec:limitations}). Since every star adds the same number
+of tokens, a larger group is also a longer input, and our data cannot separate the
+two.
 
 \begin{figure}[t]
   \centering
-  \includegraphics[width=0.8\linewidth]{figs/score_vs_group_size.pdf}
+  \includegraphics[width=0.8\linewidth]{figs/score_vs_group_size_lenient.pdf}
   \caption{\textbf{The stellar task becomes harder with the number of stars.}
-  Score (the fraction of groups in which the narrator names the odd star and its
-  property, judge-scored) as a function of the number of stars in the group, for
-  the narrator without and with the head ($1{,}203$ test groups with an odd member).
-  Error bars are $95\%$ intervals. The dashed line is the chance of picking the odd
-  star at random ($1/N$); the score also requires the right property, so its
-  chance level is lower still.}
+  Fraction of groups in which the narrator names a star that truly has the odd
+  property, and the property, as a function of the number of stars in the group,
+  for the narrator without and with the head ($1{,}203$ test groups with an odd
+  member). Error bars are $95\%$ intervals. Dotted lines: the same, counting only
+  the designated odd star (the score of \Cref{tab:headboth}). Dashed line: the
+  chance of picking the odd star at random ($1/N$); the score also requires the
+  right property, so its chance level is lower still.}
   \label{fig:groupsize}
 \end{figure}
 
