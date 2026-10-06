@@ -1,0 +1,58 @@
+% Example generations on the two reasoning tasks (verbatim narrator outputs, greedy).
+% Galaxy: galaxy_id 601201, narrator trained with LoRA and no head token
+%   (MultiLLM cache/galaxy_gen_eval/generations/lora_nohead_xmodal_eval.jsonl).
+% Stars: test group population_451_N4 (MultiLLM cache/stellar_gen_eval_full/
+%   generations/{astrosage8b,flow_astrosage8b_template}.jsonl).
+\newcommand{\gOK}{{\color{teal!80!black}\,$\checkmark$}}
+\newcommand{\gNO}{{\color{coral}\,$\times$}}
+\newcommand{\hGood}[1]{{\setlength{\fboxsep}{0.6pt}\colorbox{paleteal}{\strut #1}}}
+\newcommand{\hBad}[1]{{\setlength{\fboxsep}{0.6pt}\colorbox{palecoral}{\strut #1}}}
+\tcbset{exbox/.style={colback=white, boxrule=0.6pt, arc=1.5pt,
+  left=3pt, right=3pt, top=2pt, bottom=2pt, fontupper=\footnotesize,
+  fonttitle=\footnotesize\bfseries, coltitle=deepteal,
+  toptitle=0.6pt, bottomtitle=0.6pt}}
+\begin{minipage}[t]{0.47\textwidth}\vspace{0pt}
+  \begin{tcolorbox}[exbox, colframe=neutral, colbacktitle=palegrey,
+      title={Galaxy: does its shape agree with its history?}]
+    \raggedright
+    \textbf{Catalog.} Late-type disk ($P{=}0.75$); quiescent
+    ($\log \mathrm{sSFR} = -11.6$); declining star-formation history.
+    A disk that has stopped forming stars: shape and history
+    \emph{disagree}.
+  \end{tcolorbox}\vspace{-2pt}
+  \begin{tcolorbox}[exbox, colframe=teal!80!black, colbacktitle=paleteal,
+      title={Narrator (no head token)\gOK}]
+    \raggedright
+    A \hGood{quiescent} \hGood{late-type disk} --- a
+    \hGood{cross-modal outlier}, because disks rarely quench while retaining
+    their morphology. Its star-formation history is \hGood{declining}.
+  \end{tcolorbox}
+  {\scriptsize\color{neutral} Shape, star formation and verdict all match the
+  catalog.}
+\end{minipage}\hfill
+\begin{minipage}[t]{0.5\textwidth}\vspace{0pt}
+  \begin{tcolorbox}[exbox, colframe=neutral, colbacktitle=palegrey,
+      title={Stars: which one does not belong?}]
+    \centering
+    \begin{tabular}{@{}clccc@{}}
+      star & class & $T_\mathrm{eff}$ [K] & $\log g$ & $R$ [$R_\odot$] \\
+      \hline
+      0 & dwarf    & 5778 & 4.39 & 1.05 \\
+      \hBad{1} & \hBad{\textbf{giant}} & \hBad{4662} & \hBad{\textbf{2.45}} & \hBad{\textbf{11.14}} \\
+      2 & subgiant & 5628 & 3.89 & 2.00 \\
+      3 & dwarf    & 5394 & 4.55 & 0.81 \\
+    \end{tabular}
+  \end{tcolorbox}\vspace{-2pt}
+  \begin{tcolorbox}[exbox, colframe=coral, colbacktitle=palecoral,
+      title={Narrator, no head\gNO}]
+    \raggedright
+    These 4 stars form a homogeneous population of field stars.
+    \hBad{No anomalies detected} along the field-star axis.
+  \end{tcolorbox}\vspace{-2pt}
+  \begin{tcolorbox}[exbox, colframe=teal!80!black, colbacktitle=paleteal,
+      title={Narrator $+$ head\gOK}]
+    \raggedright
+    Sample N=4: single stars. \hGood{index 1: a giant} [logg = 2.44 dex,
+    R = 11.14 Rsun, logL = 1.72 log(Lsun), giant].
+  \end{tcolorbox}
+\end{minipage}
