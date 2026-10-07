@@ -272,3 +272,29 @@ agreement    & concordant & $8{,}177$ & $0\%$ \\
 \bottomrule
 \end{tabular}
 \end{table}
+
+\subsection{Reading the numbers, by group size}\label{app:textsize}
+\Cref{tab:textsize} breaks \Cref{tab:text} down by the number of stars in the
+group. The narrator without the head falls from $0.45$ to $0.06$ as groups grow;
+the models that read the table fall less, but stay below the narrator with the
+head at every size.
+
+\begin{table}[h]\centering\small
+\caption{\textbf{Score by number of stars in the group}, for the models of
+\Cref{tab:text} (same $1{,}203$ groups; $n$ = groups of that size).}
+\label{tab:textsize}
+\begin{tabular}{lccccccc}
+\toprule
+stars in the group & 4 & 6 & 8 & 12 & 16 & 24 & 32 \\
+$n$ & 276 & 242 & 191 & 161 & 127 & 112 & 94 \\
+\midrule
+AstroSage-8B, reads the table                & 0.55 & 0.52 & 0.48 & 0.30 & 0.50 & 0.41 & 0.45 \\
+AstroSage-8B, reads the table, reasons first & 0.29 & 0.29 & 0.33 & 0.26 & 0.28 & 0.33 & 0.22 \\
+Qwen3.5-27B, reads the table                 & 0.40 & 0.39 & 0.31 & 0.37 & 0.26 & 0.24 & 0.30 \\
+Qwen3.5-27B, reads the table, reasons first  & 0.30 & 0.38 & 0.37 & 0.35 & 0.31 & 0.22 & 0.27 \\
+\midrule
+narrator                                     & 0.45 & 0.37 & 0.44 & 0.30 & 0.25 & 0.13 & 0.06 \\
+narrator $+$ head                            & \textbf{0.68} & \textbf{0.63} & \textbf{0.71} & \textbf{0.70} & \textbf{0.68} & \textbf{0.62} & \textbf{0.56} \\
+\bottomrule
+\end{tabular}
+\end{table}

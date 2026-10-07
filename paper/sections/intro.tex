@@ -75,9 +75,9 @@ recognising when a galaxy's morphology and star-formation history disagree --- w
 performs at or below chance. A probe on the underlying representation recovers most of
 that signal in both cases, so the failure is one of computation rather than
 representation. For the stellar task, supplying the same catalog values as text in
-the prompt leaves the model at chance once its verbosity is corrected for, while
-prompting it to reason through the objects first lifts it off chance but not to the level
-the tokens already reach.
+the prompt does not help: the model either names most of the group, or, when it
+reasons first, does no better than the model reading the tokens. A larger
+general-purpose model (Qwen3.5-27B) given the same table does no better either.
 %
 \emph{Second}, we show that performing the computation outside the model and
 returning it as a single extra token recovers the ability.

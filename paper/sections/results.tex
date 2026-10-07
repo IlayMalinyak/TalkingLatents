@@ -219,42 +219,59 @@ $\Delta$  & $+0.469$ & $+0.453$ & $+0.418$ \\
 % with no odd member are excluded throughout, here and everywhere else in the
 % paper.
 
-\subsection{giving the model the numbers as text does not help}
+\subsection{giving the model the numbers as text}\label{sec:text}
 If the features carry the signal and the model cannot use it, an obvious
 alternative is to skip the features and hand the model the catalog numbers
-directly. We test this on the stellar dataset only, where the group task
-has a written form: the base AstroSage-8B model, without our training, is shown each group as an indexed table
-of numeric fields (more fields than the head ever sees) and asked, in
-words, to name the member that stands out and the property it differs on. We
-also test a version that is told to reason through the stars one at a time
-before committing to an answer. \Cref{tab:text} shows both against the two
-narrators on the same groups.
-At first sight, the text-reading model looks competitive on naming the odd member alone ($0.592$)
-but it names $68\%$ of the group and never stops generating, so the rate is
-mostly hedging: corrected for how much it names, it is below chance
-($0.87\times$). On \textbf{score}, where it must also name the right property,
-it scores $0.331$ against $0.320$ for the narrator, and both are less than half the head
-narrator's $0.652$. Reasoning first makes the model commit ($18\%$ of the group named
-instead of $68\%$, and it terminates) but does not rescue it: $0.224$, the
-lowest of any model that finishes. Reading the same numbers as text is therefore
-not successful, with or without explicit reasoning.
+directly. We test this on the stellar task. Each group is shown as a table with
+one row per star, listing its catalog values (temperature, surface gravity,
+metallicity, radius, mass, and others) together with the two catalog flags the
+head also receives: whether the star is a binary and whether it belongs to an
+open cluster. With these flags the table holds everything the head is given, so
+the comparison is fair for all five kinds of odd star. The model sees two worked
+examples and is asked, in words, to name the star that does not belong and the
+property it differs in. We test two models: the base AstroSage-8B, without our
+training, and Qwen3.5-27B, a larger general-purpose model. Each is tested twice:
+answering directly, and reasoning step by step before answering.
+\Cref{tab:text} compares them with the two narrators on the same $1{,}203$
+groups.
+
+No model that reads the numbers comes close to the narrator with the head
+($0.662$). AstroSage reading the table reaches the second-best score ($0.473$),
+but by naming most of the group ($82\%$ of the stars): naming the odd star among
+them is then no better than chance ($0.92\times$). Asked to reason first, it
+names few stars and scores $0.288$, below the narrator without the head. The
+larger model is more selective: it names the odd star at about the same rate as
+the head relative to the number of stars it names. However, it often gets the
+odd star's property wrong, and scores $0.341$ answering directly and $0.324$
+after reasoning, no different from the narrator without the head ($p{=}0.7$ in
+both cases). In most groups ($94\%$) the larger model was still reasoning when
+it reached the length limit of $4{,}096$ tokens and was made to answer from what
+it had, so its reasoning result holds for this budget only. The gap to the head
+also holds for every group size (\Cref{app:textsize}). Reading the numbers
+lets a model describe the stars, but not reliably pick out the one that does
+not belong.
 
 \begin{table}[h]\centering\small
-\caption{\textbf{The catalog-text control}, the $n{=}884$ groups with an odd
-member judged for all four models, greedy. \emph{score} and \emph{named} are the same as in Table~\ref{tab:adversarial}. \emph{lift} divides \emph{named} by the fraction of the group the model names
-($1.0$ = chance given that much hedging): the two together show why the
-name alone misleads. Under \emph{score} the text-reading model's apparent lead is
-gone --- $0.331$ against $0.320$ for the narrator, both less than half the
-head narrator's $0.652$.}
+\caption{\textbf{Giving the model the numbers as text}, on the $1{,}203$ test
+groups with an odd star (all five kinds), greedy. The text-reading models see
+every catalog value plus the binary and open-cluster flags.
+\emph{score} and \emph{named} are as in \Cref{tab:adversarial};
+\emph{stars named} is the fraction of the group the text names; \emph{lift}
+divides \emph{named} by it ($1.0$ = no better than naming that many stars at
+random). Every text-reading model scores below the narrator with the head
+($p<10^{-19}$, exact McNemar on \emph{score}).}
 \label{tab:text}
 \begin{tabular}{lcccc}
 \toprule
  & score & named & lift & stars named \\
 \midrule
-AstroSage, catalog as text   & 0.331 & 0.592 & 0.87$\times$ & 68\%   \\
-AstroSage, catalog as text, reason first & 0.224 & 0.397 & 2.21$\times$ & 18\%  \\
-narrator         & 0.320 & 0.431 & 3.32$\times$ & 13\%  \\
-narrator $+$ head & \textbf{0.652} & 0.782 & \textbf{3.91}$\times$ & 20\% \\
+AstroSage-8B, reads the table                & 0.473 & 0.761 & 0.92$\times$ & 82\% \\
+AstroSage-8B, reads the table, reasons first & 0.288 & 0.447 & 2.31$\times$ & 19\% \\
+Qwen3.5-27B, reads the table                 & 0.341 & 0.512 & 3.69$\times$ & 14\% \\
+Qwen3.5-27B, reads the table, reasons first  & 0.324 & 0.570 & \textbf{4.13}$\times$ & 14\% \\
+\midrule
+narrator                                     & 0.332 & 0.442 & 3.36$\times$ & 13\% \\
+narrator $+$ head                            & \textbf{0.662} & \textbf{0.797} & 4.08$\times$ & 20\% \\
 \bottomrule
 \end{tabular}
 \end{table}
