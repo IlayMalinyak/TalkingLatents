@@ -1,68 +1,68 @@
 \section{Limitations}\label{sec:limitations}
 
-\paragraph{The corpus is not split-aware.} $99.2\%$ of test-fold stars appear in
-some training description. The contrast is symmetric across narrators so the paired
-comparisons hold, but absolute rates are optimistic, and the adversarial set
-(\Cref{tab:adversarial}) is the answer to the recall objection rather than a
-clean test. A split-aware rebuild is the right fix and we have not done it.
+% \paragraph{The corpus is not split-aware.} $99.2\%$ of test-fold stars appear in
+% some training description. The contrast is symmetric across narrators so the paired
+% comparisons hold, but absolute rates are optimistic, and the adversarial set
+% (\Cref{tab:adversarial}) is the answer to the recall objection rather than a
+% clean test. A split-aware rebuild is the right fix and we have not done it.
 
-\paragraph{The ground truth names one intruder when several qualify.} The
-composer designates one off-axis member and leaves the others unconstrained on
-that axis, so $60.5\%$ of anomalies sit in a group containing at least one other
-member with the same label ($81.7\%$ on dwarf/giant). Naming any of them is a
-true statement, but only one is scored correct. Re-scoring both narrators to credit
-any qualifying member raises both ($0.332 \to 0.419$ without the head,
-$0.662 \to 0.756$ with it) and leaves the head's lead intact ($+0.33 \to +0.34$),
-so this does not drive the result --- but every absolute
-rate in this paper is a lower bound for that reason. The effect grows with group size (a second qualifying star in $24\%$ of
-groups with $4$ stars and $84\%$ with $32$), which is why \Cref{fig:groupsize}
-credits any qualifying star. The same construction makes
-the ``no anomaly'' groups unreliable: $71.4\%$ of them contain a member that
-crosses a threshold on some axis the composer did not check, which is why groups
-with no designated odd member are excluded from every number we report.
+% \paragraph{The ground truth names one intruder when several qualify.} The
+% composer designates one off-axis member and leaves the others unconstrained on
+% that axis, so $60.5\%$ of anomalies sit in a group containing at least one other
+% member with the same label ($81.7\%$ on dwarf/giant). Naming any of them is a
+% true statement, but only one is scored correct. Re-scoring both narrators to credit
+% any qualifying member raises both ($0.332 \to 0.419$ without the head,
+% $0.662 \to 0.756$ with it) and leaves the head's lead intact ($+0.33 \to +0.34$),
+% so this does not drive the result --- but every absolute
+% rate in this paper is a lower bound for that reason. The effect grows with group size (a second qualifying star in $24\%$ of
+% groups with $4$ stars and $84\%$ with $32$), which is why \Cref{fig:groupsize}
+% credits any qualifying star. The same construction makes
+% the ``no anomaly'' groups unreliable: $71.4\%$ of them contain a member that
+% crosses a threshold on some axis the composer did not check, which is why groups
+% with no designated odd member are excluded from every number we report.
 
-\paragraph{One seed per narrator.} Every cell was trained once. Differences of a few
-points between individual cells --- particularly in \Cref{tab:basemodel} --- are
-within the noise we cannot measure. The claims rest on the pattern across cells
-and on effects large enough that a seed is not a plausible explanation.
+% \paragraph{One seed per narrator.} Every cell was trained once. Differences of a few
+% points between individual cells --- particularly in \Cref{tab:basemodel} --- are
+% within the noise we cannot measure. The claims rest on the pattern across cells
+% and on effects large enough that a seed is not a plausible explanation.
 
-\paragraph{The stellar gain is not yet attributed to the head.} The stellar
-head narrator differs from the narrator without the head in its training (LoRA
-instead of full fine-tuning) as well as in the token. Separating the two requires
-a stellar narrator trained with LoRA and no head token, about $2{,}000$ GPU-hours
-for $20$ epochs and about $5{,}000$ to match the head narrator's $50$; it has not
-been run. On galaxies, where we ran this control, the training change alone
-accounts for the whole gain (\Cref{tab:2x2}), so the same could be true, at least
-in part, for stars. The same control would show whether the head narrator's
-stability across group sizes (\Cref{fig:groupsize}) comes from the head or from
-the training.
+% \paragraph{The stellar gain is not yet attributed to the head.} The stellar
+% head narrator differs from the narrator without the head in its training (LoRA
+% instead of full fine-tuning) as well as in the token. Separating the two requires
+% a stellar narrator trained with LoRA and no head token, about $2{,}000$ GPU-hours
+% for $20$ epochs and about $5{,}000$ to match the head narrator's $50$; it has not
+% been run. On galaxies, where we ran this control, the training change alone
+% accounts for the whole gain (\Cref{tab:2x2}), so the same could be true, at least
+% in part, for stars. The same control would show whether the head narrator's
+% stability across group sizes (\Cref{fig:groupsize}) comes from the head or from
+% the training.
 
-% Set aside with Section 4.3 (token ablations):
-\iffalse
-\paragraph{We can show the token is used, not how.} The ablations establish that
-the token's contents are read (\Cref{tab:ablate}), but not the mechanism. Two
-things remain unexplained. When the head's own top pick is wrong, the narrator
-does not preferentially follow it, so it is not simply reading the head's answer
-off the token. And most of the token's channels are unstable under
-re-sampling --- eight of eleven have a run-to-run spread comparable to their
-spread across objects --- so the information the narrator uses is probably
-carried by the few channels that are stable, not by the token as a whole. We
-report the effect; we do not claim to have explained it.
-\fi
+% % Set aside with Section 4.3 (token ablations):
+% \iffalse
+% \paragraph{We can show the token is used, not how.} The ablations establish that
+% the token's contents are read (\Cref{tab:ablate}), but not the mechanism. Two
+% things remain unexplained. When the head's own top pick is wrong, the narrator
+% does not preferentially follow it, so it is not simply reading the head's answer
+% off the token. And most of the token's channels are unstable under
+% re-sampling --- eight of eleven have a run-to-run spread comparable to their
+% spread across objects --- so the information the narrator uses is probably
+% carried by the few channels that are stable, not by the token as a whole. We
+% report the effect; we do not claim to have explained it.
+% \fi
 
-\paragraph{The judge is an LLM, not a human.} Population records are scored by the
-judge, a $27$B model. It agrees closely with the independent rule-based verifier, which
-is the evidence we have that it is not inventing its own standard, but there is
-no human-labelled subset. A few hundred hand-scored groups would settle it.
+% \paragraph{The judge is an LLM, not a human.} Population records are scored by the
+% judge, a $27$B model. It agrees closely with the independent rule-based verifier, which
+% is the evidence we have that it is not inventing its own standard, but there is
+% no human-labelled subset. A few hundred hand-scored groups would settle it.
 
-\paragraph{The two tracks do not carry the same evidence.} The catalog-text
-control and the adversarial set exist only for stars; galaxies have no
-set-level task at all, and their relational question is cross-modal agreement
-within one object rather than comparison across a group. Where a claim rests on
-one track we have said so.
+% \paragraph{The two tracks do not carry the same evidence.} The catalog-text
+% control and the adversarial set exist only for stars; galaxies have no
+% set-level task at all, and their relational question is cross-modal agreement
+% within one object rather than comparison across a group. Where a claim rests on
+% one track we have said so.
 
-\paragraph{No claim about scale.} A $70$B narrator was trained on galaxies and
-is excluded here: it was not a controlled comparison against the $8$B narrators
-(batch $16$ vs $128$ at the same unscaled learning rate), and it degenerates
-into repetition on long outputs. We therefore say nothing about how these
-results move with model size.
+% \paragraph{No claim about scale.} A $70$B narrator was trained on galaxies and
+% is excluded here: it was not a controlled comparison against the $8$B narrators
+% (batch $16$ vs $128$ at the same unscaled learning rate), and it degenerates
+% into repetition on long outputs. We therefore say nothing about how these
+% results move with model size.

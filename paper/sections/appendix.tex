@@ -325,7 +325,7 @@ are omitted.}
 To see whether the narrator's errors come from the tokens or from the narrator,
 we fit two probes for every property on the same inputs the narrator receives
 (the aligned star tokens; the image and star-formation-history embeddings of a
-galaxy). The first probe is linear (ridge or logistic regression); the second has
+galaxy). The first probe is linear (ridge or logistic regression); the second is non-linear with
 one hidden layer of 512 units. Both are trained on the training fold and tested
 on the test fold. For each property we compare them with the narrator on the
 objects where the narrator stated that property (\Cref{fig:probevsnarrator}).
@@ -362,7 +362,7 @@ than the narrator.
 \begin{figure}[h]\centering
 \includegraphics[width=\textwidth]{figs/probe_vs_narrator.pdf}
 \caption{\textbf{Probes against the narrator, per property}, AstroSage-8B,
-single objects, greedy. Probes read the same tokens as the narrator. Left: mean
+single objects. Probes read the same tokens as the narrator. Left: mean
 absolute error divided by the spread (standard deviation) of the property in
 the test set; right: accuracy of class statements, with the rate of the most
 common class (black tick). All bars are on the objects where the narrator stated
