@@ -68,27 +68,27 @@ COSMOS-Web galaxies) across per-object and pairwise questions, and on a more cha
 question for each: the odd member of a set of stars, and the agreement between two
 views of a single galaxy.
 %
-\emph{First}, we find a sharp asymmetry: reading learned tokens, the model describes a
-single object and compares two objects accurately on both datasets, but fails on the
-scientific reasoning tasks --- identifying the anomalous member of a group of stars, and
-recognising when a galaxy's morphology and star-formation history disagree --- where it
-performs at or below chance. A probe on the underlying representation recovers most of
-that signal in both cases, so the failure is one of computation rather than
-representation. For the stellar task, supplying the same catalog values as text in
-the prompt does not help: the model either names most of the group, or, when it
-reasons first, does no better than the model reading the tokens. A larger
-general-purpose model (Qwen3.5-27B) given the same table does no better either.
+\emph{First}, we find a sharp asymmetry. Reading learned tokens, the model describes
+single objects and compares pairs mostly correctly on both datasets, and judges whether a
+galaxy's shape and star-formation history agree for $97$--$99\%$ of galaxies. It fails
+when the answer requires comparing a whole group: it names the odd star and its property
+in a third of groups, falling from $0.51$ with four stars to $0.15$ with $32$. A linear
+probe ranks the odd star as well as the catalog values do, so the signal is in the
+features and the failure is in using it. Supplying the catalog values as text does not
+help: the model either names most of the group or, when it reasons first, does no better
+than the model reading the tokens, and a larger general-purpose model (Qwen3.5-27B) does
+no better either.
 %
-\emph{Second}, we show that performing the computation outside the model and
-returning it as a single extra token recovers the ability.
+\emph{Second}, performing the group computation outside the model and returning it as a
+single extra token doubles the stellar score ($0.33 \to 0.66$), keeps it flat across
+group sizes, and holds on groups whose odd star was never the odd one in training. This
+narrator was also trained differently (LoRA instead of full fine-tuning), and the
+matching control has not been run (\Cref{sec:limitations}). On galaxies, where the
+narrator already succeeds, the head token adds nothing.
 %
-\emph{Third}, the computation must match the question. A density-based head recovers rarity
-among stars but is at chance on cross-modal agreement among galaxies, where a
-discriminative cross-modal predictor works instead. 
-%
-\emph{Finally}, we report two evaluation traps that each would have produced a
-confidently wrong result, and find that verified templated prose yields a substantially
-more factual model than fluent LLM-written prose on the same task.
+\emph{Third}, verified templated prose yields a substantially more factual model than
+fluent LLM-written prose on the same task, because the LLM-written text states more than
+the input determines.
 
 \section{Related Work}\label{sec:related_work}
 

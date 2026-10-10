@@ -112,12 +112,12 @@ with everything else fixed. Varying the input format raises accuracy on single
 objects, but the narrator starts reciting its training text: novel phrasing
 falls from $0.40$ to $0.18$ on single objects and from $0.42$ to $0.04$ on pairs,
 and pair accuracy drops. Adding the paper sentences reverses this (novel
-phrasing $0.39$ and $0.68$) and gives the highest accuracy on every metric.
+phrasing $0.39$ and $0.68$) and gives the highest accuracy on single objects and on pair comparisons; only numeric accuracy on pairs stays below the baseline ($0.384$ vs.\ $0.416$).
 
 The lower block, on the full $288$k-record corpus, adds the paper sentences
-\emph{without} varying the format. On single objects this does not help: accuracy
-is unchanged and copying increases (novel phrasing $0.15 \to 0.06$). Pairs do
-improve. This comparison differs from the upper block in corpus size, learning-rate
+\emph{without} varying the format. On single objects both accuracies rise (numeric $0.540 \to
+0.647$, qualitative $0.836 \to 0.870$), but copying increases (novel phrasing
+$0.15 \to 0.06$). Pairs do improve. This comparison differs from the upper block in corpus size, learning-rate
 schedule and the share of intervening text taken from papers, so we read it only
 as consistent with the claim that the paper sentences help when the input format
 is varied. A one-variable test of the paper sentences without varied formats is
@@ -139,14 +139,14 @@ comparable with each other.}
  & num. & qual. & novel & num. & rel. & novel \\
 \midrule
 \multicolumn{7}{l}{\emph{$95$k-record subset}}\\
-baseline                         & 0.604 & 0.776 & 0.404 & 0.650 & 0.731 & 0.419 \\
-$+$ varied formats               & 0.686 & 0.807 & 0.180 & 0.560 & 0.695 & 0.043 \\
-$+$ varied formats $+$ papers    & \textbf{0.710} & \textbf{0.817} & 0.386 & \textbf{0.618} & \textbf{0.750} & \textbf{0.682} \\
+baseline                         & 0.500 & 0.828 & 0.404 & \textbf{0.416} & 0.731 & 0.419 \\
+$+$ varied formats               & 0.519 & 0.843 & 0.180 & 0.340 & 0.695 & 0.043 \\
+$+$ varied formats $+$ papers    & \textbf{0.526} & \textbf{0.855} & 0.386 & 0.384 & \textbf{0.750} & \textbf{0.682} \\
 \midrule
 \multicolumn{7}{l}{\emph{full corpus ($288$k records)}}\\
-baseline                         & 0.687 & 0.748 & 0.151 & 0.607 & 0.622 & 0.268 \\
-$+$ papers only                  & 0.670 & 0.758 & 0.060 & \textbf{0.661} & \textbf{0.806} & \textbf{0.631} \\
-full recipe                      & \textbf{0.822} & \textbf{0.812} & \textbf{0.537} & 0.647 & 0.795 & 0.355 \\
+baseline                         & 0.540 & 0.836 & 0.151 & 0.374 & 0.622 & 0.268 \\
+$+$ papers only                  & 0.647 & 0.870 & 0.060 & \textbf{0.422} & \textbf{0.806} & \textbf{0.631} \\
+full recipe                      & \textbf{0.750} & \textbf{0.881} & \textbf{0.537} & 0.410 & 0.795 & 0.355 \\
 \bottomrule
 \end{tabular}
 \end{table}
@@ -154,15 +154,26 @@ full recipe                      & \textbf{0.822} & \textbf{0.812} & \textbf{0.5
 \subsection{Evaluation}\label{app:eval}
 \textbf{Rule-based verifier (single and pair records).} A deterministic program
 extracts every numeric and categorical claim from the generated text and checks
-it against the object's catalog record. No model is involved.
+it against the object's catalog record. No model is involved. It reads values
+written in running text (``a temperature of $5800$\,K'') and in list form
+(``Surface gravity: $4.3$''). A negated statement counts as a claim of the
+opposite (``not Sun-like'' is correct for a star that is not Sun-like), and a
+galaxy's star-formation trend is checked over the time window the text names
+(e.g.\ ``declining over the last $5\%$'').
 \begin{itemize}\itemsep1pt
-\item \emph{Numeric accuracy}: the fraction of stated values whose absolute error
-  is within the per-quantity tolerance of \Cref{tab:tol}. A value off by more than
-  three times the tolerance counts as a \emph{contradiction}.
+\item \emph{Numeric accuracy}: the fraction of stated values within $10\%$ of
+  the catalog value. For quantities given as logarithms ($\log g$, $[\mathrm{Fe/H}]$,
+  $\log M_\star$, $\log \mathrm{sSFR}$) this means $10\%$ in the underlying
+  quantity, i.e.\ within $\log_{10} 1.1 = 0.041$\,dex. The galaxy
+  star-formation trend index is signed and is zero for a flat history, so a
+  relative tolerance is undefined for it; it keeps an absolute tolerance of
+  $0.05$. A value off by more than three times the tolerance counts as a
+  \emph{contradiction}. \Cref{tab:tol} gives the accuracy and the mean absolute
+  error of each quantity separately.
 \item \emph{Qualitative accuracy} (single): the fraction of class words that
   match the catalog. For stars: evolutionary state (dwarf, subgiant, giant) and
-  group-relative classes (metal-poor/rich, fast/slow rotator, young/old,
-  luminous/faint, Sun-like). For galaxies: morphology class (early/late disk,
+  group-relative classes (metallicity rank in four classes, hot/cool, fast/slow
+  rotator, young/old, luminous/faint, Sun-like, metal-poor on an absolute scale). For galaxies: morphology class (early/late disk,
   elliptical, mixed), star-formation state (quiescent, green valley,
   star-forming, starburst) and mass class.
 \item \emph{Relational accuracy} (pair): the fraction of comparisons that match the
@@ -181,24 +192,35 @@ it against the object's catalog record. No model is involved.
 \end{itemize}
 
 \begin{table}[h]\centering\small
-\caption{\textbf{Numeric tolerances} of the rule verifier (absolute, in the
-quantity's native unit). A stated value within the tolerance is correct; one
-off by more than $3\times$ the tolerance is a contradiction.}
+\caption{\textbf{Numbers stated for single objects}, per quantity, by the
+Llama-3.1-8B and AstroSage-8B narrators of \Cref{tab:basemodel} (greedy).
+\emph{acc.}: fraction within $10\%$ (\Cref{app:eval}); \emph{MAE}: mean
+absolute error in the quantity's unit; $n$: number of stated values. Quantities
+stated fewer than $10$ times by both models are omitted.}
 \label{tab:tol}
-\begin{tabular}{llcllc}
+\begin{tabular}{llrccrcc}
 \toprule
-\multicolumn{3}{c}{stars} & \multicolumn{3}{c}{galaxies} \\
-\cmidrule(lr){1-3}\cmidrule(lr){4-6}
-quantity & unit & tol. & quantity & unit & tol. \\
+ & & \multicolumn{3}{c}{Llama-3.1-8B} & \multicolumn{3}{c}{AstroSage-8B} \\
+\cmidrule(lr){3-5}\cmidrule(lr){6-8}
+quantity & unit & $n$ & acc. & MAE & $n$ & acc. & MAE \\
 \midrule
-$T_\mathrm{eff}$ & K & 200 & $\log M_\star$ & dex & 0.10 \\
-$\log g$ & dex & 0.20 & $\log \mathrm{SFR}$ & dex & 0.15 \\
-$[\mathrm{Fe/H}]$ & dex & 0.15 & $\log \mathrm{sSFR}$ & dex & 0.15 \\
-$P_\mathrm{rot}$ & d & 3.0 & redshift & --- & 0.10 \\
-radius & $R_\odot$ & 0.15 & S\'ersic index & --- & 0.30 \\
-mass & $M_\odot$ & 0.10 & formation age & Gyr & 0.50 \\
-age & Gyr & 1.5 & SFH mean time & --- & 0.05 \\
-parallax & mas & 0.20 & & & \\
+\multicolumn{8}{l}{\emph{stars}}\\
+$T_\mathrm{eff}$ & K           & 331 & 0.99 & 67    & 293 & 1.00 & 67    \\
+$\log g$         & dex         & 355 & 0.59 & 0.072 & 293 & 0.59 & 0.074 \\
+mass             & $M_\odot$   & 342 & 0.85 & 0.050 & 222 & 0.83 & 0.064 \\
+radius           & $R_\odot$   & 155 & 0.57 & 0.34  & 180 & 0.61 & 0.40  \\
+age              & Gyr         & 284 & 0.34 & 1.46  & 178 & 0.31 & 1.50  \\
+parallax         & mas         & 270 & 0.43 & 0.22  & 147 & 0.36 & 0.30  \\
+\midrule
+\multicolumn{8}{l}{\emph{galaxies}}\\
+$\log M_\star$          & dex & 88   & 0.20 & 0.19  & 226  & 0.23 & 0.14  \\
+$\log \mathrm{sSFR}$    & dex & 229  & 0.30 & 0.12  & 195  & 0.27 & 0.14  \\
+redshift                & --- & 739  & 0.85 & 0.066 & 543  & 0.86 & 0.045 \\
+S\'ersic index          & --- & 0    & ---  & ---   & 61   & 0.16 & 1.40  \\
+formation age           & Gyr & 82   & 0.55 & 0.054 & 324  & 0.58 & 0.17  \\
+SFH mean time           & --- & 1692 & 0.89 & 0.012 & 2248 & 0.87 & 0.013 \\
+SFH trend index         & --- & 1726 & 0.70 & 0.048 & 1890 & 0.66 & 0.051 \\
+recent mass fraction    & --- & 419  & 0.65 & 0.026 & 1058 & 0.64 & 0.023 \\
 \bottomrule
 \end{tabular}
 \end{table}
@@ -272,6 +294,83 @@ agreement    & concordant & $8{,}177$ & $0\%$ \\
 \bottomrule
 \end{tabular}
 \end{table}
+
+\subsection{Accuracy per property}\label{app:perprop}
+\Cref{fig:perprop} breaks the single-object accuracy of AstroSage-8B down by
+property, on the whole test set ($19{,}010$ stars, $3{,}000$ galaxies). Most
+class statements are right more than $90\%$ of the time. The exceptions are
+informative. For stars, the metallicity rank is right in $68\%$ of cases, and
+most errors confuse two neighbouring classes (below and above the median);
+subgiants are often called dwarfs ($59\%$ correct, against $98\%$ for dwarfs
+and giants). Among stated numbers, temperature and mass are usually within
+$10\%$, while radius, surface gravity, parallax and age often are not; age is
+off by $1.5$\,Gyr on average. For galaxies, redshift and the mean
+star-formation time are accurate, while stellar mass, specific star-formation
+rate and the S\'ersic index are rarely within $10\%$ (stellar mass is off by
+$0.14$\,dex on average).
+
+\begin{figure}[h]\centering
+\includegraphics[width=\textwidth]{figs/per_property_accuracy.pdf}
+\caption{\textbf{Single-object accuracy per property}, AstroSage-8B, greedy,
+whole test set. Left: fraction of stated numbers within $10\%$ of the catalog
+value (\Cref{app:eval}); right: fraction of class statements that match the
+catalog. Bars are $95\%$ intervals; the dashed line is the pooled accuracy;
+colour marks properties significantly below or above it; numbers at the right
+are how many statements were scored. Properties stated fewer than $30$ times
+are omitted.}
+\label{fig:perprop}
+\end{figure}
+
+\subsection{Does the narrator say what the tokens contain?}\label{app:probevsnarrator}
+To see whether the narrator's errors come from the tokens or from the narrator,
+we fit two probes for every property on the same inputs the narrator receives
+(the aligned star tokens; the image and star-formation-history embeddings of a
+galaxy). The first probe is linear (ridge or logistic regression); the second has
+one hidden layer of 512 units. Both are trained on the training fold and tested
+on the test fold. For each property we compare them with the narrator on the
+objects where the narrator stated that property (\Cref{fig:probevsnarrator}).
+
+\paragraph{Galaxies.} No test galaxy appears in the training text, so this is a
+clean comparison. The narrator says about as much as the non-linear probe can
+read. On classes they are equal for morphology, disturbance and the
+star-formation trend; elsewhere the probe is ahead by $0.03$--$0.07$ (by $0.09$
+for the S\'ersic shape, which the narrator states for $1\%$ of galaxies).
+On numbers the probe is more accurate for the star-formation-history quantities
+and the specific star-formation rate, and the narrator is more accurate for
+redshift and stellar mass. The largest gap is not accuracy but coverage: the
+narrator states the stellar mass, specific star-formation rate, redshift or
+S\'ersic index for only $2$--$18\%$ of galaxies, although the probes read them
+well ($R^2 = 0.85$--$0.99$, except the S\'ersic index, $R^2 = 0.43$).
+
+\paragraph{Stars.} The narrator is more accurate than both probes on most
+numbers, for example radius ($0.40$ against $0.82\,R_\odot$ for the non-linear
+probe). Part of this is recall. The narrator states the exact catalog value far
+more often than a probe can: temperature to the kelvin in $35\%$ of its
+statements, against $0.5\%$ for the non-linear probe. Almost every such value is
+written in some training description of that star, which exists for $99.2\%$ of
+test stars (\Cref{sec:data}); when the value appears in none of them, exact
+matches drop to the probe's level. The effect on the average error is small: it
+is only slightly lower where the training text gave the number. On classes the
+narrator and the probes agree to within $0.02$.
+
+\paragraph{Weak in both.} Some properties are hard for the probes too: star age
+($R^2 = 0.55$), the metallicity rank ($66\%$, against $25\%$ by chance), and the
+galaxy S\'ersic index. For these, the information is mostly missing from the
+tokens, and the narrator's errors (\Cref{fig:perprop}) reflect the tokens rather
+than the narrator.
+
+\begin{figure}[h]\centering
+\includegraphics[width=\textwidth]{figs/probe_vs_narrator.pdf}
+\caption{\textbf{Probes against the narrator, per property}, AstroSage-8B,
+single objects, greedy. Probes read the same tokens as the narrator. Left: mean
+absolute error divided by the spread (standard deviation) of the property in
+the test set; right: accuracy of class statements, with the rate of the most
+common class (black tick). All bars are on the objects where the narrator stated
+the property; the percentage next to each name is how often it did. Top:
+galaxies ($3{,}000$, none in the training text); bottom: stars ($19{,}010$,
+$99.2\%$ described in the training text).}
+\label{fig:probevsnarrator}
+\end{figure}
 
 \subsection{Reading the numbers, by group size}\label{app:textsize}
 \Cref{tab:textsize} breaks \Cref{tab:text} down by the number of stars in the

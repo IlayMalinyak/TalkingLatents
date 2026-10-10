@@ -17,7 +17,7 @@
 % Both example texts are VERBATIM, not invented:
 %   question -> configs/stellar/filler_queries.yaml : single_target[0]
 %   prose    -> cache/stellar_gen_eval/generations/astrosage8b.jsonl, a single-
-%               mode generation at T=0.6, quoted in full. NB greedy (T=0) output
+%               mode generation at T=0.6, first sentences quoted verbatim. NB greedy (T=0) output
 %               from this arm is a bullet list, not free prose -- the free-form
 %               register appears once the template attractor is broken. State
 %               the temperature if the figure is ever queried on this.
@@ -72,12 +72,12 @@
 % ------------------------------------------------ input block (the anchor)
 % token row chained with relative spacing so it survives any document font size
 \node[brak] (ob) at (0,0) {[OBJECTS]};
-\node[tok, right=1.8mm of ob] (g0) {};
+\node[tok, right=1.2mm of ob] (g0) {};
 \node[tok, right=1.2mm of g0] (g1) {};
 \node[text=deepteal, right=1.0mm of g1, inner sep=0pt] (dots) {$\cdots$};
 \node[tok, right=1.0mm of dots] (k0) {};
 \node[tok, right=1.2mm of k0] (k1) {};
-\node[brak, right=1.8mm of k1] (cb) {[/OBJECTS]};
+\node[brak, right=1.2mm of k1] (cb) {[/OBJECTS]};
 \coordinate (rowmid) at ($(ob.west)!0.5!(cb.east)$);
 \node[ex] (q) at ($(rowmid)+(0,0.50)$) {``Describe this star.''};
 \begin{scope}[on background layer]
@@ -87,26 +87,25 @@
 \node[dnote, anchor=north] at ($(input.south)+(0,-1mm)$) {\textbf{input}};
 
 % ------------------------------------------------ upstream (left)
-\node[box, left=7mm of input] (adapt) {\textbf{adapter}\\\textbf{network}};
-\node[box, left=7mm of adapt]  (feat)
+\node[box, left=4mm of input] (adapt) {\textbf{adapter}\\\textbf{network}};
+\node[box, left=4mm of adapt]  (feat)
   {\textbf{multimodal}\\\textbf{features}\\[-1pt] \scriptsize $N$ objects};
 \draw[arr] (feat) -- (adapt);
 \draw[arr] (adapt) -- (input);
 
 % ------------------------------------------------ LLM (right)
-\node[box, right=7mm of input, minimum width=21mm] (llm) {\textbf{LLM}\\[3pt]
+\node[box, right=4mm of input, minimum width=15mm] (llm) {\textbf{LLM}\\[3pt]
   {\scriptsize\ttfamily\color{deepteal} LoRA\hspace{5mm}}};
 \draw[arr] (input) -- (llm);
 
 % ------------------------------------------------ output prose (right)
 \node[draw=deepteal, line width=1.0pt, rounded corners=2.5pt, fill=white,
-      right=7mm of llm, align=left, inner sep=4pt, font=\scriptsize,
-      text width=54mm]
+      right=4mm of llm, align=left, inner sep=4pt,
+      font={\scriptsize\hyphenpenalty 10000 \exhyphenpenalty 10000 },
+      text width=33mm]
   (prose)
-  {This source presents as a catalogued main-sequence dwarf. Catalog values:
-   spectroscopic Teff 6485 K; stellar log g 4.07 $(+0.03/{-}0.04)$; reported age
-   (derived from isochrone) 2.1 Gyr. This star's [Fe/H] falls in the
-   above-median quartile of the Kepler field.};
+  {This source presents as a catalogued main-sequence dwarf.
+   Catalog values: spectroscopic Teff 6485\,K; stellar log\,g 4.07 \ldots};
 \node[dnote, anchor=north] at ($(prose.south)+(0,-1mm)$) {\textbf{prose}};
 \draw[arr] (llm) -- (prose);
 
