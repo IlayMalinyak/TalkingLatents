@@ -209,7 +209,7 @@ narrator in this paper uses both.
 described in training, the narrator states about what a non-linear probe on the
 same tokens can read. On stars it states more: it is more accurate than the same
 probe on most numbers (radius error $0.40$ against $0.82\,R_\odot$), and it
-gives the temperature to the kelvin in $35\%$ of its statements, against $0.5\%$
+gives the exact temperature (zero Kelvin error) in $35\%$ of its statements, against $0.5\%$
 for the probe. Almost every such exact value is written in some training
 description of the same star; where none gives it, exact matches fall to the
 probe's level. The average error changes little. Part of the stellar
@@ -218,21 +218,20 @@ in \Cref{tab:basemodel} should be read with this in mind.
 
 \textbf{The answer.} The objection that matters most is that the head narrator
 might recall which star was called unusual during training rather than work it
-out. The overlap is the same for every narrator, so the paired comparisons above
-are fair, but they do not rule this out. From the test fold we therefore keep
+out. While the comparisons in~\Cref{tab:headboth}
+are fair (all experiments used the same dataset), they do not rule this out. From the test fold we therefore keep
 only groups whose odd member was \emph{never} an odd member anywhere in
 training: the star may have been described many times, but never as the one
 that stands out. Only $2.3\%$ of candidate groups survive that filter, leaving
-$1{,}000$. If the head narrator is recalling, it should lose most of its
+$1{,}000$. If the head narrator is memorizing, it should lose most of its
 advantage here. \Cref{tab:adversarial} shows that it does not; the advantage
 grows. The head is worth $+0.469$ on this set against $+0.330$ on the full test
 set, and the two narrators move in opposite directions: the narrator without the
-head falls ($0.332 \to 0.279$) while the head narrator does not. That is the
-opposite of what recall predicts.
+head falls ($0.332 \to 0.279$) while the head narrator improves ($0.662 \to 0.748$). 
 
 \begin{table}[h]\centering\small
 \caption{$1{,}000$ stellar groups whose odd member
-was never an odd member in training, greedy, judge-scored. \emph{score} is the fraction of descriptions that name the
+was never an odd member in training, judge-scored. \emph{score} is the fraction of descriptions that name the
 true odd member and its property; \emph{named} counts naming the odd member
 regardless of property, and \emph{property} naming the right property regardless
 of member.}
