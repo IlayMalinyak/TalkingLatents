@@ -321,6 +321,43 @@ are omitted.}
 \label{fig:perprop}
 \end{figure}
 
+\subsection{The stellar group task, by kind of odd star}\label{app:perodd}
+Groups are built by choosing members that share one property and adding an odd
+star that differs on another, but the other members are not checked on that
+second property, so some groups contain more than one star with the odd
+property. \Cref{tab:perodd} gives the score for each kind of odd star on all
+test groups, and on the $556$ groups in which the odd star is the only member with
+its odd property. The head improves the score in every row. On the second set
+the narrator without the head again declines with group size ($0.44$, $0.33$ and
+$0.14$ for $4$--$7$, $8$--$15$ and $16$--$32$ stars), while the head narrator
+does not ($0.70$, $0.74$, $0.75$).
+
+\begin{table}[h]\centering\small
+\caption{\textbf{The stellar group task, by kind of odd star}, judge-scored,
+greedy; score as in \Cref{tab:headboth}. Rows use the groups whose odd stars all
+differ on the same property ($775$ of $1{,}203$; the last row uses all groups). \emph{Unique}: groups in which
+the odd star is the only member with its odd property. Binarity and open-cluster
+membership are also given to the head as catalog flags (\Cref{sec:text}). All
+differences are significant (exact McNemar, $p<10^{-3}$) except giants in the unique
+groups ($p=0.33$, $n=60$).}
+\label{tab:perodd}
+\begin{tabular}{lcccccc}
+\toprule
+ & \multicolumn{3}{c}{all groups} & \multicolumn{3}{c}{unique} \\
+\cmidrule(lr){2-4}\cmidrule(lr){5-7}
+odd star & $n$ & narrator & $+$ head & $n$ & narrator & $+$ head \\
+\midrule
+open-cluster member & 120 & 0.150 & \textbf{0.708} & 117 & 0.145 & \textbf{0.709} \\
+binary              & 140 & 0.157 & \textbf{0.550} &  47 & 0.255 & \textbf{0.660} \\
+metal-rich          & 169 & 0.533 & \textbf{0.840} & 147 & 0.551 & \textbf{0.850} \\
+hot                 & 161 & 0.342 & \textbf{0.627} &  99 & 0.394 & \textbf{0.657} \\
+giant               & 185 & 0.227 & \textbf{0.449} &  60 & 0.300 & \textbf{0.400} \\
+\midrule
+all kinds           & 1{,}203 & 0.332 & \textbf{0.662} & 556 & 0.369 & \textbf{0.714} \\
+\bottomrule
+\end{tabular}
+\end{table}
+
 \subsection{Does the narrator say what the tokens contain?}\label{app:probevsnarrator}
 To see whether the narrator's errors come from the tokens or from the narrator,
 we fit two probes for every property on the same inputs the narrator receives
