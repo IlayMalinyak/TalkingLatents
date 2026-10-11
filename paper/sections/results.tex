@@ -176,23 +176,59 @@ content is worth $0.06$--$0.10$ of the $0.33$ gain, and the remaining $0.23$
 coincides with a change in training that we cannot yet separate from the token.
 \fi
 
-\subsection{is this reasoning, or memorization?}\label{sec:memorization}
-As described in \Cref{sec:data}, $99.2\%$ of the stars we evaluate on appear in
-\emph{some} training description. That is the same for every narrator, so the
-paired comparisons above are fair, but it leaves an obvious objection: the head
-narrator might be recalling which star was called unusual
-during training rather than working it out.
+\subsection{what does the narrator memorize?}\label{sec:memorization}
+A narrator trained on templated text, and on the stars it is later tested on
+(\Cref{sec:data}), could copy instead of read. Three things could be copied: the
+wording of the training descriptions, the values written about a particular
+object, and the answer to a reasoning question. We test each where it can be
+tested (\Cref{tab:memo}). The tests use different data, so each is read against
+its own control, not against the other rows.
 
-We test this directly, on the stellar track. From the test fold we keep only
-groups whose odd member was \emph{never} an odd member anywhere in training:
-the star may have been described many times, but never as the one that stands
-out. Only $2.3\%$ of candidate groups survive that filter, leaving $1{,}000$.
-If the head narrator is recalling, it should lose most of its advantage here. Table~\ref{tab:adversarial} shows this experiment. The advantage does not shrink where memorisation is
-impossible; it grows. The head is worth $+0.469$ on this set against
-$+0.330$ on the full test set, and the two narrators move in opposite directions
-on it: the narrator without the head falls ($0.332 \to 0.279$) while the head
-narrator does not. That is the opposite of what a memorization
-explanation predicts.
+\begin{table}[h]\centering\small
+\caption{\textbf{What the narrator copies from its training text.} Each row is a
+separate test with its own control; numbers are not comparable across rows.}
+\label{tab:memo}
+\begin{tabular}{p{0.2\linewidth}p{0.11\linewidth}p{0.27\linewidth}p{0.3\linewidth}}
+\toprule
+what could be copied & data & test & finding \\
+\midrule
+wording & galaxies & training recipe (\Cref{app:recipe}) & copied when only the input format varies; the paper sentences remove it \\
+values about one object & stars, galaxies & narrator against probes and against the training text (\Cref{app:probevsnarrator}) & exact values copied when the training text gives them; average error barely changes \\
+the answer to a reasoning question & stars & groups whose odd star was never the odd one in training (\Cref{tab:adversarial}) & not recalled; the head's advantage grows \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\textbf{Wording.} With a varied input format but no paper sentences, the
+narrator recites its training descriptions: the fraction of novel descriptions
+falls from $0.40$ to $0.18$ on single objects and from $0.42$ to $0.04$ on
+pairs. Adding the paper sentences restores it ($0.39$ and $0.68$). Every
+narrator in this paper uses both.
+
+\textbf{Values about one object.} On galaxies, where no test galaxy is
+described in training, the narrator states about what a non-linear probe on the
+same tokens can read. On stars it states more: it is more accurate than the same
+probe on most numbers (radius error $0.40$ against $0.82\,R_\odot$), and it
+gives the temperature to the kelvin in $35\%$ of its statements, against $0.5\%$
+for the probe. Almost every such exact value is written in some training
+description of the same star; where none gives it, exact matches fall to the
+probe's level. The average error changes little. Part of the stellar
+narrator's numeric precision is therefore recall, and its single-star numbers
+in \Cref{tab:basemodel} should be read with this in mind.
+
+\textbf{The answer.} The objection that matters most is that the head narrator
+might recall which star was called unusual during training rather than work it
+out. The overlap is the same for every narrator, so the paired comparisons above
+are fair, but they do not rule this out. From the test fold we therefore keep
+only groups whose odd member was \emph{never} an odd member anywhere in
+training: the star may have been described many times, but never as the one
+that stands out. Only $2.3\%$ of candidate groups survive that filter, leaving
+$1{,}000$. If the head narrator is recalling, it should lose most of its
+advantage here. \Cref{tab:adversarial} shows that it does not; the advantage
+grows. The head is worth $+0.469$ on this set against $+0.330$ on the full test
+set, and the two narrators move in opposite directions: the narrator without the
+head falls ($0.332 \to 0.279$) while the head narrator does not. That is the
+opposite of what recall predicts.
 
 \begin{table}[h]\centering\small
 \caption{$1{,}000$ stellar groups whose odd member
@@ -212,6 +248,12 @@ $\Delta$  & $+0.469$ & $+0.453$ & $+0.418$ \\
 \end{tabular}
 \end{table}
 
+Taken together, the narrator copies surface detail, namely wording when the
+training allows it and exact values it has read about the same star, but not
+conclusions: whether a star is the odd one in its group is worked out from the
+input, not recalled. This is also why the stellar overlap does not undermine the
+reasoning results. They are measured on new groups, and in \Cref{tab:adversarial}
+on answers that never appeared in training.
 
 % One caveat on reading the table. This set is deliberately harder than the full
 % fold and its item mix is different, so only the within-set gap is quotable:

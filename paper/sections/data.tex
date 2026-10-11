@@ -12,21 +12,31 @@ LLM we use in its place in one comparison. Generated text is scored by the
 by the \emph{judge} (Qwen3.5-27B), an LLM that reads each description against
 the ground truth.
 
-We test two different astrophysical datasets, representing different domains and physical properties. The first dataset is a \emph{stellar} multimodal dataset comprising 190,091 stars, observed by $5$ different modalities coming from different telescopes - \emph{Kepler}\citep{kepler:mission}, TESS\citep{tess:mission}, LAMOST\citep{lamost:survey}, APOGEE\citep{apogee:mission}, and Gaia\citep{gaia:mission}. Each modality is processed through a specific encoder, and the modalities are aligned with a model that factorizes the latent space into shared and specific subspaces. The result is one shared feature and $5$ per-modality features, each projected to the token embedding space of the LLM as its own small group of tokens. The second dataset is galaxies from the COSMOS-Web survey \citep{Casey2023_cosmos-web}, including two modalities: images and star-formation history (SFH). Similar to the stellar dataset, we use a pretrained model that aligns the two modalities (here using CLIP \cite{Radford2021_CLIP}) and project the frozen features into the LLM's token embedding. Notably, the two datasets are different in many aspects: number and type of modalities, pretrained models, and scientific questions. Using the two datasets in the same pipeline highlights general vs data-specific conclusions.\\  
+We test two different astrophysical datasets, representing different domains and physical properties. The first dataset is a \emph{stellar} multimodal dataset comprising 190,091 stars, observed by $5$ different modalities coming from different telescopes - \emph{Kepler}\citep{kepler:mission}, TESS\citep{tess:mission}, LAMOST\citep{lamost:survey}, APOGEE\citep{apogee:mission}, and Gaia\citep{gaia:mission}. Each modality is processed through a specific encoder, and the modalities are aligned with a model that factorizes the latent space into shared and specific subspaces. The result is one shared feature and $5$ per-modality features, each projected to the token embedding space of the LLM as its own small group of tokens. The second dataset is galaxies from the COSMOS-Web survey \citep{Casey2023_cosmos-web}, including two modalities: images and star-formation history (SFH). Similar to the stellar dataset, we use a pretrained model that aligns the two modalities (here using CLIP \cite{Radford2021_CLIP}) and project the frozen features into the LLM's token embedding. Notably, the two datasets are different in many aspects: number and type of modalities, pretrained models, scientific questions, and what their test sets hold out (below). Using the two datasets in the same pipeline highlights general vs data-specific conclusions.\\  
 \textbf{training prose}. One of the challenges in this pipeline is creating the training dataset. This should include ground-truth prose per object. Contrary to other fields, in astrophysics data is usually stored only in numerical catalogs, so one needs to create the prose from scratch. Our main method is a \emph{template-based} method: a deterministic program that picks a subset of facts from the catalog, chooses a phrasing from a bank of templates, and
 writes prose. Every sentence is checked against the record by the verifier before it enters the corpus. The
 check is per-fact: it guarantees that the facts a description states are true of the object, not
 that the description mentions every unusual object in a group. Both datasets share two types of prose: description of a single object (single), and comparison between pairs (pair). We also test deeper reasoning capabilities with two additional tasks. In the stellar dataset, we use population prose: a group of $N$ objects with a description of the typical members, and a callout
 of the ones that do not belong and on which property. In the galaxy dataset, the task is to judge whether a galaxy's shape agrees with its star-formation history, a relation between its two modalities. In~\Cref{sec:results} we compare the template-based method with a second method: an \emph{LLM-based} generation, where the writer produces the population prose from the same catalog facts, and every claim is verified.
 
-\textbf{Objects, facts and descriptions.} \todo{here we might want to emphesize that the datasets representes two different paradigms - the stellar dataset treat every prose as a unique sample, regardless of which star it came from. this enables larger diversity (?) but might cause memorization of specific samples, which we test in the experiments (4.3 and 4.1,  which show that some descriptions of the stellar case are recall from training. The other is a fixed split wihhc we do in the galaxy case. This might justify the stellar split and memorization results. if we do it, we should also mention this difference in the previous paragraph.} The stellar set has $190{,}091$
-stars, of which we evaluate on a held-out set of $19{,}010$. Because every star is
-described in many training records and the stellar training text was not built
-split by split, $99.2\%$ of these evaluation stars appear in \emph{some} training
-description; \Cref{sec:memorization} tests whether this matters. The galaxy set
-has $137{,}696$ galaxies, split $80/10/10$ into training, validation and test
-galaxies, and all galaxy training text is written about training galaxies only,
-so the test galaxies are never seen in training.
+\textbf{Objects, facts and descriptions.} The two datasets are split in
+different ways, and the difference decides what each test measures. The galaxy
+set has $137{,}696$ galaxies, split $80/10/10$ into training, validation and
+test galaxies, and all galaxy training text is written about training galaxies
+only: the galaxy test holds out the objects themselves. The stellar set has
+$190{,}091$ stars, of which we evaluate on a held-out set of $19{,}010$, but the
+stellar training text was written for all stars and divided into training and
+validation by description, not by star. As a result, $99.2\%$ of the evaluation
+stars appear in \emph{some} training description, and the stellar test holds
+out questions rather than objects. This matches how a stellar catalog is used:
+the stars of the Kepler field are fixed and already catalogued, and the
+questions of interest are new comparisons among them, not descriptions of stars
+never observed. No test group appears in training (the largest overlap between
+a test group and any training group is a third of their combined members), and
+in \Cref{sec:memorization} we also hold out the answer itself. For questions
+about a single star the overlap does matter, because the narrator can reuse
+what training said about the same star. \Cref{sec:memorization} measures how
+much, with the galaxies, where no such overlap exists, as the comparison.
 
 Each star's catalog record holds $13$ numbers ($T_\mathrm{eff}$, $\log g$,
 $[\mathrm{Fe/H}]$, mass, radius, age, luminosity, distance, parallax, Gaia's
@@ -92,7 +102,7 @@ between properties we later test. The two are needed together
 narrator copy training descriptions almost verbatim; adding the paper sentences
 removes that copying, and accuracy improves further. Population records are always
 presented as the data tokens alone. The recipe was chosen on the galaxy data and
-reused unchanged for stars. \todo{all the memorization tests should be somehow unified in terms of the narrative - we test them with the div+arxix pipeline but also with the different types of datasets - independent prose vs. sample-based split. can we somehow draw a clear picture from everything together? eventhogh they are done on different datasets?}
+reused unchanged for stars.
 
 
 \begin{figure}[h]
