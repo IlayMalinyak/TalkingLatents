@@ -16,10 +16,10 @@ We test two different astrophysical datasets, representing different domains and
 \textbf{training prose}. One of the challenges in this pipeline is creating the training dataset. This should include ground-truth prose per object. Contrary to other fields, in astrophysics data is usually stored only in numerical catalogs, so one needs to create the prose from scratch. Our main method is a \emph{template-based} method: a deterministic program that picks a subset of facts from the catalog, chooses a phrasing from a bank of templates, and
 writes prose. Every sentence is checked against the record by the verifier before it enters the corpus. The
 check is per-fact: it guarantees that the facts a description states are true of the object, not
-that the description mentions every unusual object in a group. Both datasets share two types of prose: description of a single object (single), and comparison between pairs (pair). We also test deeper reasoning capabilities with two additional tasks. In the stellar dataset we use population prose: a group of $N$ objects with description of the typical members, and a callout
-of the one that does not belong and on which property. In the galaxy dataset, the task is to judge whether a galaxy's shape agrees with its star-formation history, a relation between its two modalities. In~\Cref{sec:results} we compare the template-based method with a second method: an \emph{LLM-based} generation, where the writer produces the population prose from the same catalog facts, and every claim is verified.
+that the description mentions every unusual object in a group. Both datasets share two types of prose: description of a single object (single), and comparison between pairs (pair). We also test deeper reasoning capabilities with two additional tasks. In the stellar dataset, we use population prose: a group of $N$ objects with a description of the typical members, and a callout
+of the ones that do not belong and on which property. In the galaxy dataset, the task is to judge whether a galaxy's shape agrees with its star-formation history, a relation between its two modalities. In~\Cref{sec:results} we compare the template-based method with a second method: an \emph{LLM-based} generation, where the writer produces the population prose from the same catalog facts, and every claim is verified.
 
-\textbf{Objects, facts and descriptions.} The stellar set has $190{,}091$
+\textbf{Objects, facts and descriptions.} \todo{here we might want to emphesize that the datasets representes two different paradigms - the stellar dataset treat every prose as a unique sample, regardless of which star it came from. this enables larger diversity (?) but might cause memorization of specific samples, which we test in the experiments (4.3 and 4.1,  which show that some descriptions of the stellar case are recall from training. The other is a fixed split wihhc we do in the galaxy case. This might justify the stellar split and memorization results. if we do it, we should also mention this difference in the previous paragraph.} The stellar set has $190{,}091$
 stars, of which we evaluate on a held-out set of $19{,}010$. Because every star is
 described in many training records and the stellar training text was not built
 split by split, $99.2\%$ of these evaluation stars appear in \emph{some} training
@@ -92,7 +92,7 @@ between properties we later test. The two are needed together
 narrator copy training descriptions almost verbatim; adding the paper sentences
 removes that copying, and accuracy improves further. Population records are always
 presented as the data tokens alone. The recipe was chosen on the galaxy data and
-reused unchanged for stars.
+reused unchanged for stars. \todo{all the memorization tests should be somehow unified in terms of the narrative - we test them with the div+arxix pipeline but also with the different types of datasets - independent prose vs. sample-based split. can we somehow draw a clear picture from everything together? eventhogh they are done on different datasets?}
 
 
 \begin{figure}[h]
