@@ -11,7 +11,7 @@ the score as a function of group size. Here we count a description as correct if
 names \emph{any} star that truly has the odd property, together with that property:
 the test groups designate one odd star, but larger groups more often contain a
 second star with the same property ($24\%$ of groups with $4$ stars, $84\%$ with
-$32$), and naming it is a true statement. Without the head, the score falls
+$32$), and naming it is a true statement \todo{why is it happen? is it a failure of the dataset implementation or expected?}. Without the head, the score falls
 steadily as the group grows, from $0.51$ with $4$ stars to $0.15$ with $32$
 (Spearman $\rho=-0.21$, $p=10^{-13}$). With the head, it stays between $0.69$ and
 $0.81$ at every size and does not decline. Counting only the designated star gives
@@ -229,7 +229,7 @@ head also receives: whether the star is a binary and whether it belongs to an
 open cluster. With these flags the table holds everything the head is given, so
 the comparison is fair for all five kinds of odd star. The model sees two worked
 examples and is asked, in words, to name the star that does not belong and the
-property it differs in. We test two models: the base AstroSage-8B, without our
+property it differs in. We test two models: the base model (AstroSage-8B), without our
 training, and Qwen3.5-27B, a larger general-purpose model. Each is tested twice:
 answering directly, and reasoning step by step before answering.
 \Cref{tab:text} compares them with the two narrators on the same $1{,}203$
@@ -253,7 +253,7 @@ not belong.
 
 \begin{table}[h]\centering\small
 \caption{\textbf{Giving the model the numbers as text}, on the $1{,}203$ test
-groups with an odd star (all five kinds), greedy. The text-reading models see
+groups with an odd star (all five kinds). The text-reading models see
 every catalog value plus the binary and open-cluster flags.
 \emph{score} and \emph{named} are as in \Cref{tab:adversarial};
 \emph{stars named} is the fraction of the group the text names; \emph{lift}
@@ -285,7 +285,7 @@ was checked against the record before the text was accepted. The training text
 is, in that sense, true. \Cref{tab:corpus} compares the two corpora with
 everything else held fixed: same base model, same prompt, and no head (both narrators read the data tokens only and are fully fine-tuned). We see that training on the writer's fluent prose makes the narrator invent:
 contradictions per group go from $1.9$ to $7.2$, and not one group out of
-$1{,}191$ is described fully correctly. The training text was verified true; the
+$1{,}191$ is described fully correctly \todo{what is the meaning of 'fully correct'? we have more than one outlier?}. The training text was verified true; the
 model trained on it is not. This is aligned with the finding of \cite{Hegselmann2022TabLLMFC} who showed that template-based serialization outperforms LLM-based serialization for tabular data. The two corpora differ in how much they commit to. Per group description, the
 templater writes a median of $21$ words containing $5$ numbers and names $17\%$
 of the members; it states the population and the member that does not belong,
