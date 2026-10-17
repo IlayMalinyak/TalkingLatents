@@ -11,8 +11,8 @@
 % that axis, so $60.5\%$ of anomalies sit in a group containing at least one other
 % member with the same label ($81.7\%$ on dwarf/giant). Naming any of them is a
 % true statement, but only one is scored correct. Re-scoring both narrators to credit
-% any qualifying member raises both ($0.332 \to 0.419$ without the head,
-% $0.662 \to 0.756$ with it) and leaves the head's lead intact ($+0.33 \to +0.34$),
+% any qualifying member raises both ($0.332 \to 0.419$ without the tool,
+% $0.662 \to 0.756$ with it) and leaves the tool's lead intact ($+0.33 \to +0.34$),
 % so this does not drive the result --- but every absolute
 % rate in this paper is a lower bound for that reason. The effect grows with group size (a second qualifying star in $24\%$ of
 % groups with $4$ stars and $84\%$ with $32$), which is why \Cref{fig:groupsize}
@@ -26,23 +26,23 @@
 % within the noise we cannot measure. The claims rest on the pattern across cells
 % and on effects large enough that a seed is not a plausible explanation.
 
-% \paragraph{The stellar gain is not yet attributed to the head.} The stellar
-% head narrator differs from the narrator without the head in its training (LoRA
+% \paragraph{The stellar gain is not yet attributed to the tool.} The stellar
+% tool narrator differs from the narrator without the tool in its training (LoRA
 % instead of full fine-tuning) as well as in the token. Separating the two requires
-% a stellar narrator trained with LoRA and no head token, about $2{,}000$ GPU-hours
-% for $20$ epochs and about $5{,}000$ to match the head narrator's $50$; it has not
+% a stellar narrator trained with LoRA and no tool token, about $2{,}000$ GPU-hours
+% for $20$ epochs and about $5{,}000$ to match the tool narrator's $50$; it has not
 % been run. On galaxies, where we ran this control, the training change alone
 % accounts for the whole gain (\Cref{tab:2x2}), so the same could be true, at least
-% in part, for stars. The same control would show whether the head narrator's
-% stability across group sizes (\Cref{fig:groupsize}) comes from the head or from
+% in part, for stars. The same control would show whether the tool narrator's
+% stability across group sizes (\Cref{fig:groupsize}) comes from the tool or from
 % the training.
 
 % % Set aside with Section 4.3 (token ablations):
 % \iffalse
 % \paragraph{We can show the token is used, not how.} The ablations establish that
 % the token's contents are read (\Cref{tab:ablate}), but not the mechanism. Two
-% things remain unexplained. When the head's own top pick is wrong, the narrator
-% does not preferentially follow it, so it is not simply reading the head's answer
+% things remain unexplained. When the tool's own top pick is wrong, the narrator
+% does not preferentially follow it, so it is not simply reading the tool's answer
 % off the token. And most of the token's channels are unstable under
 % re-sampling --- eight of eleven have a run-to-run spread comparable to their
 % spread across objects --- so the information the narrator uses is probably

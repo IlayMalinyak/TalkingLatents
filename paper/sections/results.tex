@@ -1,22 +1,22 @@
 \section{Results}\label{sec:results}
 \subsection{singles and pair questions}
-We first test the single and pair questions, comparing two types of Llama-8B models: Llama-3.1 and AstroSage \citep{haan2025_astrosage}, a Llama-3.1 model that was fine-tuned specifically on arXiv astrophysics papers.~\Cref{tab:basemodel} shows the comparison on both datasets. Single and pair descriptions are scored by the verifier, which extracts every numeric and categorical claim from the generated text and checks it against the catalog: \emph{numeric accuracy} is the fraction of stated values within a per-quantity tolerance of the catalog value, and \emph{qualitative} (single) or \emph{relational} (pair) accuracy is the fraction of class words or comparisons that match it (tolerances and definitions in \Cref{app:eval}). Both models perform well on both tasks, and the differences between them are small: AstroSage is ahead in five of the eight cells, and no difference exceeds $0.04$. We use AstroSage for the rest of the paper. \Cref{app:perprop} breaks the accuracy down by property: class statements are mostly right, while some stated numbers (age, parallax, galaxy stellar mass) are often off by more than $10\%$. Probes trained on the same tokens (\Cref{app:probevsnarrator}) show that on galaxies the narrator states about what the tokens contain, while on stars part of its numeric precision is recall of catalog values from the training text. \todo{the comparison with probes should include more information - both models are better than linear probe (right?) and the comparison with non-linear probe (MLP) shows the recall claim. we should also emphesize the advantage of using language model for descriptions - we needed to train seperate probes per property. this is more complex }
+We first test the single and pair questions, comparing two types of Llama-8B models: Llama-3.1 and AstroSage \citep{haan2025_astrosage}, a Llama-3.1 model that was fine-tuned specifically on arXiv astrophysics papers.~\Cref{tab:basemodel} shows the comparison on both datasets. Single and pair descriptions are scored by the verifier, which extracts every numeric and categorical claim from the generated text and checks it against the catalog: \emph{numeric accuracy} is the fraction of stated values within a per-quantity tolerance of the catalog value, and \emph{qualitative} (single) or \emph{relational} (pair) accuracy is the fraction of class words or comparisons that match it (tolerances and definitions in \Cref{app:eval}). Both models perform well on both tasks, and the differences between them are small: AstroSage is ahead in five of the eight cells, and no difference exceeds $0.04$. We use AstroSage for the rest of the paper. \Cref{app:perprop} breaks the accuracy down by property: class statements are mostly right, while some stated numbers (age, parallax, galaxy stellar mass) are often off by more than $10\%$. Probes trained on the same tokens (\Cref{app:probevsnarrator}) show that on galaxies the narrator states about what the tokens contain, while on stars part of its numeric precision is recall of catalog values from the training text. The probes are the more exact readers where the comparison is clean, but each is a separate model trained for one property of one dataset; the narrator is one model that answers for every property, on both datasets, in free text and in any combination.
 \subsection{scientific reasoning tasks} Single and pair questions consists of description and simple comparisons and requires almost no reasoning beyond the basic properties. It is also similar to the protein description tasks as in  \cite{Dotan2026_betadescribe}, and therefore it is not surprising that an LLM performs well on such questions. Next, we test the performance on questions that requires some form of scientific reasoning. As mentioned in~\Cref{sec:data}, those are finding the odd member of a group of stars, and judging whether a galaxy's shape agrees with its star-formation history. The rest of the paper focuses on those tasks.~\Cref{tab:headboth} shows the results of the two reasoning tasks. \Cref{fig:examples} shows one example generated description for each task. The two tasks behave differently. On stars, the narrator alone, reading only the data tokens, fails: it names the odd member and its property in only a third of the groups. On galaxies, the narrator alone succeeds: trained with LoRA, it gives the right verdict for $97$--$99\%$ of galaxies. Interestingly, full fine-tuning performs slightly worse than LoRA, especially on quiescent galaxies. 
 
-Before adding anything to the stellar narrator, we check whether its failure is a failure of information. A cross-fit linear probe on the same aligned features, asked to rank the members of a group, matches what the true catalog values achieve (rank-1 $0.660$ from the shared subspace and $0.686$ from the full feature, against $0.660$ for the catalog itself; \Cref{sec:appendix}). The signal the task needs is present in the features the model reads, so the failure is in the readout and not in the representation. The last column of \Cref{tab:headboth} adds the head token (see~\Cref{sec:data}). In the stellar case the head is a flow matching model that was trained to learn the joint distribution of the aligned features and catalog labels, conditioned on the rest of the group. In the galaxy case, it is a cross-modal predictor trained to predict one modality from the other. On stars, the head narrator doubles the score ($0.33 \to 0.66$). The gain holds for every kind of odd star, and also on the $556$ groups in which the odd star is the only member with its odd property ($0.37 \to 0.71$; \Cref{app:perodd}). On galaxies, it is no better than a narrator trained the same way without the token (\Cref{app:2x2}). The stellar narrator without a head was fully fine-tuned while the head narrator was trained with LoRA, and the matching stellar control (LoRA without a head) has not been run (\Cref{sec:limitations}). \todo{run the missing experiment}
+Before adding anything to the stellar narrator, we check whether its failure is a failure of information. A cross-fit linear probe on the same aligned features, asked to rank the members of a group, matches what the true catalog values achieve (rank-1 $0.660$ from the shared subspace and $0.686$ from the full feature, against $0.660$ for the catalog itself; \Cref{sec:appendix}). The signal the task needs is present in the features the model reads, so the failure is in the readout and not in the representation. The last column of \Cref{tab:headboth} adds the tool token (see~\Cref{sec:data}). In the stellar case the tool is a flow-matching model trained on the joint distribution of a star's aligned features and its catalog values ($T_\mathrm{eff}$, $\log g$, $[\mathrm{Fe/H}]$, rotation period, binarity and cluster membership), conditioned on the rest of the group. For each star it returns how surprising the star is under that model and the values the group would predict for it, eleven numbers in all, which a trained projection maps to that star's tool token. In the galaxy case, it is a cross-modal predictor trained to predict one modality from the other, and it returns one token per galaxy. The stellar tool is not an answer on its own: ranking the members by its surprise score puts the odd star first in $29\%$ of groups. On stars, the tool narrator doubles the score ($0.33 \to 0.66$) and names the odd star in $84\%$ of groups; when the tool's own top choice is wrong, it follows it no more often than the narrator without the tool does ($7\%$ against $8\%$). The narrator uses what the tool returns; it does not copy a verdict from it. The gain holds for every kind of odd star, and also on the $556$ groups in which the odd star is the only member with its odd property ($0.37 \to 0.71$; \Cref{app:perodd}). On galaxies, it is no better than a narrator trained the same way without the token (\Cref{app:2x2}). The stellar narrator without a tool was fully fine-tuned while the tool narrator was trained with LoRA, and the matching stellar control (LoRA without a tool) has not been run (\Cref{sec:limitations}).
 
 The asymmetry in performance, together with the results in~\Cref{tab:basemodel}, points to the number of objects in the question as the important factor for successful generation of the \emph{narrator}. The galaxy verdict concerns a single object and follows from two of its own properties, its shape and whether it still forms stars, which the narrator can read from that galaxy's tokens. Even though morphology-SFH disagreement is deeper than mere description, the \emph{narrator} still performs almost perfectly. In the stellar case, finding the odd star requires comparing every member with the rest of the group, a computation over the whole set that no single star's tokens contain. The narrator's strong performance on single and pair questions supports the hypothesis that population-related questions are inherently more challenging for the narrator. To test this, we vary only the number of stars while keeping the question fixed:
 the test groups contain between $4$ and $32$ stars, and \Cref{fig:groupsize} shows
-the score as a function of group size. Without the head, the score falls
+the score as a function of group size. Without the tool, the score falls
 steadily as the group grows, from $0.45$ with $4$ stars to $0.06$ with $32$
-(Spearman $\rho=-0.24$, $p=10^{-16}$). With the head, it stays between $0.56$ and
+(Spearman $\rho=-0.24$, $p=10^{-16}$). With the tool, it stays between $0.56$ and
 $0.71$ with no significant trend ($\rho=-0.03$, $p=0.3$). The difficulty of the stellar task
-therefore grows with the number of objects the narrator must compare, and the head
+therefore grows with the number of objects the narrator must compare, and the tool
 narrator does not suffer from it. Because the two narrators also differ in training
 (LoRA against full fine-tuning), part of this stability may come from the training
-rather than the head (\Cref{sec:limitations}). Since every star adds the same number
+rather than the tool (\Cref{sec:limitations}). Since every star adds the same number
 of tokens, a larger group is also a longer input, and our data cannot separate the
-two. Next, we perform two ablation tests for the stellar population task: whether the improvement from using the head comes from reasoning or memorization, and whether handing the \emph{narrator} the full catalog numbers prevents the failure.
+two. Next, we perform two ablation tests for the stellar population task: whether the improvement from using the tool comes from reasoning or memorization, and whether handing the \emph{narrator} the full catalog numbers prevents the failure.
 
 \begin{figure}[t]
   \centering
@@ -24,7 +24,7 @@ two. Next, we perform two ablation tests for the stellar population task: whethe
   \caption{\textbf{The stellar task becomes harder with the number of stars.}
   Score of \Cref{tab:headboth} (the narrator names the odd star and its property)
   as a function of the number of stars in the group, for the narrator without and
-  with the head ($1{,}203$ test groups with an odd member). Error bars are $95\%$
+  with the tool ($1{,}203$ test groups with an odd member). Error bars are $95\%$
   intervals. Dashed line: the chance of picking the odd star at random ($1/N$);
   the score also requires the right property, so its chance level is lower still.}
   \label{fig:groupsize}
@@ -36,10 +36,10 @@ two. Next, we perform two ablation tests for the stellar population task: whethe
   \input{figs/example_generations}
   \caption{\textbf{Example generations on the two reasoning tasks}, verbatim and
   decoded greedily. \emph{Left}: a quenched disk, whose shape and star-formation
-  history disagree. The narrator trained without the head token states the shape,
+  history disagree. The narrator trained without the tool token states the shape,
   the star-formation state and the verdict correctly, as it does for $97$--$99\%$
   of test galaxies. \emph{Right}: a test group of four stars containing one giant.
-  The narrator without the head reports no odd member; the narrator with the head
+  The narrator without the tool reports no odd member; the narrator with the tool
   names the giant, with values that match the catalog.}
   \label{fig:examples}
 \end{figure*}
@@ -80,16 +80,16 @@ the catalog; \emph{relational acc.} (pair) = fraction of comparisons
 \begin{table}[h]\centering\small
 \caption{\textbf{The reasoning tasks.} Each row is one task and scorer; the
 columns are narrators that differ in how they were trained and whether they read
-the head token. Stars: the fraction of the $1{,}203$ test groups with an odd member
+the tool token. Stars: the fraction of the $1{,}203$ test groups with an odd member
 in which the text names it \emph{and} its property, scored by the verifier and by
 the judge, which agree on the size of the effect. Galaxies: the fraction of test
 galaxies with the correct agreement verdict (\Cref{sec:galaxyscore}), on the
 $9{,}609$ star-forming and $1{,}068$ quiescent galaxies. The stellar narrator
-trained with LoRA and no head token was not run (\Cref{sec:limitations}).}
+trained with LoRA and no tool token was not run (\Cref{sec:limitations}).}
 \label{tab:headboth}
 \begin{tabular}{llccc}
 \toprule
- & & \multicolumn{2}{c}{narrator, no head token} & narrator $+$ head \\
+ & & \multicolumn{2}{c}{narrator, no tool token} & narrator $+$ tool \\
 \cmidrule(lr){3-4}
 task & scorer & full fine-tune & LoRA & LoRA \\
 \midrule
@@ -105,15 +105,15 @@ task & scorer & full fine-tune & LoRA & LoRA \\
 
 
 
-% Section 4.3 (token or training?) set aside until the stellar LoRA-without-head
+% Section 4.3 (token or training?) set aside until the stellar LoRA-without-tool
 % control is run; restore by deleting the \iffalse / \fi pair.
 \iffalse
 \subsection{is it the token, or the training that came with it?}\label{sec:tokenortraining}
-The narrators with and without the head are two separately trained models, and
-they differ in more than the token: the head narrator is trained with LoRA on a
+The narrators with and without the tool are two separately trained models, and
+they differ in more than the token: the tool narrator is trained with LoRA on a
 frozen base model, while the narrator without it is fully fine-tuned. The gain in
 \Cref{tab:headboth} could therefore come from the token or from the training.
-The test that does not depend on training is to take the trained head narrator
+The test that does not depend on training is to take the trained tool narrator
 and break its token at generation time, leaving everything else unchanged.
 \Cref{tab:ablate} does this two ways: scrambling the token across the group, so
 that it has the right statistics but describes a different star, and replacing
@@ -123,7 +123,7 @@ it with zeros.
 \caption{\textbf{Breaking the token at test time}, stellar group task, full test
 set ($n{=}1{,}203$ groups with an odd member, greedy, judge-scored).
 \emph{score} is the fraction of descriptions that name the true odd member and
-its property. The last three rows are one trained model, the head narrator, with
+its property. The last three rows are one trained model, the tool narrator, with
 its token intact or damaged at generation time; the first row is a separately
 trained model.}
 \label{tab:ablate}
@@ -131,26 +131,26 @@ trained model.}
 \toprule
  & score  \\
 \midrule
-narrator, trained without a head token & 0.332 \\
+narrator, trained without a tool token & 0.332 \\
 \midrule
-head narrator, token zeroed      & 0.561  \\
-head narrator, token scrambled   & 0.606 \\
-head narrator, token intact      & \textbf{0.662}  \\
+tool narrator, token zeroed      & 0.561  \\
+tool narrator, token scrambled   & 0.606 \\
+tool narrator, token intact      & \textbf{0.662}  \\
 \bottomrule
 \end{tabular}
 \end{table}
 
 Breaking the token costs the same model $0.056$ (scrambled) to $0.101$ (zeroed),
 both significant, so what the token contains is read and used. Even with a broken
-token, however, the head narrator stays far above the narrator trained without
+token, however, the tool narrator stays far above the narrator trained without
 one ($0.561$ against $0.332$). A zeroed token carries no information about the
 group, so this gap is a difference between the two trained models, not something
-the token supplies at test time: it comes from how the head narrator was trained
-(LoRA on a frozen base instead of full fine-tuning, and alongside a head token),
+the token supplies at test time: it comes from how the tool narrator was trained
+(LoRA on a frozen base instead of full fine-tuning, and alongside a tool token),
 and a test-time ablation cannot tell these apart.
 
 On galaxies we ran the missing control: a narrator trained with LoRA and
-\emph{no} head token (\Cref{tab:headboth}, \Cref{app:2x2}). It matches the head
+\emph{no} tool token (\Cref{tab:headboth}, \Cref{app:2x2}). It matches the tool
 narrator on quiescent galaxies ($0.974$ against $0.978$, not significant) and is
 slightly better on star-forming ones ($0.988$ against $0.986$). The full
 fine-tune is the outlier: on quiescent galaxies it gives the wrong verdict for
@@ -159,12 +159,12 @@ $12\%$ of them, mostly because it misreads whether the galaxy still forms stars
 then, the gain over the fully fine-tuned narrator comes from the training, not from
 the token. The galaxy narrator does read its token, since scrambling it costs a
 little on star-forming galaxies ($0.986 \to 0.978$), but the token adds nothing
-the data tokens do not already provide; this is expected, since the galaxy head is
+the data tokens do not already provide; this is expected, since the galaxy tool is
 computed from the same image and star-formation embeddings the narrator reads.
 
 For stars, the same control would require training a stellar narrator with LoRA
-and no head token, about $700$--$1{,}100$ GPU-hours, which we have not yet done.
-Until then, the stellar evidence supports a narrower claim: the head token's
+and no tool token, about $700$--$1{,}100$ GPU-hours, which we have not yet done.
+Until then, the stellar evidence supports a narrower claim: the tool token's
 content is worth $0.06$--$0.10$ of the $0.33$ gain, and the remaining $0.23$
 coincides with a change in training that we cannot yet separate from the token.
 \fi
@@ -187,7 +187,7 @@ what could be copied & data & test & finding \\
 \midrule
 wording & galaxies & training recipe (\Cref{app:recipe}) & copied when only the input format varies; the paper sentences remove it \\
 values about one object & stars, galaxies & narrator against probes and against the training text (\Cref{app:probevsnarrator}) & exact values copied when the training text gives them; average error barely changes \\
-the answer to a reasoning question & stars & groups whose odd star was never the odd one in training (\Cref{tab:adversarial}) & not recalled; the head's advantage grows \\
+the answer to a reasoning question & stars & groups whose odd star was never the odd one in training (\Cref{tab:adversarial}) & not recalled; the tool's advantage grows \\
 \bottomrule
 \end{tabular}
 \end{table}
@@ -209,18 +209,18 @@ probe's level. The average error changes little. Part of the stellar
 narrator's numeric precision is therefore recall, and its single-star numbers
 in \Cref{tab:basemodel} should be read with this in mind.
 
-\textbf{The answer.} The objection that matters most is that the head narrator
+\textbf{The answer.} The objection that matters most is that the tool narrator
 might recall which star was called unusual during training rather than work it
 out. While the comparisons in~\Cref{tab:headboth}
 are fair (all experiments used the same dataset), they do not rule this out. From the test fold we therefore keep
 only groups whose odd member was \emph{never} an odd member anywhere in
 training: the star may have been described many times, but never as the one
 that stands out. Only $2.3\%$ of candidate groups survive that filter, leaving
-$1{,}000$. If the head narrator is memorizing, it should lose most of its
+$1{,}000$. If the tool narrator is memorizing, it should lose most of its
 advantage here. \Cref{tab:adversarial} shows that it does not; the advantage
-grows. The head is worth $+0.469$ on this set against $+0.330$ on the full test
+grows. The tool is worth $+0.469$ on this set against $+0.330$ on the full test
 set, and the two narrators move in opposite directions: the narrator without the
-head falls ($0.332 \to 0.279$) while the head narrator improves ($0.662 \to 0.748$). 
+tool falls ($0.332 \to 0.279$) while the tool narrator improves ($0.662 \to 0.748$). 
 
 \begin{table}[h]\centering\small
 \caption{$1{,}000$ stellar groups whose odd member
@@ -234,7 +234,7 @@ of member.}
  & score & named & property  \\
 \midrule
 narrator & 0.279 & 0.329 & 0.343  \\
-narrator $+$ head   & \textbf{0.748} & \textbf{0.782} & \textbf{0.761}  \\
+narrator $+$ tool   & \textbf{0.748} & \textbf{0.782} & \textbf{0.761}  \\
 $\Delta$  & $+0.469$ & $+0.453$ & $+0.418$ \\
 \bottomrule
 \end{tabular}
@@ -259,8 +259,8 @@ alternative is to skip the features and hand the model the catalog numbers
 directly. We test this on the stellar task. Each group is shown as a table with
 one row per star, listing its catalog values (temperature, surface gravity,
 metallicity, radius, mass, and others) together with the two catalog flags the
-head also receives: whether the star is a binary and whether it belongs to an
-open cluster. With these flags the table holds everything the head is given, so
+tool also receives: whether the star is a binary and whether it belongs to an
+open cluster. With these flags the table holds everything the tool is given, so
 the comparison is fair for all five kinds of odd star. The model sees two worked
 examples and is asked, in words, to name the star that does not belong and the
 property it differs in. We test two models: the base model (AstroSage-8B), without our
@@ -269,18 +269,18 @@ answering directly, and reasoning step by step before answering.
 \Cref{tab:text} compares them with the two narrators on the same $1{,}203$
 groups.
 
-No model that reads the numbers comes close to the narrator with the head
+No model that reads the numbers comes close to the narrator with the tool
 ($0.662$). AstroSage reading the table reaches the second-best score ($0.473$),
 but by naming most of the group ($82\%$ of the stars): naming the odd star among
 them is then no better than chance ($0.92\times$). Asked to reason first, it
-names few stars and scores $0.288$, below the narrator without the head. The
+names few stars and scores $0.288$, below the narrator without the tool. The
 larger model is more selective: it names the odd star at about the same rate as
-the head relative to the number of stars it names. However, it often gets the
+the tool relative to the number of stars it names. However, it often gets the
 odd star's property wrong, and scores $0.341$ answering directly and $0.324$
-after reasoning, no different from the narrator without the head ($p{=}0.7$ in
+after reasoning, no different from the narrator without the tool ($p{=}0.7$ in
 both cases). In most groups ($94\%$) the larger model was still reasoning when
 it reached the length limit of $4{,}096$ tokens and was made to answer from what
-it had, so its reasoning result holds for this budget only. The gap to the head
+it had, so its reasoning result holds for this budget only. The gap to the tool
 also holds for every group size (\Cref{app:textsize}). Reading the numbers
 lets a model describe the stars, but not reliably pick out the one that does
 not belong.
@@ -292,7 +292,7 @@ every catalog value plus the binary and open-cluster flags.
 \emph{score} and \emph{named} are as in \Cref{tab:adversarial};
 \emph{stars named} is the fraction of the group the text names; \emph{lift}
 divides \emph{named} by it ($1.0$ = no better than naming that many stars at
-random). Every text-reading model scores below the narrator with the head
+random). Every text-reading model scores below the narrator with the tool
 ($p<10^{-19}$, exact McNemar on \emph{score}).}
 \label{tab:text}
 \begin{tabular}{lcccc}
@@ -305,7 +305,7 @@ Qwen3.5-27B, reads the table                 & 0.341 & 0.512 & 3.69$\times$ & 14
 Qwen3.5-27B, reads the table, reasons first  & 0.324 & 0.570 & \textbf{4.13}$\times$ & 14\% \\
 \midrule
 narrator                                     & 0.332 & 0.442 & 3.36$\times$ & 13\% \\
-narrator $+$ head                            & \textbf{0.662} & \textbf{0.797} & 4.08$\times$ & 20\% \\
+narrator $+$ tool                            & \textbf{0.662} & \textbf{0.797} & 4.08$\times$ & 20\% \\
 \bottomrule
 \end{tabular}
 \end{table}
@@ -317,9 +317,9 @@ The obvious alternative is to let a capable LLM write it, which has the potentia
 catalog facts and asked to write the group descriptions, and every claim it made
 was checked against the record before the text was accepted. The training text
 is, in that sense, true. \Cref{tab:corpus} compares the two corpora with
-everything else held fixed: same base model, same prompt, and no head (both narrators read the data tokens only and are fully fine-tuned). We see that training on the writer's fluent prose makes the narrator invent:
+everything else held fixed: same base model, same prompt, and no tool (both narrators read the data tokens only and are fully fine-tuned). We see that training on the writer's fluent prose makes the narrator invent:
 contradictions per group go from $1.9$ to $7.2$, and not one group out of
-$1{,}191$ is described fully correctly \todo{what is the meaning of 'fully correct'? we have more than one outlier?}. The training text was verified true; the
+$1{,}191$ is described fully correctly (odd star and property named, typical members described correctly, and no statement contradicting the record). The training text was verified true; the
 model trained on it is not. This is aligned with the finding of \cite{Hegselmann2022TabLLMFC} who showed that template-based serialization outperforms LLM-based serialization for tabular data. The two corpora differ in how much they commit to. Per group description, the
 templater writes a median of $21$ words containing $5$ numbers and names $17\%$
 of the members; it states the population and the member that does not belong,
@@ -344,7 +344,7 @@ more than the input determines.
 
 \begin{table}[h]\centering\small
 \caption{\textbf{Which prose to train on.} AstroSage-8B, same prompt, latent
-tokens only (no head), full fine-tune; greedy, judge-scored, on the $1{,}191$
+tokens only (no tool), full fine-tune; greedy, judge-scored, on the $1{,}191$
 groups with an odd member judged for both narrators (paired; hence $0.333$ here
 vs.\ $0.332$ on the $1{,}203$ groups of \Cref{tab:headboth}). \emph{score} is as
 in \Cref{tab:headboth}; \emph{covered} = the text correctly describes the typical

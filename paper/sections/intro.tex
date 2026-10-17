@@ -57,9 +57,12 @@ correlations. Unfolding it, however, requires analysing high-dimensional feature
 directly, whereas the common practice of projecting them to a low-dimensional summary
 discards exactly the structure such analyses depend on. Most current uses of LLMs with
 scientific data take the form of textual descriptions, or of agents that delegate the
-analysis to dedicated models and read off their results, which is usually called \emph{Tool Use (TU)}. Whether an LLM can perform
+analysis to dedicated models and read off their results as text, which is usually called
+\emph{tool use} \citep{Schick2023_toolformer, Gao2023_pal, Hao2023ToolkenGPTAF}. Whether an LLM can perform
 scientific reasoning \emph{directly} from learned data representations is therefore still
-an open question, and it is the question we study here.
+an open question, and it is the question we study here. Where it cannot, we ask a second
+one: whether the result of a dedicated model can be handed to the LLM in a form it can
+use, as latent tokens rather than as text. We call this \emph{latent tool use (LTU)}.
 
 \textbf{Contribution.}
 We connect frozen survey encoders to an 8B language model through a trained
@@ -79,13 +82,17 @@ help: the model either names most of the group or, when it reasons first, does n
 than the model reading the tokens, and a larger general-purpose model (Qwen3.5-27B) does
 no better either.
 %
-\emph{Second}, performing the group computation outside the model and returning it as a
-single extra token doubles the stellar score ($0.33 \to 0.66$), keeps it flat across
-group sizes, and holds on groups whose odd star was never the odd one in training. We call this process \emph{Latent Tool Use (LTU)}.
+\emph{Second}, performing part of the group comparison outside the language model, in a
+small model that is not one, and returning its result as one extra latent token per star
+doubles the stellar score ($0.33 \to 0.66$), keeps it flat across group sizes, and holds
+on groups whose odd star was never the odd one in training. The small model is a poor
+answer on its own (its own ranking puts the odd star first in $29\%$ of groups), and the
+language model does not copy its verdict; it is the latent return that the language model
+can use. This is latent tool use.
 % This
 % model was also trained differently (LoRA instead of full fine-tuning), and the
 % matching control has not been run (\Cref{sec:limitations}). On galaxies, where the
-% narrator already succeeds, the head token adds nothing.
+% narrator already succeeds, the tool token adds nothing.
 %
 \emph{Third}, verified templated prose yields a substantially more factual model than
 fluent LLM-written prose on the same task, because the LLM-written text states more than
@@ -128,4 +135,16 @@ Alayrac2022_flamingo, Li2023_blip2, Liu2023_llava}. This recipe is
 well-established for producing descriptions of a single input. Whether it supports
 comparison across several inputs, which is what population-level scientific questions
 require, has received little attention.
+
+\paragraph{Tool use, in text and in latent space.}
+In tool-augmented language models the model decides when to call a tool, writes its
+arguments, and reads the result back as text \citep{Schick2023_toolformer, Gao2023_pal};
+ToolkenGPT makes the call itself a learned token embedding, but the result still returns
+as text \citep{Hao2023ToolkenGPTAF}. Closer to our setting, Prismer feeds the outputs of
+expert vision models to a language model as tokens \citep{Liu2023_prismer}, and PEARL
+trains a vision-language model to predict the effect of a tool in latent space, so that no
+tool is called at inference \citep{Adhikari2026_pearl}. Latent tool use, as we use the
+term, differs from both: the tool is run, on every input, and its result is returned to the
+language model as latent tokens that the model is trained to read, instead of as text. The
+language model does not decide when to call it; we leave that to future work.
 

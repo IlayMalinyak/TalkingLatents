@@ -48,36 +48,36 @@ The catalog row is not a ceiling on the task. It bounds what a \emph{single
 ranked quantity} can do, and it falls short of $1.0$ because the label is a
 threshold test (``$[\mathrm{Fe/H}] > 0.3$'') while a ranking is a distance test:
 a star can sit far from the group median without crossing the threshold. A
-readout that models the group jointly, the head of
+readout that models the group jointly, the tool of
 \Cref{tab:headboth}, is not bound by it.
 
 Scoring the narrators by the same rule, crediting any equally-qualifying star,
-raises both narrators ($0.332 \to 0.419$ without the head, $0.662 \to 0.756$ with
-it) and leaves the head's lead intact: $+0.33 \to +0.34$ ($n{=}1{,}203$ groups,
+raises both narrators ($0.332 \to 0.419$ without the tool, $0.662 \to 0.756$ with
+it) and leaves the tool's lead intact: $+0.33 \to +0.34$ ($n{=}1{,}203$ groups,
 exact McNemar $p{=}7\times10^{-81}$).
 
 \subsection{The galaxy narrators: token or training?}\label{app:2x2}
-The galaxy head narrator differs from the fully fine-tuned narrator in two ways:
-it reads the head token, and it is trained with LoRA on a frozen base. To separate
+The galaxy tool narrator differs from the fully fine-tuned narrator in two ways:
+it reads the tool token, and it is trained with LoRA on a frozen base. To separate
 the two, we trained a third narrator on the \emph{same} text with the \emph{same}
-LoRA settings and no head token, and we also ran the head narrator with its token
-scrambled at test time (each galaxy receives the head token of another test
+LoRA settings and no tool token, and we also ran the tool narrator with its token
+scrambled at test time (each galaxy receives the tool token of another test
 galaxy). All four narrators describe the same $10{,}677$ test galaxies, decoded
 greedily, and are scored as in \Cref{sec:galaxyscore}.
 
 \begin{table}[h]\centering\small
 \caption{\textbf{Galaxy agreement task, four narrators.} Fraction of test
 galaxies with the correct verdict. $p$-values are exact McNemar tests on the same
-galaxies, against the LoRA narrator with the head token.}
+galaxies, against the LoRA narrator with the tool token.}
 \label{tab:2x2}
 \begin{tabular}{lcc}
 \toprule
  & star-forming ($9{,}609$) & quiescent ($1{,}068$) \\
 \midrule
-full fine-tune, no head token          & 0.980 ($p{=}5{\times}10^{-6}$) & 0.884 ($p{=}2{\times}10^{-23}$) \\
-LoRA, no head token                    & \textbf{0.988} ($p{=}0.002$) & 0.974 ($p{=}0.50$) \\
-LoRA $+$ head token                    & 0.986 & \textbf{0.978} \\
-LoRA $+$ head token, scrambled         & 0.978 ($p{=}3{\times}10^{-9}$) & 0.972 ($p{=}0.34$) \\
+full fine-tune, no tool token          & 0.980 ($p{=}5{\times}10^{-6}$) & 0.884 ($p{=}2{\times}10^{-23}$) \\
+LoRA, no tool token                    & \textbf{0.988} ($p{=}0.002$) & 0.974 ($p{=}0.50$) \\
+LoRA $+$ tool token                    & 0.986 & \textbf{0.978} \\
+LoRA $+$ tool token, scrambled         & 0.978 ($p{=}3{\times}10^{-9}$) & 0.972 ($p{=}0.34$) \\
 \bottomrule
 \end{tabular}
 \end{table}
@@ -90,15 +90,15 @@ LoRA $+$ head token, scrambled         & 0.978 ($p{=}3{\times}10^{-9}$) & 0.972 
   \label{fig:agreement}
 \end{figure}
 
-Three things follow. First, the LoRA narrator without the head token is as good
+Three things follow. First, the LoRA narrator without the tool token is as good
 as the one with it: indistinguishable on quiescent galaxies and slightly better
 on star-forming ones. Second, the fully fine-tuned narrator is clearly worse on
 quiescent galaxies; most of its errors there come from stating that a quiescent
-galaxy still forms stars. Third, scrambling the head narrator's token costs it a
+galaxy still forms stars. Third, scrambling the tool narrator's token costs it a
 little on star-forming galaxies, so the narrator does read the token, but the
 information it carries is already available from the data tokens. On galaxies,
 the improvement over the fully fine-tuned narrator therefore comes from the
-training, not from the head token. The stellar equivalent of this control was not
+training, not from the tool token. The stellar equivalent of this control was not
 run (\Cref{sec:limitations}).
 
 \subsection{The training recipe}\label{app:recipe}
@@ -327,9 +327,9 @@ star that differs on another, but the other members are not checked on that
 second property, so some groups contain more than one star with the odd
 property. \Cref{tab:perodd} gives the score for each kind of odd star on all
 test groups, and on the $556$ groups in which the odd star is the only member with
-its odd property. The head improves the score in every row. On the second set
-the narrator without the head again declines with group size ($0.44$, $0.33$ and
-$0.14$ for $4$--$7$, $8$--$15$ and $16$--$32$ stars), while the head narrator
+its odd property. The tool improves the score in every row. On the second set
+the narrator without the tool again declines with group size ($0.44$, $0.33$ and
+$0.14$ for $4$--$7$, $8$--$15$ and $16$--$32$ stars), while the tool narrator
 does not ($0.70$, $0.74$, $0.75$).
 
 \begin{table}[h]\centering\small
@@ -337,7 +337,7 @@ does not ($0.70$, $0.74$, $0.75$).
 greedy; score as in \Cref{tab:headboth}. Rows use the groups whose odd stars all
 differ on the same property ($775$ of $1{,}203$; the last row uses all groups). \emph{Unique}: groups in which
 the odd star is the only member with its odd property. Binarity and open-cluster
-membership are also given to the head as catalog flags (\Cref{sec:text}). All
+membership are also given to the tool as catalog flags (\Cref{sec:text}). All
 differences are significant (exact McNemar, $p<10^{-3}$) except giants in the unique
 groups ($p=0.33$, $n=60$).}
 \label{tab:perodd}
@@ -345,7 +345,7 @@ groups ($p=0.33$, $n=60$).}
 \toprule
  & \multicolumn{3}{c}{all groups} & \multicolumn{3}{c}{unique} \\
 \cmidrule(lr){2-4}\cmidrule(lr){5-7}
-odd star & $n$ & narrator & $+$ head & $n$ & narrator & $+$ head \\
+odd star & $n$ & narrator & $+$ tool & $n$ & narrator & $+$ tool \\
 \midrule
 open-cluster member & 120 & 0.150 & \textbf{0.708} & 117 & 0.145 & \textbf{0.709} \\
 binary              & 140 & 0.157 & \textbf{0.550} &  47 & 0.255 & \textbf{0.660} \\
@@ -411,9 +411,9 @@ $99.2\%$ described in the training text).}
 
 \subsection{Reading the numbers, by group size}\label{app:textsize}
 \Cref{tab:textsize} breaks \Cref{tab:text} down by the number of stars in the
-group. The narrator without the head falls from $0.45$ to $0.06$ as groups grow;
+group. The narrator without the tool falls from $0.45$ to $0.06$ as groups grow;
 the models that read the table fall less, but stay below the narrator with the
-head at every size.
+tool at every size.
 
 \begin{table}[h]\centering\small
 \caption{\textbf{Score by number of stars in the group}, for the models of
@@ -430,7 +430,7 @@ Qwen3.5-27B, reads the table                 & 0.40 & 0.39 & 0.31 & 0.37 & 0.26 
 Qwen3.5-27B, reads the table, reasons first  & 0.30 & 0.38 & 0.37 & 0.35 & 0.31 & 0.22 & 0.27 \\
 \midrule
 narrator                                     & 0.45 & 0.37 & 0.44 & 0.30 & 0.25 & 0.13 & 0.06 \\
-narrator $+$ head                            & \textbf{0.68} & \textbf{0.63} & \textbf{0.71} & \textbf{0.70} & \textbf{0.68} & \textbf{0.62} & \textbf{0.56} \\
+narrator $+$ tool                            & \textbf{0.68} & \textbf{0.63} & \textbf{0.71} & \textbf{0.70} & \textbf{0.68} & \textbf{0.62} & \textbf{0.56} \\
 \bottomrule
 \end{tabular}
 \end{table}

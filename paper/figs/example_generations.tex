@@ -1,5 +1,5 @@
 % Example generations on the two reasoning tasks (verbatim narrator outputs, greedy).
-% Galaxy: galaxy_id 601201, narrator trained with LoRA and no head token
+% Galaxy: galaxy_id 601201, narrator trained with LoRA and no tool token
 %   (MultiLLM cache/galaxy_gen_eval/generations/lora_nohead_xmodal_eval.jsonl).
 % Stars: test group population_451_N4 (MultiLLM cache/stellar_gen_eval_full/
 %   generations/{astrosage8b,flow_astrosage8b_template}.jsonl).
@@ -21,7 +21,7 @@
     \emph{disagree}.
   \end{tcolorbox}\vspace{-2pt}
   \begin{tcolorbox}[exbox, colframe=teal!80!black, colbacktitle=paleteal,
-      title={Narrator (no head token)\gOK}]
+      title={Narrator (no tool token)\gOK}]
     \raggedright
     A \hGood{quiescent} \hGood{late-type disk} --- a
     \hGood{cross-modal outlier}, because disks rarely quench while retaining
@@ -44,13 +44,13 @@
     \end{tabular}
   \end{tcolorbox}\vspace{-2pt}
   \begin{tcolorbox}[exbox, colframe=coral, colbacktitle=palecoral,
-      title={Narrator, no head\gNO}]
+      title={Narrator, no tool\gNO}]
     \raggedright
     These 4 stars form a homogeneous population of field stars.
     \hBad{No anomalies detected} along the field-star axis.
   \end{tcolorbox}\vspace{-2pt}
   \begin{tcolorbox}[exbox, colframe=teal!80!black, colbacktitle=paleteal,
-      title={Narrator $+$ head\gOK}]
+      title={Narrator $+$ tool\gOK}]
     \raggedright
     Sample N=4: single stars. \hGood{index 1: a giant} [logg = 2.44 dex,
     R = 11.14 Rsun, logL = 1.72 log(Lsun), giant].

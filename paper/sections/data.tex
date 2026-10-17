@@ -2,10 +2,12 @@
 \label{sec:data}
 \textbf{Terminology.} We use six names throughout. The \emph{narrator} is
 the 8B language model we train: it reads an object's data tokens and answers questions
-about the object. The \emph{head} is a small model, not a language model,
-trained separately to compute one quantity that a question depends on
-(\Cref{sec:results}); its output enters the narrator as one extra token, the
-\emph{head token}. The \emph{templater} is the deterministic program that writes
+about the object. The \emph{tool} is a small model, not a language model,
+trained separately to compute, for every object in a question, a quantity that
+the question depends on (\Cref{sec:results}). It is run on every input, and its
+output enters the narrator as one extra token per object, the \emph{tool token},
+which the narrator is trained to read; a narrator that reads it is a \emph{tool
+narrator}. The \emph{templater} is the deterministic program that writes
 our training text from catalog facts, and the \emph{writer} (DeepSeek-V4) is the
 LLM we use in its place in one comparison. Generated text is scored by the
 \emph{verifier}, a program that checks every stated fact against the catalog, and
