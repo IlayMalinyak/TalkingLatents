@@ -16,8 +16,10 @@ We test two different astrophysical datasets, representing different domains and
 \textbf{training prose}. One of the challenges in this pipeline is creating the training dataset. This should include ground-truth prose per object. Contrary to other fields, in astrophysics data is usually stored only in numerical catalogs, so one needs to create the prose from scratch. Our main method is a \emph{template-based} method: a deterministic program that picks a subset of facts from the catalog, chooses a phrasing from a bank of templates, and
 writes prose. Every sentence is checked against the record by the verifier before it enters the corpus. The
 check is per-fact: it guarantees that the facts a description states are true of the object, not
-that the description mentions every unusual object in a group. Both datasets share two types of prose: description of a single object (single), and comparison between pairs (pair). We also test deeper reasoning capabilities with two additional tasks. In the stellar dataset, we use population prose: a group of $N$ objects with a description of the typical members, and a callout
-of the ones that do not belong and on which property. In the galaxy dataset, the task is to judge whether a galaxy's shape agrees with its star-formation history, a relation between its two modalities. In~\Cref{sec:results} we compare the template-based method with a second method: an \emph{LLM-based} generation, where the writer produces the population prose from the same catalog facts, and every claim is verified.
+that the description mentions every unusual object in a group. Both datasets share two types of prose: description of a single object (single), and comparison between pairs (pair). We also test deeper reasoning capabilities with two additional tasks, and this is where the datasets diverge. In the stellar dataset, we use population prose: a group of $N$ objects with a description of the typical members, and a callout
+of the ones that do not belong and on which property. In the galaxy dataset, the task is to judge whether a galaxy's shape agrees with its star-formation history, a relation between its two modalities. 
+
+% In~\Cref{sec:results} we compare the template-based method with a second method: an \emph{LLM-based} generation, where the writer produces the population prose from the same catalog facts, and every claim is verified.
 
 \textbf{Objects, facts and descriptions.} The two datasets are split in
 different ways, and the difference decides what each test measures. The galaxy
