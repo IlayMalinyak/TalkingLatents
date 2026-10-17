@@ -57,7 +57,7 @@ correlations. Unfolding it, however, requires analysing high-dimensional feature
 directly, whereas the common practice of projecting them to a low-dimensional summary
 discards exactly the structure such analyses depend on. Most current uses of LLMs with
 scientific data take the form of textual descriptions, or of agents that delegate the
-analysis to dedicated models and read off their results. Whether an LLM can perform
+analysis to dedicated models and read off their results, which is usually called \emph{Tool Use (TU)}. Whether an LLM can perform
 scientific reasoning \emph{directly} from learned data representations is therefore still
 an open question, and it is the question we study here.
 
@@ -81,10 +81,11 @@ no better either.
 %
 \emph{Second}, performing the group computation outside the model and returning it as a
 single extra token doubles the stellar score ($0.33 \to 0.66$), keeps it flat across
-group sizes, and holds on groups whose odd star was never the odd one in training. This
-narrator was also trained differently (LoRA instead of full fine-tuning), and the
-matching control has not been run (\Cref{sec:limitations}). On galaxies, where the
-narrator already succeeds, the head token adds nothing.
+group sizes, and holds on groups whose odd star was never the odd one in training. We call this process \emph{Latent Tool Use (LTU)}.
+% This
+% model was also trained differently (LoRA instead of full fine-tuning), and the
+% matching control has not been run (\Cref{sec:limitations}). On galaxies, where the
+% narrator already succeeds, the head token adds nothing.
 %
 \emph{Third}, verified templated prose yields a substantially more factual model than
 fluent LLM-written prose on the same task, because the LLM-written text states more than
