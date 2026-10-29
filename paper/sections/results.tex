@@ -187,7 +187,7 @@ what could be copied & data & test & finding \\
 \midrule
 wording & galaxies & training recipe (\Cref{app:recipe}) & copied when only the input format varies; the paper sentences remove it \\
 values about one object & stars, galaxies & narrator against probes and against the training text (\Cref{app:probevsnarrator}) & exact values copied when the training text gives them; average error barely changes \\
-the answer to a reasoning question & stars & groups whose odd star was never the odd one in training (\Cref{tab:adversarial}) & not recalled; the tool's advantage grows \\
+the answer to a reasoning question & stars & test set split by whether the odd star was ever the odd one in training, and a larger set built that way (\Cref{tab:adversarial}) & not recalled; the tool's gain is unchanged \\
 \bottomrule
 \end{tabular}
 \end{table}
@@ -211,31 +211,53 @@ in \Cref{tab:basemodel} should be read with this in mind.
 
 \textbf{The answer.} The objection that matters most is that the tool narrator
 might recall which star was called unusual during training rather than work it
-out. While the comparisons in~\Cref{tab:headboth}
-are fair (all experiments used the same dataset), they do not rule this out. From the test fold we therefore keep
-only groups whose odd member was \emph{never} an odd member anywhere in
-training: the star may have been described many times, but never as the one
-that stands out. Only $2.3\%$ of candidate groups survive that filter, leaving
-$1{,}000$. If the tool narrator is memorizing, it should lose most of its
-advantage here. \Cref{tab:adversarial} shows that it does not; the advantage
-grows. The tool is worth $+0.469$ on this set against $+0.330$ on the full test
-set, and the two narrators move in opposite directions: the narrator without the
-tool falls ($0.332 \to 0.279$) while the tool narrator improves ($0.662 \to 0.748$). 
+out. The comparisons in~\Cref{tab:headboth} are fair, since every narrator saw
+the same training text, but they do not rule this out. We test it twice. First
+on the test set itself: we split its $1{,}203$ groups with an odd member by
+whether that member was ever the odd member of a training group. The two halves
+are disjoint and together give the numbers of \Cref{tab:headboth} exactly
+(\Cref{tab:adversarial}, top). Almost every odd star was odd somewhere in
+training ($1{,}167$ groups), as the overlap described in \Cref{sec:data}
+implies, and $36$ groups remain whose answer never appeared. On those the tool
+is worth $+0.31$ ($0.39 \to 0.69$; $p=0.003$, bootstrap $95\%$ interval $+0.14$
+to $+0.47$), against $+0.33$ on the other half ($0.33 \to 0.66$): the gain
+does not depend on whether the answer was available to recall. Second, because
+that half is small, we build a larger set of the same kind: $1{,}000$ new groups
+from the test fold, each with an odd member that was never an odd member in
+training, which keeps $2.3\%$ of candidate groups. \Cref{tab:adversarial}
+(bottom) shows the same picture with more power: the tool is worth $+0.47$. This
+set is harder by construction, since the stars that survive the filter are
+rarely odd and their anomalies are subtler, so its absolute rates are not
+comparable to those of \Cref{tab:headboth}; only the gap within it is.
 
 \begin{table}[h]\centering\small
-\caption{$1{,}000$ stellar groups whose odd member
-was never an odd member in training, judge-scored. \emph{score} is the fraction of descriptions that name the
-true odd member and its property; \emph{named} counts naming the odd member
-regardless of property, and \emph{property} naming the right property regardless
-of member.}
+\caption{\textbf{Is the answer recalled?} Judge-scored. \emph{Top}: the test
+groups of \Cref{tab:headboth}, split by whether the odd member was ever the odd
+member of a training group; the two rows are disjoint and together reproduce
+\Cref{tab:headboth}. \emph{Bottom}: a larger set of $1{,}000$ new groups whose
+odd member was never odd in training. \emph{score} is the fraction of
+descriptions that name the true odd member and its property; \emph{named}
+counts naming the odd member regardless of property, and \emph{property} naming
+the right property regardless of member.}
 \label{tab:adversarial}
-\begin{tabular}{lccc}
+\begin{tabular}{llcccc}
 \toprule
- & score & named & property  \\
+ & & groups & narrator & narrator $+$ tool & $\Delta$ \\
 \midrule
-narrator & 0.279 & 0.329 & 0.343  \\
-narrator $+$ tool   & \textbf{0.748} & \textbf{0.782} & \textbf{0.761}  \\
-$\Delta$  & $+0.469$ & $+0.453$ & $+0.418$ \\
+\multirow{3}{*}{\shortstack[l]{test set,\\ odd star was odd in training}}
+ & score    & $1{,}167$ & 0.330 & \textbf{0.661} & $+0.331$ \\
+ & named    &           & 0.441 & \textbf{0.800} & $+0.359$ \\
+ & property &           & 0.388 & \textbf{0.686} & $+0.297$ \\
+\midrule
+\multirow{3}{*}{\shortstack[l]{test set,\\ odd star never odd in training}}
+ & score    & $36$      & 0.389 & \textbf{0.694} & $+0.306$ \\
+ & named    &           & 0.472 & \textbf{0.694} & $+0.222$ \\
+ & property &           & 0.472 & \textbf{0.750} & $+0.278$ \\
+\midrule
+\multirow{3}{*}{\shortstack[l]{new groups,\\ odd star never odd in training}}
+ & score    & $1{,}000$ & 0.279 & \textbf{0.748} & $+0.469$ \\
+ & named    &           & 0.329 & \textbf{0.782} & $+0.453$ \\
+ & property &           & 0.343 & \textbf{0.761} & $+0.418$ \\
 \bottomrule
 \end{tabular}
 \end{table}
@@ -244,14 +266,8 @@ Taken together, the narrator copies surface detail, namely wording when the
 training allows it and exact values it has read about the same star, but not
 conclusions: whether a star is the odd one in its group is worked out from the
 input, not recalled. This is also why the stellar overlap does not undermine the
-reasoning results. They are measured on new groups, and in \Cref{tab:adversarial}
-on answers that never appeared in training.
-
-% One caveat on reading the table. This set is deliberately harder than the full
-% fold and its item mix is different, so only the within-set gap is quotable:
-% compare $0.748$ to $0.279$, not to the $0.662$ of \Cref{tab:headboth}. Groups
-% with no odd member are excluded throughout, here and everywhere else in the
-% paper.
+reasoning results. They are measured on new groups, and the tool's gain is the
+same where the answer never appeared in training.
 
 \subsection{giving the model the numbers as text}\label{sec:text}
 If the features carry the signal and the model cannot use it, an obvious
