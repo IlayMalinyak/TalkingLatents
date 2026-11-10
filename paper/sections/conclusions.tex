@@ -1,1 +1,25 @@
 \section{Conclusion}
+\nw{We asked whether a language model can reason directly over learned scientific features,
+beyond describing them. On single objects and pairs it can, on both datasets. On questions
+that require reasoning, the main result concerns training rather than architecture. A fully
+fine-tuned narrator fails to find the odd star in a group, and fails more as the group grows.
+A narrator trained with LoRA on a frozen base, on the same text and the same features,
+succeeds in about two thirds of groups and does not lose accuracy with group size, and the
+same comparison also favours LoRA on galaxies. Neither method was tuned, so a better recipe
+for full fine-tuning may exist, but LoRA gives this result without one, and most of the gain
+remains when the two share an optimizer schedule.
+
+Latent tool use adds to this in a specific place. A small flow-matching model that receives
+catalog labels as auxiliary data, and returns its output as a latent token, improves the
+identification of outliers that never appeared as outliers in training ($0.62 \to 0.75$),
+including when binary stars are excluded ($0.78 \to 0.88$). It adds little where the training
+data offers precedent, and nothing on galaxies, where its output repeats what the narrator
+already reads. Text is a poor substitute: models given the catalog numbers score below the
+LoRA narrator, and frontier models given the raw observations zero-shot score lower still.
+Verified templated text remains preferable to fluent LLM-written text as training data.
+
+For a language model reading scientific data, these results suggest first adapting it with a
+low-rank adapter, and then adding dedicated models with auxiliary data where the task goes
+beyond what the training data covers. Why the frozen base preserves this ability, and how
+frontier agents with code execution compare, remain open.}
+

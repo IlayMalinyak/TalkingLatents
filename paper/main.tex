@@ -43,6 +43,19 @@
 \newcommand{\hugues}[1]{\textcolor{blue}{\textbf{Hugues:} #1}}
 \newcommand{\ilay}[1]{\textcolor{red}{\textbf{Ilay:} #1}}
 
+% Revision tracking. Green = new or changed text, orange = removed text.
+% Set \trackrevfalse to get the clean version.
+\definecolor{revnew}{HTML}{0B7A3B}
+\definecolor{revold}{HTML}{D95F02}
+\newif\iftrackrev \trackrevtrue
+\iftrackrev
+  \newcommand{\nw}[1]{{\color{revnew}#1}}
+  \newcommand{\dl}[1]{{\color{revold}#1}}
+\else
+  \newcommand{\nw}[1]{#1}
+  \newcommand{\dl}[1]{}
+\fi
+
 % colours used by figs/architecture_body (Fig. 1)
 \definecolor{deepteal}{HTML}{264653}
 \definecolor{coral}{HTML}{E76F51}

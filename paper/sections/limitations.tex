@@ -1,5 +1,29 @@
 \section{Limitations}\label{sec:limitations}
 
+\nw{\paragraph{Training recipes were not tuned.} We compare full fine-tuning and LoRA with
+the settings each happened to be trained with, and did not search hyperparameters for either.
+A different recipe might close the gap for full fine-tuning; our claim is that LoRA performs
+better without such a search, not that full fine-tuning cannot match it. The LoRA narrator
+trained with the full fine-tuning schedule was stopped before it converged, so the part of
+the gain we assign to the optimizer schedule (\Cref{tab:chain}) also includes the effect of
+training length.
+
+\paragraph{The tool has catalog labels.} The stellar tool models the aligned features jointly
+with catalog labels and receives those labels at test time, which narrators without the tool
+do not. The comparison with and without the tool is therefore a comparison with and without
+auxiliary data, and we do not separate the part of the gain due to the learned density from
+the part due to the labels. The tool's gain is concentrated on groups whose odd star was
+never odd in training, where binarity is the odd property in more than half of the groups.
+
+\paragraph{Frontier models were tested zero-shot.} The frontier models received the raw
+observations without tools and without any training on this data, while the narrators read
+pre-trained features and were trained on descriptions of these stars. The comparison shows
+what a general-purpose model does out of the box. It does not bound what an agent could do
+with code execution over the same observations, which we did not complete.
+
+\paragraph{One seed per narrator.} Each narrator was trained once. Our claims rest on large
+paired differences on the same test items and on the same pattern across two datasets.}
+
 % \paragraph{The corpus is not split-aware.} $99.2\%$ of test-fold stars appear in
 % some training description. The contrast is symmetric across narrators so the paired
 % comparisons hold, but absolute rates are optimistic, and the adversarial set
