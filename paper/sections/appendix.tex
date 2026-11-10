@@ -52,9 +52,7 @@ readout that models the group jointly, the tool of
 \Cref{tab:headboth}, is not bound by it.
 
 Scoring the narrators by the same rule, crediting any equally-qualifying star,
-\dl{raises both narrators ($0.332 \to 0.419$ without the tool, $0.662 \to 0.756$ with
-it) and leaves the tool's lead intact: $+0.33 \to +0.34$ ($n{=}1{,}203$ groups,
-exact McNemar $p{=}7\times10^{-81}$).}\nw{raises every narrator ($0.332 \to 0.419$ for the fully fine-tuned narrator, $0.633 \to 0.717$
+\nw{raises every narrator ($0.332 \to 0.419$ for the fully fine-tuned narrator, $0.633 \to 0.717$
 for the LoRA narrator without the tool, and $0.662 \to 0.756$ for the tool narrator) and leaves
 the tool narrator's lead over full fine-tuning intact: $+0.33 \to +0.34$ ($n{=}1{,}203$ groups,
 exact McNemar $p{=}7\times10^{-81}$).}
@@ -101,8 +99,7 @@ galaxy still forms stars. Third, scrambling the tool narrator's token costs it a
 little on star-forming galaxies, so the narrator does read the token, but the
 information it carries is already available from the data tokens. On galaxies,
 the improvement over the fully fine-tuned narrator therefore comes from the
-\dl{training, not from the tool token. The stellar equivalent of this control was not
-run (\Cref{sec:limitations}).}\nw{training, not from the tool token. The stellar equivalent is in \Cref{sec:tokenortraining}.}
+\nw{training, not from the tool token. The stellar equivalent is in \Cref{sec:tokenortraining}.}
 
 \subsection{The training recipe}\label{app:recipe}
 \Cref{tab:recipe} tests the two input changes of \Cref{sec:data} on the galaxy
@@ -329,9 +326,7 @@ Groups are built by choosing members that share one property and adding an odd
 star that differs on another, but the other members are not checked on that
 second property, so some groups contain more than one star with the odd
 property. \Cref{tab:perodd} gives the score for each kind of odd star on all
-\dl{test groups, and on the $556$ groups in which the odd star is the only member with
-its odd property. The tool improves the score in every row. On the second set
-the narrator without the tool again declines}\nw{test groups, and on the $556$ groups in which the odd star is the only member with
+\nw{test groups, and on the $556$ groups in which the odd star is the only member with
 its odd property. The tool narrator improves on the fully fine-tuned narrator in every row;
 most of that gain is already present in the LoRA narrator without the tool, and the tool adds
 most on binary stars. On the second set
@@ -418,9 +413,7 @@ $99.2\%$ described in the training text).}
 
 \subsection{Reading the numbers, by group size}\label{app:textsize}
 \Cref{tab:textsize} breaks \Cref{tab:text} down by the number of stars in the
-\dl{group. The narrator without the tool falls from $0.45$ to $0.06$ as groups grow;
-the models that read the table fall less, but stay below the narrator with the
-tool at every size.}\nw{group. The fully fine-tuned narrator falls from $0.45$ to $0.06$ as groups grow;
+\nw{group. The fully fine-tuned narrator falls from $0.45$ to $0.06$ as groups grow;
 the models that read the table fall less, but stay below the LoRA narrators at every size.}
 
 \begin{table}[h]\centering\small
@@ -460,6 +453,35 @@ searched for any of these narrators.
 Each star is shown as fixed plots of its full Kepler light curve, a $20$-day segment of it,
 one TESS sector, and its LAMOST and APOGEE spectra, together with its Gaia measurements as
 text. No derived stellar parameter is shown. A group shows these panels for every member.
-Replacing the plots with binned numerical tables, on $100$ single stars and $20$ groups, did not
-change the result significantly.
+
+Plots may suit a vision model less than numbers do. We therefore replaced each plot with a
+table of the same observations, binned to a few hundred values per curve or spectrum, and
+reran Claude Opus 5.5 on a subset of the same items (\Cref{tab:frontierinput}). The results do
+not change: the model states about the same fraction of numbers and classes correctly, and
+it finds the odd star in about as few groups. The low score therefore does not come from the
+plot format.
+
+We also started a third version, in which the model can run code on the unbinned
+observations. It ran on only three groups before we stopped it, which is too few to report.
 }
+
+\begin{table}[h]\centering\small
+\caption{\nw{\textbf{Plots against tables as input}, Claude Opus 5.5, zero-shot, paired on the
+same items. Single stars are scored by the verifier as in \Cref{tab:frontier}; groups are
+judge-scored, and we report counts because there are only $16$ groups with an odd member.}}
+\label{tab:frontierinput}
+\nw{\begin{tabular}{lcc}
+\toprule
+ & plots & tables \\
+\midrule
+\multicolumn{3}{l}{\emph{single stars ($n=100$)}}\\
+numeric acc.     & 0.357 & 0.385 \\
+qualitative acc. & 0.580 & 0.590 \\
+\midrule
+\multicolumn{3}{l}{\emph{groups with an odd member ($n=16$)}}\\
+odd star and property named & 3 & 2 \\
+odd star named              & 4 & 2 \\
+contradictions per group    & 3.06 & 3.19 \\
+\bottomrule
+\end{tabular}}
+\end{table}

@@ -71,45 +71,24 @@ use, as latent tokens rather than as text. We call this \emph{latent tool use (L
 % question for each: the odd member of a set of stars, and the agreement between two
 % views of a single galaxy.
 %
-\dl{\emph{First}, we find a sharp asymmetry. Reading learned tokens, the model describes
-single objects and compares pairs mostly correctly on both datasets, and judges whether a
-galaxy's shape and star-formation history disagree for $97$--$99\%$ of galaxies. It fails
-when the answer requires comparing a whole group: it names the odd star and its property
-in a third of groups, falling from $0.51$ with four stars to $0.15$ with $32$. A linear}\nw{\emph{First}, we find that the way the language model is adapted decides whether it can
-reason over a group. Reading learned tokens, the model describes
-single objects and compares pairs mostly correctly on both datasets. Fully fine-tuned, it
-fails when the answer requires comparing a whole group: it names the odd star and its
-property in a third of groups, falling from $0.45$ with four stars to $0.06$ with $32$.
-Trained with LoRA on a frozen base, on the same text, it does so in $63\%$ of groups with
-no decline with group size, and it judges whether a galaxy's shape and star-formation
-history disagree for $97$--$99\%$ of galaxies, against $88\%$ of quiescent galaxies when
-fully fine-tuned. \todo{we should not put exact numbers. this sohuld be more high level and short} With the optimizer schedule of the fully fine-tuned model, the LoRA
-model still reaches $0.51$. Neither method was tuned. A linear}
-probe ranks the odd star as well as the catalog values do, so the signal is in the
-features and the failure is in using it. Supplying the catalog values as text does not
-help: the model either names most of the group or, when it reasons first, does no better
-\dl{than the model reading the tokens, and a larger general-purpose model (Qwen3.5-27B) does
-no better either.}\nw{than the fully fine-tuned model reading the tokens, and a larger general-purpose model
-(Qwen3.5-27B) does no better either. Frontier general-purpose models given the raw
-observations zero-shot, without tools, score $0.20$. \todo{also too long, complex and in the weeds. Make it cleaner and simpler. we should not put every result here but the main contributions. i think resuts are not contributions.}}
-%
-\dl{\emph{Second}, performing part of the group comparison outside the language model, in a
-small non-language model, and returning its result as one extra latent token per star,
-doubles the stellar score ($0.33 \to 0.66$), keeps it flat across group sizes, and holds
-on groups whose odd star was never the odd one in training. The small model does not know the answer on its own (its own ranking puts the odd star first in $29\%$ of groups), and the language model does not copy its verdict; it is the latent return that the language model can use. This is latent tool use.}\nw{\emph{Second}, we perform part of the group comparison outside the language model, in a
-small non-language model that models the stars together with their catalog labels, and
-return its result as one extra latent token per star. For a LoRA model, this adds little
-on the standard test groups ($+0.03$, not significant), and significantly improves the
-groups whose odd star was never the odd one in training ($0.62 \to 0.75$). The labels are an inherent input of this small model, so the result reads as follows: when labels are given to it as auxiliary data, the language model uses the returned token to improve its answers. The small model does not know the answer on its own (its own ranking puts the odd star first in $29\%$ of groups), and the language model does not copy its verdict. This is latent tool use.
-\todo{contribution are too long and complex. we need to distill it by a lot. we need to ask ourselves - what are the contributions not the all the results? what is important. aso, at this part we should explain thngs in high level, not get into the weeds}}
-% This
-% model was also trained differently (LoRA instead of full fine-tuning), and the
-% matching control has not been run (\Cref{sec:limitations}). On galaxies, where the
-% narrator already succeeds, the tool token adds nothing.
-%
-\emph{Third}, verified templated prose yields a substantially more factual model than
-fluent LLM-written prose on the same task, because the LLM-written text states more than
-the input determines.
+
+\nw{\emph{First}, we show that the way the language model is fine-tuned decides whether it
+can reason over a group of objects. With full fine-tuning, the model describes single
+objects and compares pairs well, but it often fails to find the odd star in a group, and it
+fails more often as the group grows. With LoRA on a frozen base, the same model, trained on
+the same data, finds the odd star in most groups at every group size, and it also judges
+galaxies more accurately. A linear probe shows that the features contain the answer, so the
+fully fine-tuned model fails because it does not read them well.
+
+\emph{Second}, we introduce latent tool use. A small model compares each star with the rest
+of its group, using the star's features and catalog labels, and returns its result to the
+language model as one latent token per star. The language model uses this token without
+copying the small model's answer, and answers more accurately on groups unlike those it saw
+in training.
+
+\emph{Third}, we show that training on verified templated prose gives a more factual model
+than training on fluent LLM-written prose, because LLM-written prose states more than its
+input supports.}
 
 \section{Related Work}\label{sec:related_work}
 
