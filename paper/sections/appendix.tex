@@ -52,10 +52,10 @@ readout that models the group jointly, the tool of
 \Cref{tab:headboth}, is not bound by it.
 
 Scoring the narrators by the same rule, crediting any equally-qualifying star,
-\nw{raises every narrator ($0.332 \to 0.419$ for the fully fine-tuned narrator, $0.633 \to 0.717$
+raises every narrator ($0.332 \to 0.419$ for the fully fine-tuned narrator, $0.633 \to 0.717$
 for the LoRA narrator without the tool, and $0.662 \to 0.756$ for the tool narrator) and leaves
 the tool narrator's lead over full fine-tuning intact: $+0.33 \to +0.34$ ($n{=}1{,}203$ groups,
-exact McNemar $p{=}7\times10^{-81}$).}
+exact McNemar $p{=}7\times10^{-81}$).
 
 \subsection{The galaxy narrators: token or training?}\label{app:2x2}
 The galaxy tool narrator differs from the fully fine-tuned narrator in two ways:
@@ -99,7 +99,7 @@ galaxy still forms stars. Third, scrambling the tool narrator's token costs it a
 little on star-forming galaxies, so the narrator does read the token, but the
 information it carries is already available from the data tokens. On galaxies,
 the improvement over the fully fine-tuned narrator therefore comes from the
-\nw{training, not from the tool token. The stellar equivalent is in \Cref{sec:tokenortraining}.}
+training, not from the tool token. The stellar equivalent is in \Cref{sec:tokenortraining}.
 
 \subsection{The training recipe}\label{app:recipe}
 \Cref{tab:recipe} tests the two input changes of \Cref{sec:data} on the galaxy
@@ -326,11 +326,11 @@ Groups are built by choosing members that share one property and adding an odd
 star that differs on another, but the other members are not checked on that
 second property, so some groups contain more than one star with the odd
 property. \Cref{tab:perodd} gives the score for each kind of odd star on all
-\nw{test groups, and on the $556$ groups in which the odd star is the only member with
+test groups, and on the $556$ groups in which the odd star is the only member with
 its odd property. The tool narrator improves on the fully fine-tuned narrator in every row;
 most of that gain is already present in the LoRA narrator without the tool, and the tool adds
 most on binary stars. On the second set
-the fully fine-tuned narrator again declines} with group size ($0.44$, $0.33$ and
+the fully fine-tuned narrator again declines with group size ($0.44$, $0.33$ and
 $0.14$ for $4$--$7$, $8$--$15$ and $16$--$32$ stars), while the tool narrator
 does not ($0.70$, $0.74$, $0.75$).
 
@@ -340,22 +340,22 @@ greedy; score as in \Cref{tab:headboth}. Rows use the groups whose odd stars all
 differ on the same property ($775$ of $1{,}203$; the last row uses all groups). \emph{Unique}: groups in which
 the odd star is the only member with its odd property. Binarity and open-cluster
 membership are also given to the tool as catalog flags (\Cref{sec:text}). All
-differences \nw{between the fully fine-tuned narrator and the tool narrator} are significant
+differences between the fully fine-tuned narrator and the tool narrator are significant
 (exact McNemar, $p<10^{-3}$) except giants in the unique groups ($p=0.33$, $n=60$).}
 \label{tab:perodd}
 \begin{tabular}{lcccccccc}
 \toprule
  & \multicolumn{4}{c}{all groups} & \multicolumn{4}{c}{unique} \\
 \cmidrule(lr){2-5}\cmidrule(lr){6-9}
-odd star & $n$ & full FT & \nw{LoRA} & $+$ tool & $n$ & full FT & \nw{LoRA} & $+$ tool \\
+odd star & $n$ & full FT & LoRA & $+$ tool & $n$ & full FT & LoRA & $+$ tool \\
 \midrule
-open-cluster member & 120 & 0.150 & \nw{0.692} & \textbf{0.708} & 117 & 0.145 & \nw{0.684} & \textbf{0.709} \\
-binary              & 140 & 0.157 & \nw{0.429} & \textbf{0.550} &  47 & 0.255 & \nw{0.468} & \textbf{0.660} \\
-metal-rich          & 169 & 0.533 & \nw{0.799} & \textbf{0.840} & 147 & 0.551 & \nw{0.782} & \textbf{0.850} \\
-hot                 & 161 & 0.342 & \nw{0.528} & \textbf{0.627} &  99 & 0.394 & \nw{0.606} & \textbf{0.657} \\
-giant               & 185 & 0.227 & \nw{0.427} & \textbf{0.449} &  60 & 0.300 & \nw{\textbf{0.417}} & 0.400 \\
+open-cluster member & 120 & 0.150 & 0.692 & \textbf{0.708} & 117 & 0.145 & 0.684 & \textbf{0.709} \\
+binary              & 140 & 0.157 & 0.429 & \textbf{0.550} &  47 & 0.255 & 0.468 & \textbf{0.660} \\
+metal-rich          & 169 & 0.533 & 0.799 & \textbf{0.840} & 147 & 0.551 & 0.782 & \textbf{0.850} \\
+hot                 & 161 & 0.342 & 0.528 & \textbf{0.627} &  99 & 0.394 & 0.606 & \textbf{0.657} \\
+giant               & 185 & 0.227 & 0.427 & \textbf{0.449} &  60 & 0.300 & \textbf{0.417} & 0.400 \\
 \midrule
-all kinds           & 1{,}203 & 0.332 & \nw{0.633} & \textbf{0.662} & 556 & 0.369 & \nw{0.664} & \textbf{0.714} \\
+all kinds           & 1{,}203 & 0.332 & 0.633 & \textbf{0.662} & 556 & 0.369 & 0.664 & \textbf{0.714} \\
 \bottomrule
 \end{tabular}
 \end{table}
@@ -413,8 +413,8 @@ $99.2\%$ described in the training text).}
 
 \subsection{Reading the numbers, by group size}\label{app:textsize}
 \Cref{tab:textsize} breaks \Cref{tab:text} down by the number of stars in the
-\nw{group. The fully fine-tuned narrator falls from $0.45$ to $0.06$ as groups grow;
-the models that read the table fall less, but stay below the LoRA narrators at every size.}
+group. The fully fine-tuned narrator falls from $0.45$ to $0.06$ as groups grow;
+the models that read the table fall less, but stay below the LoRA narrators at every size.
 
 \begin{table}[h]\centering\small
 \caption{\textbf{Score by number of stars in the group}, for the models of
@@ -430,15 +430,15 @@ AstroSage-8B, reads the table, reasons first & 0.29 & 0.29 & 0.33 & 0.26 & 0.28 
 Qwen3.5-27B, reads the table                 & 0.40 & 0.39 & 0.31 & 0.37 & 0.26 & 0.24 & 0.30 \\
 Qwen3.5-27B, reads the table, reasons first  & 0.30 & 0.38 & 0.37 & 0.35 & 0.31 & 0.22 & 0.27 \\
 \midrule
-narrator, \nw{full fine-tune}                & 0.45 & 0.37 & 0.44 & 0.30 & 0.25 & 0.13 & 0.06 \\
-\nw{narrator, LoRA, FT schedule}             & \nw{0.51} & \nw{0.52} & \nw{0.61} & \nw{0.52} & \nw{0.50} & \nw{0.46} & \nw{0.34} \\
-\nw{narrator, LoRA}                          & \nw{0.60} & \nw{0.61} & \nw{0.70} & \nw{0.70} & \nw{0.67} & \nw{0.60} & \nw{0.53} \\
+narrator, full fine-tune                & 0.45 & 0.37 & 0.44 & 0.30 & 0.25 & 0.13 & 0.06 \\
+narrator, LoRA, FT schedule             & 0.51 & 0.52 & 0.61 & 0.52 & 0.50 & 0.46 & 0.34 \\
+narrator, LoRA                          & 0.60 & 0.61 & 0.70 & 0.70 & 0.67 & 0.60 & 0.53 \\
 narrator $+$ tool                            & \textbf{0.68} & \textbf{0.63} & \textbf{0.71} & \textbf{0.70} & \textbf{0.68} & \textbf{0.62} & \textbf{0.56} \\
 \bottomrule
 \end{tabular}
 \end{table}
 
-\nw{\subsection{Training recipes of the stellar narrators}\label{app:recipes}
+\subsection{Training recipes of the stellar narrators}\label{app:recipes}
 Full fine-tuning updates all weights of the language model, with a learning rate of
 $5\times10^{-5}$, a cosine schedule with warm-up, and label smoothing of $0.05$. The LoRA
 narrators freeze the base model and train low-rank adapters (rank $16$, $\alpha=32$) on the
@@ -463,14 +463,14 @@ plot format.
 
 We also started a third version, in which the model can run code on the unbinned
 observations. It ran on only three groups before we stopped it, which is too few to report.
-}
+
 
 \begin{table}[h]\centering\small
-\caption{\nw{\textbf{Plots against tables as input}, Claude Opus 5.5, zero-shot, paired on the
+\caption{\textbf{Plots against tables as input}, Claude Opus 5.5, zero-shot, paired on the
 same items. Single stars are scored by the verifier as in \Cref{tab:frontier}; groups are
-judge-scored, and we report counts because there are only $16$ groups with an odd member.}}
+judge-scored, and we report counts because there are only $16$ groups with an odd member.}
 \label{tab:frontierinput}
-\nw{\begin{tabular}{lcc}
+\begin{tabular}{lcc}
 \toprule
  & plots & tables \\
 \midrule
@@ -483,5 +483,5 @@ odd star and property named & 3 & 2 \\
 odd star named              & 4 & 2 \\
 contradictions per group    & 3.06 & 3.19 \\
 \bottomrule
-\end{tabular}}
+\end{tabular}
 \end{table}
