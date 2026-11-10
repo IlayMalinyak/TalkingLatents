@@ -50,8 +50,8 @@ LLMs in a scientifically useful manner. Each has distinct advantages, and the po
 for knowledge alignment between them has far-reaching outcomes. One is interpretability:
 an LLM that operates over both natural language and learned scientific representations
 could serve as a `bridge' between humans and machine learning representations, which are
-usually hard to interpret. A second is scientific discovery: foundation models trained on
-large and diverse datasets encapsulate latent information beyond their downstream tasks,
+usually hard to interpret. A second is scientific discovery: LLMs have broad theoretical knowledge, and combining this general knowledge with specific data can lead to new discoveries. In addition, physics foundation models are trained on
+large and diverse datasets and encapsulate latent information beyond their downstream tasks,
 and that information can support non-trivial population analysis or complex cross-modal
 correlations. Unfolding it, however, requires analysing high-dimensional features
 directly, whereas the common practice of projecting them to a low-dimensional summary
@@ -83,7 +83,7 @@ property in a third of groups, falling from $0.45$ with four stars to $0.06$ wit
 Trained with LoRA on a frozen base, on the same text, it does so in $63\%$ of groups with
 no decline with group size, and it judges whether a galaxy's shape and star-formation
 history disagree for $97$--$99\%$ of galaxies, against $88\%$ of quiescent galaxies when
-fully fine-tuned. With the optimizer schedule of the fully fine-tuned model, the LoRA
+fully fine-tuned. \todo{we should not put exact numbers. this sohuld be more high level and short} With the optimizer schedule of the fully fine-tuned model, the LoRA
 model still reaches $0.51$. Neither method was tuned. A linear}
 probe ranks the odd star as well as the catalog values do, so the signal is in the
 features and the failure is in using it. Supplying the catalog values as text does not
@@ -91,7 +91,7 @@ help: the model either names most of the group or, when it reasons first, does n
 \dl{than the model reading the tokens, and a larger general-purpose model (Qwen3.5-27B) does
 no better either.}\nw{than the fully fine-tuned model reading the tokens, and a larger general-purpose model
 (Qwen3.5-27B) does no better either. Frontier general-purpose models given the raw
-observations zero-shot, without tools, score $0.20$.}
+observations zero-shot, without tools, score $0.20$. \todo{also too long, complex and in the weeds. Make it cleaner and simpler. we should not put every result here but the main contributions. i think resuts are not contributions.}}
 %
 \dl{\emph{Second}, performing part of the group comparison outside the language model, in a
 small non-language model, and returning its result as one extra latent token per star,
@@ -100,7 +100,8 @@ on groups whose odd star was never the odd one in training. The small model does
 small non-language model that models the stars together with their catalog labels, and
 return its result as one extra latent token per star. For a LoRA model, this adds little
 on the standard test groups ($+0.03$, not significant), and significantly improves the
-groups whose odd star was never the odd one in training ($0.62 \to 0.75$). The labels are an inherent input of this small model, so the result reads as follows: when labels are given to it as auxiliary data, the language model uses the returned token to improve its answers. The small model does not know the answer on its own (its own ranking puts the odd star first in $29\%$ of groups), and the language model does not copy its verdict. This is latent tool use.}
+groups whose odd star was never the odd one in training ($0.62 \to 0.75$). The labels are an inherent input of this small model, so the result reads as follows: when labels are given to it as auxiliary data, the language model uses the returned token to improve its answers. The small model does not know the answer on its own (its own ranking puts the odd star first in $29\%$ of groups), and the language model does not copy its verdict. This is latent tool use.
+\todo{contribution are too long and complex. we need to distill it by a lot. we need to ask ourselves - what are the contributions not the all the results? what is important. aso, at this part we should explain thngs in high level, not get into the weeds}}
 % This
 % model was also trained differently (LoRA instead of full fine-tuning), and the
 % matching control has not been run (\Cref{sec:limitations}). On galaxies, where the
