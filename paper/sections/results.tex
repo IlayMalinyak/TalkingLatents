@@ -269,7 +269,10 @@ by whether the odd star was ever the odd member of a training group. Almost all 
 small, we also built $1{,}000$ new groups from the test fold whose odd star was never an odd
 member in training, which keeps $2.3\%$ of candidate groups. On these, LoRA gains $0.34$ over
 full fine-tuning, so that gain is not recall. This set is harder by construction, since stars
-that survive the filter are rarely odd, so only differences within it are comparable.
+that survive the filter are rarely odd, so only differences within it are comparable. The
+filter also changes which property makes a star odd: in $54\%$ of these groups it is
+binarity, against $26\%$ of the test groups, and almost none turn on metallicity ($1\%$) or
+cluster membership. The set therefore checks recall but does not replace the test groups.
 
 \begin{table}[h]\centering\small
 \caption{\textbf{Is the answer recalled?} Judge-scored. \emph{Top}: the test
