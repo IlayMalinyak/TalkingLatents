@@ -333,7 +333,7 @@ narrator does ($7\%$ against $8\%$), so it does not copy a verdict from the toke
 the token: on the test groups, scrambling the token across the group costs $0.056$ and zeroing
 it costs $0.101$ (\Cref{tab:ablate}). On the never-odd groups the costs are larger: scrambling costs $0.197$ ($0.748 \to 0.551$)
 and zeroing costs $0.401$ ($\to 0.347$), both below the narrator trained without the tool
-($0.615$).
+($0.615$; \Cref{tab:ablate}).
 On galaxies the tool adds nothing, as expected, since it is computed from the same embeddings
 the narrator reads (\Cref{app:2x2}).
 
@@ -346,19 +346,20 @@ trained for $20$ epochs against $50$ for the tool narrator, so we do not interpr
 of a few points between them.
 
 \begin{table}[h]\centering\small
-\caption{\textbf{Breaking the token at test time}, stellar group task, the $1{,}203$ test
-groups, greedy, judge-scored. The last three rows are one trained model, the tool narrator,
+\caption{\textbf{Breaking the token at test time}, stellar group task, greedy, judge-scored.
+\emph{Test}: the $1{,}203$ test groups with an odd member. \emph{Never odd}: the $1{,}000$
+groups of \Cref{tab:group}. The last three rows are one trained model, the tool narrator,
 with its token intact or damaged at generation time.}
 \label{tab:ablate}
-\begin{tabular}{lc}
+\begin{tabular}{lcc}
 \toprule
- & score  \\
+ & test & never odd \\
 \midrule
-LoRA, no tool token & 0.633 \\
+LoRA, no tool token & 0.633 & 0.615 \\
 \midrule
-LoRA $+$ tool, token zeroed      & 0.561  \\
-LoRA $+$ tool, token scrambled   & 0.606 \\
-LoRA $+$ tool, token intact      & \textbf{0.662}  \\
+LoRA $+$ tool, token zeroed      & 0.561 & 0.347 \\
+LoRA $+$ tool, token scrambled   & 0.606 & 0.551 \\
+LoRA $+$ tool, token intact      & \textbf{0.662} & \textbf{0.748} \\
 \bottomrule
 \end{tabular}
 \end{table}
