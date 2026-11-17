@@ -1,3 +1,19 @@
 \begin{abstract}
-Recent advances in Large Language Models (LLMs) offer unique opportunities for scientific tasks, yet their ability to reason over complex numerical data remains largely unexplored. While several works investigate the ability of LLMs to create textual descriptions of scientific objects (e.g., proteins), we ask whether they can understand those objects and answer comparative questions about them. This kind of reasoning beyond description is crucial for the development of useful co-scientists. We test two different astrophysical datasets, involving both stars and galaxies, with pre-trained multimodal features that serve as the LLM data tokens. Adding those tokens as additional information, we fine-tune an 8B Llama model on various scientific description and reasoning tasks. We find that the model can describe the objects and compare pairs reasonably well in both datasets. On reasoning tasks, the outcome depends strongly on how the language model is adapted. Fully fine-tuned, the model can find cross-modal anomalies on galaxies, but it fails to identify outliers within a population of stars, and its performance drops with the size of the population. Training only a low-rank adapter (LoRA) on a frozen base model, with neither method's hyperparameters tuned, nearly doubles the stellar score, removes the dependence on population size, and improves the galaxy task; most of the gain remains when the two methods share one optimizer schedule. We further show that a small flow-matching model, which receives catalog labels as auxiliary data and returns its output to the LLM as latent tokens rather than as text, improves the identification of outliers that were never outliers in training ($0.62 \to 0.75$). We call this \emph{latent tool use (LTU)}. Frontier general-purpose models given the raw observations zero-shot, without tools, score well below these narrators. In addition, we show that for such questions, a template-based dataset is preferable to an LLM-based dataset. The results indicate that a language model reading learned scientific features can perform population-level reasoning when it is adapted with a low-rank adapter, and that a dedicated model given auxiliary labels adds to this where the training data offers no precedent.  
+Large Language Models (LLMs) can describe scientific objects, but can they analyse data
+directly from a learned scientific representation? We connect pre-trained multimodal encoders
+of stars and of galaxies to an 8B language model and ask whether their features are a
+sufficient interface for analysis beyond description. Two reference points bracket the
+results: linear probes on the same features show what the representation contains, and
+frontier models given the raw observations show what is reachable without it. The language
+model describes single objects about as well as the probes, on both datasets. Finding the odd
+member of a group of stars depends on how the model is adapted. Fully fine-tuned, it fails in
+two thirds of groups, and fails more often as the group grows. Trained with a low-rank adapter
+(LoRA) on a frozen base, on the same data, it succeeds in about two thirds of groups at every
+group size, including groups whose answer never appeared in training; galaxies show the same
+effect of adaptation. A probe confirms that the features contain the answer. Models that read
+the catalog values as text without training on the task, and frontier models given the raw
+observations zero-shot, score below the LoRA model. As a preliminary extension, a small model
+that passes auxiliary catalog labels to the language model as latent tokens helps on groups
+unlike those seen in training. Comparisons with a text-trained model and with frontier agents
+that run code are in progress.
 \end{abstract}

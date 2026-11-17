@@ -58,37 +58,31 @@ directly, whereas the common practice of projecting them to a low-dimensional su
 discards exactly the structure such analyses depend on. Most current uses of LLMs with
 scientific data take the form of textual descriptions, or of agents that delegate the
 analysis to dedicated models and read off their results as text, which is usually called
-\emph{tool use} \citep{Schick2023_toolformer, Gao2023_pal, Hao2023ToolkenGPTAF}. Whether an LLM can perform
-scientific reasoning \emph{directly} from learned data representations is therefore still
-an open question, and it is the question we study here. Where it cannot, we ask a second
-one: whether the result of a dedicated model can be handed to the LLM in a form it can
-use, as latent tokens rather than as text. We call this \emph{latent tool use (LTU)}.
+\emph{tool use} \citep{Schick2023_toolformer, Gao2023_pal, Hao2023ToolkenGPTAF}. We ask a
+different question: is a learned scientific representation a sufficient interface for an LLM
+to analyse data, beyond describing it? Two reference points bracket the answer. Probes trained
+on the same features show what the representation contains, and frontier models given the raw
+observations show what is reachable without it.
 
 \textbf{Contribution.}
-% We connect frozen survey encoders to an 8B language model through a trained
-% projector, adapting the language model itself with either LoRA or full fine-tuning, and evaluate it on two independent astrophysical datasets (Kepler-field stars,
-% COSMOS-Web galaxies) across per-object and pairwise questions, and on a more challenging 
-% question for each: the odd member of a set of stars, and the agreement between two
-% views of a single galaxy.
-%
+\emph{First}, we measure what a language model reading learned features can and cannot do. It
+describes single objects about as well as a linear probe on the same features, on stars and on
+galaxies, and it can find the odd member of a group of stars. Frontier models given the raw
+observations zero-shot do worse on both.
 
-\emph{First}, we show that the way the language model is fine-tuned decides whether it
-can reason over a group of objects. With full fine-tuning, the model describes single
-objects and compares pairs well, but it often fails to find the odd star in a group, and it
-fails more often as the group grows. With LoRA on a frozen base, the same model, trained on
-the same data, finds the odd star in most groups at every group size, and it also judges
-galaxies more accurately. A linear probe shows that the features contain the answer, so the
-fully fine-tuned model fails because it does not read them well.
+\emph{Second}, we show that reasoning over a group depends on how the language model is
+adapted. With full fine-tuning, the model describes single objects well but often fails to
+find the odd star, and fails more often as the group grows. With LoRA on a frozen base, the
+same model, trained on the same data, finds it in most groups at every group size. A probe
+shows that the features contain the answer, so the fully fine-tuned model fails to read it.
 
-\emph{Second}, we introduce latent tool use. A small model compares each star with the rest
-of its group, using the star's features and catalog labels, and returns its result to the
-language model as one latent token per star. The language model uses this token without
-copying the small model's answer, and answers more accurately on groups unlike those it saw
-in training.
+\emph{Third}, we compare the latent interface with its alternatives: the catalog values as
+text, read by models with and without training on the task, and frontier models on the raw
+observations.
 
-\emph{Third}, we show that training on verified templated prose gives a more factual model
-than training on fluent LLM-written prose, because LLM-written prose states more than its
-input supports.
+As a preliminary extension, we show that information outside the representation, such as
+whether a star is a known binary, can be passed to the language model by a small separate model
+as a latent token, and that this helps on groups unlike those seen in training.
 
 \section{Related Work}\label{sec:related_work}
 
@@ -123,7 +117,7 @@ LLMs on domain tasks \citep{haan2025_astrosage}, but remain confined to text and
 The architecture we use is standard outside the sciences: a trained projector maps a
 frozen encoder's outputs into the embedding space of a frozen language model, which is
 adapted with a small number of trainable parameters \citep{Tsimpoukelli2021_frozen,
-Alayrac2022_flamingo, Li2023_blip2, Liu2023_llava}. This recipe is
+Alayrac2022_flamingo, Li2023_blip2, Liu2023_llava}. LoRA \citep{Hu2021_lora} is one such method; compared with full fine-tuning it learns less of a new domain but preserves more of the base model's abilities \citep{Biderman2024_lora}. This recipe is
 well-established for producing descriptions of a single input. Whether it supports
 comparison across several inputs, which is what population-level scientific questions
 require, has received little attention.
@@ -135,8 +129,8 @@ ToolkenGPT makes the call itself a learned token embedding, but the result still
 as text \citep{Hao2023ToolkenGPTAF}. Closer to our setting, Prismer feeds the outputs of
 expert vision models to a language model as tokens \citep{Liu2023_prismer}, and PEARL
 trains a vision-language model to predict the effect of a tool in latent space, so that no
-tool is called at inference \citep{Adhikari2026_pearl}. Latent tool use, as we use the
-term, differs from both: the tool is run, on every input, and its result is returned to the
+tool is called at inference \citep{Adhikari2026_pearl}. Coca-Cola compresses an agent's tool outputs into latent tokens instead of text \citep{Liu2026_cocacola}, and CoLT has a small model expand latent seed tokens into reasoning steps, which it calls latent tool calls \citep{Zhu2026_colt}. Our tool, as we use the
+term, differs from these: the tool is run, on every input, and its result is returned to the
 language model as latent tokens that the model is trained to read, instead of as text. The
 language model does not decide when to call it; we leave that to future work.
 

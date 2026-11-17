@@ -9,53 +9,355 @@ the true catalog value, and a cross-fit ridge regression that predicts the same
 quantity from the aligned feature (5-fold, so no star is scored by a model that
 saw it). If the probe tracks the catalog, the signal survives the alignment.
 
-Two details matter. First, only the three continuous axes can be ranked by a
-scalar; binarity and cluster membership are categorical and are excluded
-($103$ of $259$ anomalies). Second, the composer designates one intruder but
+The test groups are those of \Cref{tab:group}. Two details matter. First, only the three continuous axes can be ranked by a
+scalar; binarity and cluster membership are categorical and are excluded, as are odd stars with a missing value
+($689$ of $2{,}097$ odd stars). Second, the composer designates one intruder but
 leaves the other members unconstrained on that axis, so a group often contains
-several stars carrying the same label --- $60.5\%$ of anomalies on the full
-fold, and $81.7\%$ on dwarf/giant. Naming any of them is a true statement about
+several stars carrying the same label. Naming any of them is a true statement about
 the group, so a readout is credited for the best-placed qualifying star rather
 than only the designated one. ``Extreme'' is distance from the group median in
 units of its median absolute deviation, which does not reveal which direction
 the answer lies in.
 
 \begin{table}[h]\centering\small
-\caption{\textbf{Ranking the odd member from the features alone.} $n{=}156$
-continuous-axis anomalies over $129$ groups. \emph{rank-1} = a qualifying star
-is the single most extreme member; \emph{top-3} = one is among the three most
-extreme. The probe reads only what the language model reads.}
+\caption{\textbf{Ranking the odd member from the features alone}, the $1{,}203$ test groups.
+$n{=}1{,}408$ continuous-axis odd stars in $929$ groups. \emph{rank-1} = a qualifying star
+is the single most extreme member; \emph{top-3} = one is among the three most extreme. The
+probe reads only what the language model reads. The narrator rows use the same odd stars and
+credit a callout of any qualifying star (\Cref{tab:probegroup}).}
 \label{tab:probe}
 \begin{tabular}{lcc}
 \toprule
 readout & rank-1 & top-3 \\
 \midrule
-catalog values (oracle)      & 0.660 & \textbf{0.942} \\
-probe, shared subspace (64-d) & 0.660 & 0.840 \\
-probe, full feature (1024-d)  & \textbf{0.686} & 0.891 \\
+catalog values (oracle)       & \textbf{0.728} & \textbf{0.970} \\
+probe, shared subspace (64-d) & 0.567 & 0.866 \\
+probe, full feature (1024-d)  & 0.722 & 0.945 \\
 \midrule
-\multicolumn{3}{l}{\emph{by axis, full feature vs.\ catalog}}\\
-dwarf / giant     & 0.911 \emph{vs} 0.857 & 1.000 \emph{vs} 0.929 \\
-hot / cool        & 0.755 \emph{vs} 0.694 & 0.939 \emph{vs} 0.959 \\
-metal rich / poor & 0.373 \emph{vs} 0.412 & 0.725 \emph{vs} 0.941 \\
+\multicolumn{3}{l}{\emph{rank-1 by axis: catalog, probe; narrators full FT, LoRA, LoRA $+$ tool}}\\
+dwarf / giant ($n=498$)     & \multicolumn{2}{l}{0.896, 0.916; \ 0.291, 0.544, 0.600} \\
+hot / cool ($n=441$)        & \multicolumn{2}{l}{0.776, 0.773; \ 0.413, 0.639, 0.730} \\
+metal rich / poor ($n=469$) & \multicolumn{2}{l}{0.505, 0.467; \ 0.429, 0.802, 0.834} \\
 \bottomrule
 \end{tabular}
 \end{table}
 
-The probe matches the catalog at rank-1 and keeps $89$--$95\%$ of it at top-3. The information for this task is therefore in the features.
+The probe matches the catalog at rank-1 and keeps $97\%$ of it at top-3. The information for
+this task is therefore in the features. On the $1{,}000$ never-odd groups ($525$ odd stars) the
+result is the same: $0.733$ for the probe against $0.745$ for the catalog values.
 
-The catalog row is not a ceiling on the task. It bounds what a \emph{single
-ranked quantity} can do, and it falls short of $1.0$ because the label is a
-threshold test (``$[\mathrm{Fe/H}] > 0.3$'') while a ranking is a distance test:
-a star can sit far from the group median without crossing the threshold. A
-readout that models the group jointly, the tool of
-\Cref{tab:headboth}, is not bound by it.
+The catalog row is not a ceiling on the task. It bounds what a \emph{single ranked quantity}
+can do, and it falls short of $1.0$ because the label is a threshold test
+(``$[\mathrm{Fe/H}] > 0.3$'') while a ranking is a distance test: a star can sit far from the
+group median without crossing the threshold. This is largest for metallicity, where the
+narrators, which state labels rather than distances, score above the probe. The narrators are
+furthest below the probe on dwarfs and giants, which they classify well one star at a time
+(\Cref{tab:single}).
 
-Scoring the narrators by the same rule, crediting any equally-qualifying star,
-raises every narrator ($0.332 \to 0.419$ for the fully fine-tuned narrator, $0.633 \to 0.717$
-for the LoRA narrator without the tool, and $0.662 \to 0.756$ for the tool narrator) and leaves
-the tool narrator's lead over full fine-tuning intact: $+0.33 \to +0.34$ ($n{=}1{,}203$ groups,
-exact McNemar $p{=}7\times10^{-81}$).
+Scoring the narrators by the judge while crediting any equally-qualifying star raises every
+narrator ($0.332 \to 0.419$ for the fully fine-tuned narrator, $0.633 \to 0.717$ for the LoRA
+narrator, and $0.662 \to 0.756$ for the tool narrator) and leaves the order unchanged
+($n{=}1{,}203$ groups).
+
+\subsection{Base model}\label{app:basemodel}
+We compared two Llama-8B models: Llama-3.1 and AstroSage \citep{haan2025_astrosage}, a
+Llama-3.1 model fine-tuned on arXiv astrophysics papers, with the same corpus, recipe and seed
+(\Cref{tab:basemodel}). Both describe and compare objects well on both datasets, and the
+differences are split evenly: AstroSage is ahead in four of the eight cells, and no difference
+exceeds $0.05$. We use AstroSage for the rest of the paper.
+
+\begin{table}[h]\centering\small
+\caption{\textbf{Base model: Llama-3.1-8B vs.\ AstroSage-8B}, identical
+corpus, recipe and seed; rule-scored, greedy; the better model in bold.
+Metrics: \emph{numeric acc.} = fraction of numbers the text states that are
+within $10\%$ of the catalog value (\Cref{app:eval}); \emph{qualitative acc.} (single) =
+fraction of class words (dwarf/giant, disk/elliptical, \ldots) that match
+the catalog; \emph{relational acc.} (pair) = fraction of comparisons
+(``hotter than'', ``more massive'') that match.
+}
+\label{tab:basemodel}
+\begin{tabular}{llcc}
+\toprule
+ & metric & Llama-3.1-8B & AstroSage-8B \\
+\midrule
+\multicolumn{4}{l}{\emph{galaxies --- one object}}\\
+ & numeric acc.\     & \textbf{0.750} & 0.711 \\
+ & qualitative acc.\ & 0.881 & \textbf{0.896} \\
+\multicolumn{4}{l}{\emph{galaxies --- pair}}\\
+ & numeric acc.\     & 0.410 & \textbf{0.444} \\
+ & relational acc.\  & \textbf{0.795} & 0.771 \\
+\midrule
+\multicolumn{4}{l}{\emph{stars --- one object}}\\
+ & numeric acc.\     & 0.651 & \textbf{0.660} \\
+ & qualitative acc.\ & 0.888 & \textbf{0.891} \\
+\multicolumn{4}{l}{\emph{stars --- pair}}\\
+ & numeric acc.\     & \textbf{0.776} & 0.766 \\
+ & relational acc.\  & \textbf{0.942} & 0.900 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+
+\subsection{Single stars and pairs, by training}\label{app:regime}
+\begin{table}[h]\centering\small
+\caption{\textbf{Single stars and pairs, by training}, whole test set ($19{,}010$ single
+stars and $9{,}505$ pairs), greedy, scored by the verifier as in \Cref{tab:basemodel}. The
+tool token enters group questions only, so the last two columns are separately trained
+models that read the same inputs here.}
+\label{tab:regime}
+\begin{tabular}{lcccc}
+\toprule
+ & full fine-tune & LoRA, FT schedule & LoRA & LoRA $+$ tool \\
+\midrule
+single star, numeric acc.     & 0.666 & 0.615 & 0.724 & \textbf{0.796} \\
+single star, qualitative acc. & 0.890 & 0.890 & 0.910 & \textbf{0.933} \\
+pair, numeric acc.            & 0.769 & 0.724 & 0.802 & \textbf{0.849} \\
+pair, relational acc.         & 0.939 & 0.947 & 0.953 & \textbf{0.969} \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+
+
+On single stars and pairs the LoRA narrator with the schedule of the tool narrator is more
+accurate than the fully fine-tuned one, while with the full fine-tuning schedule it is equal on
+class statements and comparisons and lower on stated numbers. The advantage of LoRA over full
+fine-tuning at a matched schedule therefore appears in the group task.
+
+\subsection{Separating the training from the tool}\label{sec:tokenortraining}
+The narrators with and without the tool are separately trained models, and the fully
+fine-tuned narrator differs from the tool narrator in more than the token: the tool narrator
+is trained with LoRA on a frozen base and with a different optimizer schedule. To separate
+these factors we trained two further stellar narrators without a tool
+(\Cref{tab:chain}): one with exactly the recipe of the tool narrator, and one with LoRA but
+the optimizer schedule of the fully fine-tuned narrator (\Cref{app:recipes}). All four
+narrators share the training text, prompt, base model and test items, and each column of
+\Cref{tab:chain} changes one thing from the previous one.
+
+\begin{table}[h]\centering\small
+\caption{\textbf{Separating the training from the tool}, stellar group task, judge-scored,
+greedy, paired. \emph{score}, \emph{named} and \emph{property} are as in
+\Cref{tab:adversarial}; \emph{covered}, \emph{contradictions} and \emph{all correct} as in
+\Cref{tab:corpus}. \emph{Top}: the $1{,}203$ test groups with an odd member.
+\emph{Bottom}: the $1{,}000$ groups whose odd member was never odd in training.}
+\label{tab:chain}
+\begin{tabular}{lcccc}
+\toprule
+ & full fine-tune & LoRA, FT schedule & LoRA & LoRA $+$ tool \\
+\midrule
+\multicolumn{5}{l}{\emph{test groups ($n=1{,}203$)}}\\
+score          & 0.332 & 0.510 & 0.633 & \textbf{0.662} \\
+named          & 0.442 & 0.672 & 0.766 & \textbf{0.797} \\
+property       & 0.391 & 0.556 & 0.660 & \textbf{0.687} \\
+covered        & 0.569 & 0.638 & \textbf{0.658} & 0.623 \\
+all correct    & 0.126 & 0.112 & \textbf{0.226} & 0.221 \\
+contradictions/group & 1.90 & 2.32 & \textbf{1.55} & 1.57 \\
+\midrule
+\multicolumn{5}{l}{\emph{groups whose odd member was never odd in training ($n=1{,}000$)}}\\
+score          & 0.279 & 0.590 & 0.615 & \textbf{0.748} \\
+named          & 0.329 & 0.652 & 0.655 & \textbf{0.782} \\
+property       & 0.343 & 0.669 & 0.646 & \textbf{0.761} \\
+covered        & 0.560 & 0.586 & 0.627 & \textbf{0.628} \\
+all correct    & 0.017 & 0.023 & 0.104 & \textbf{0.140} \\
+contradictions/group & 1.85 & 2.10 & 1.44 & \textbf{1.35} \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\textbf{LoRA instead of full fine-tuning.} With the same optimizer schedule, LoRA raises the
+score from $0.33$ to $0.51$ on the test groups ($p<10^{-24}$) and from $0.28$ to $0.59$ on
+the groups whose odd star was never odd in training ($p<10^{-60}$). This run had not
+converged when it was stopped. It finds the odd star more often but makes more contradictions
+than the fully fine-tuned narrator ($2.32$ against $1.90$ per group), so what LoRA brings at
+this schedule is the identification of the odd star, not a more accurate description overall.
+
+\textbf{The optimizer schedule and training length.} Moving to the schedule of the tool
+narrator adds $0.12$ on the test groups ($p<10^{-12}$), only $0.03$ on the never-odd groups
+($p=0.14$, not significant), and removes about two thirds of a contradiction per group on
+both sets ($p<10^{-37}$). Since the previous run had not converged, we attribute this step to
+the schedule and the training length together. Neither recipe was tuned, so a better recipe
+for full fine-tuning may exist; LoRA is better without one.
+
+
+\subsection{What the narrator copies}\label{app:memo}
+\begin{table}[h]\centering\small
+\caption{\textbf{What the narrator copies from its training text.} Each row is a
+separate test with its own control; numbers are not comparable across rows.}
+\label{tab:memo}
+\begin{tabular}{p{0.2\linewidth}p{0.11\linewidth}p{0.27\linewidth}p{0.3\linewidth}}
+\toprule
+what could be copied & data & test & finding \\
+\midrule
+wording & galaxies & training recipe (\Cref{app:recipe}) & copied when only the input format varies; the paper sentences remove it \\
+values about one object & stars, galaxies & narrator against probes and against the training text (\Cref{app:probevsnarrator}) & exact values copied when the training text gives them; average error barely changes \\
+the answer to a reasoning question & stars & test set split by whether the odd star was ever the odd one in training, and a larger set built that way (\Cref{tab:adversarial}) & not recalled; LoRA's gain holds, and the tool's is larger \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\textbf{Wording.} With a varied input format but no paper sentences, the
+narrator recites its training descriptions: the fraction of novel descriptions
+falls from $0.40$ to $0.18$ on single objects and from $0.42$ to $0.04$ on
+pairs. Adding the paper sentences restores it ($0.39$ and $0.68$). Every
+narrator in this paper uses both.
+
+\textbf{Values about one object.} On galaxies, where no test galaxy is
+described in training, the narrator states about what a non-linear probe on the
+same tokens can read. On stars it states more: it is more accurate than the same
+probe on most numbers (radius error $0.40$ against $0.82\,R_\odot$), and it
+gives the exact temperature (zero Kelvin error) in $35\%$ of its statements, against $0.5\%$
+for the probe. Almost every such exact value is written in some training
+description of the same star; where none gives it, exact matches fall to the
+probe's level. The average error changes little. Part of the stellar
+narrator's numeric precision is therefore recall, and its single-star numbers
+in \Cref{tab:basemodel} should be read with this in mind.
+
+
+\textbf{Wording.} With a varied input format but no paper sentences, the
+narrator recites its training descriptions: the fraction of novel descriptions
+falls from $0.40$ to $0.18$ on single objects and from $0.42$ to $0.04$ on
+pairs. Adding the paper sentences restores it ($0.39$ and $0.68$). Every
+narrator in this paper uses both (\Cref{app:recipe}).
+
+\textbf{Values about one object.} On galaxies, where no test galaxy is
+described in training, the narrator states about what a non-linear probe on the
+same tokens can read. On stars it states more: it is more accurate than the same
+probe on most numbers (radius error $0.40$ against $0.82\,R_\odot$), and it
+gives the exact temperature (zero Kelvin error) in $35\%$ of its statements, against $0.5\%$
+for the probe. Almost every such exact value is written in some training
+description of the same star; where none gives it, exact matches fall to the
+probe's level. The average error changes little. Part of the stellar
+narrator's numeric precision is therefore recall, and its single-star numbers
+in \Cref{tab:single} should be read with this in mind.
+
+\subsection{The catalog as text}\label{app:text}
+Each text reader is tested twice: answering directly, and reasoning step by step before
+answering. \Cref{tab:text} gives the full comparison.
+No model that reads the numbers reaches the LoRA narrators ($0.633$ without the tool and
+$0.662$ with it; $p<10^{-14}$ for the best text reader against the LoRA narrator without the
+tool). AstroSage reading the table reaches the best score among them ($0.473$),
+but by naming most of the group ($82\%$ of the stars): naming the odd star among
+them is then no better than chance ($0.92\times$). Asked to reason first, it
+names few stars and scores $0.288$, below the fully fine-tuned narrator. The
+larger model is more selective: it names the odd star at about the same rate as
+the tool relative to the number of stars it names. However, it often gets the
+odd star's property wrong, and scores $0.341$ answering directly and $0.324$
+after reasoning, no different from the fully fine-tuned narrator ($p{=}0.7$ in
+both cases). In most groups ($94\%$) the larger model was still reasoning when
+it reached the length limit of $4{,}096$ tokens and was made to answer from what
+it had, so its reasoning result holds for this budget only. The gap to the LoRA narrators
+also holds for every group size (\Cref{app:textsize}). Reading the numbers
+lets a model describe the stars, but not reliably pick out the one that does
+not belong.
+
+\begin{table}[h]\centering\small
+\caption{\textbf{Giving the model the numbers as text}, on the $1{,}203$ test
+groups with an odd star (all five kinds). The text-reading models see
+every catalog value plus the binary and open-cluster flags.
+\emph{score} and \emph{named} are as in \Cref{tab:adversarial};
+\emph{stars named} is the fraction of the group the text names; \emph{lift}
+divides \emph{named} by it ($1.0$ = no better than naming that many stars at
+random). Every text-reading model scores below the LoRA narrators
+($p<10^{-14}$, exact McNemar on \emph{score}).}
+\label{tab:text}
+\begin{tabular}{lcccc}
+\toprule
+ & score & named & lift & stars named \\
+\midrule
+AstroSage-8B, reads the table                & 0.473 & 0.761 & 0.92$\times$ & 83\% \\
+AstroSage-8B, reads the table, reasons first & 0.288 & 0.447 & 1.82$\times$ & 25\% \\
+Qwen3.5-27B, reads the table                 & 0.341 & 0.512 & 3.63$\times$ & 14\% \\
+Qwen3.5-27B, reads the table, reasons first  & 0.324 & 0.570 & 4.07$\times$ & 14\% \\
+AstroSage-8B, LoRA on the table              & \TODO{A} & \TODO{A} & \TODO{A} & \TODO{A} \\
+\midrule
+narrator, full fine-tune                & 0.332 & 0.442 & 3.36$\times$ & 13\% \\
+narrator, LoRA, FT schedule             & 0.510 & 0.672 & 3.39$\times$ & 20\% \\
+narrator, LoRA                          & 0.633 & 0.766 & \textbf{4.31}$\times$ & 18\% \\
+narrator $+$ tool                            & \textbf{0.662} & \textbf{0.797} & 4.08$\times$ & 20\% \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+
+\subsection{Frontier models on the raw observations}\label{app:frontiertab}
+\begin{table}[h]\centering\small
+\caption{\textbf{Frontier models on the raw observations, zero-shot}, paired on the same items.
+Groups are judge-scored ($n=177$ with an odd member); single stars ($n=1{,}463$) and pairs
+($n=1{,}000$) are scored by the verifier as in \Cref{tab:basemodel}. Fable was run on groups only.}
+\label{tab:frontier}
+\begin{tabular}{lccccc}
+\toprule
+ & Opus 5.5 & Fable 5.1 & full fine-tune & LoRA & LoRA $+$ tool \\
+\midrule
+group, score          & 0.203 & 0.203 & 0.333 & 0.627 & \textbf{0.644} \\
+group, named          & 0.339 & 0.345 & 0.435 & 0.734 & \textbf{0.797} \\
+group, contradictions & 3.29  & 3.14  & 1.79  & \textbf{1.36} & 1.51 \\
+\midrule
+single, numeric acc.     & 0.394 & --- & 0.667 & 0.730 & \textbf{0.796} \\
+single, qualitative acc. & 0.636 & --- & 0.892 & 0.916 & \textbf{0.935} \\
+pair, numeric acc.       & 0.534 & --- & 0.774 & 0.800 & \textbf{0.853} \\
+pair, relational acc.    & 0.750 & --- & 0.937 & 0.949 & \textbf{0.970} \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+
+
+\subsection{Templates against LLM-written prose}\label{app:corpus}
+Everything above is trained on prose written by the deterministic templater.
+The obvious alternative is to let a capable LLM write it, which has the potential for better diversity and fluency. To compare the two, we built an LLM-based corpus: the writer (DeepSeek-V4) was given the same
+catalog facts and asked to write the group descriptions, and every claim it made
+was checked against the record before the text was accepted. The training text
+is, in that sense, true. \Cref{tab:corpus} compares the two corpora with
+everything else held fixed: same base model, same prompt, and no tool (both narrators read the data tokens only and are fully fine-tuned). We see that training on the writer's fluent prose makes the narrator invent:
+contradictions per group go from $1.9$ to $7.2$, and not one group out of
+$1{,}191$ is described fully correctly (odd star and property named, typical members described correctly, and no statement contradicting the record). The training text was verified true; the
+model trained on it is not. This is aligned with the finding of \cite{Hegselmann2022TabLLMFC} who showed that template-based serialization outperforms LLM-based serialization for tabular data. The two corpora differ in how much they commit to. Per group description, the
+templater writes a median of $21$ words containing $5$ numbers and names $17\%$
+of the members; it states the population and the member that does not belong,
+and says nothing about the rest. The writer uses $82$ words containing $17$
+numbers and names $83\%$ of the members, giving most of them a full quantitative
+profile. Training on the second teaches the narrator to do the same. On the test groups,
+the narrator trained on writer prose writes a median of $78$ words against $17$, states
+$8$ values per group against $1$, and names $72\%$ of the members against
+$26\%$. Most of its extra contradictions ($70\%$) are such numeric claims, and
+most of those concern members \emph{other} than the outlier, whose values the
+template-trained narrator rarely states at all. Per stated value, the two narrators are
+contradicted at a similar rate ($0.52$ vs.\ $0.46$): the writer-trained narrator is
+wrong more often mainly because it says more. Values for the typical members are hard to read
+for both narrators: for either one about $40\%$ of them contradict the record
+(verifier). A narrator trained to state them for every member therefore
+mostly adds errors. This is not the whole story: on the outlier itself, the writer-trained
+narrator's stated values contradict the record far more often ($18\%$ vs.\ $2\%$ of
+values, verifier). Verification of the training text does not help in either
+case, because the problem is not that the text is false; it is that it asserts
+more than the input determines.
+
+\begin{table}[h]\centering\small
+\caption{\textbf{Which prose to train on.} AstroSage-8B, same prompt, latent
+tokens only (no tool), full fine-tune; greedy, judge-scored, on the $1{,}191$
+groups with an odd member judged for both narrators (paired; hence $0.333$ here
+vs.\ $0.332$ on the $1{,}203$ groups of \Cref{tab:group}). \emph{score} is as
+in \Cref{tab:group}; \emph{covered} = the text correctly describes the typical
+(non-odd) members; \emph{contradictions/group} = the number of statements the
+judge marks as contradicting the record; \emph{all correct} = score, covered,
+and no contradiction.}
+\label{tab:corpus}
+\begin{tabular}{lcccc}
+\toprule
+training prose & score & covered & contradictions/group & all correct \\
+\midrule
+template       & \textbf{0.333} & \textbf{0.573} & \textbf{1.88} & \textbf{0.128} \\
+writer (DeepSeek-V4), verified & 0.258 & 0.178 & 7.16 & 0.000 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+
+\subsection{New runs by group size and kind of odd star}\label{app:newruns}
+\TODO{Runs A (text-only LoRA) and B (labels token): scores by group size and by kind of odd
+star, on the test and never-odd groups, with the non-binary subset for B. Run C (frontier agents
+with code): items, tokens, cost and wall time per item.}
 
 \subsection{The galaxy narrators: token or training?}\label{app:2x2}
 The galaxy tool narrator differs from the fully fine-tuned narrator in two ways:
@@ -336,10 +638,10 @@ does not ($0.70$, $0.74$, $0.75$).
 
 \begin{table}[h]\centering\small
 \caption{\textbf{The stellar group task, by kind of odd star}, judge-scored,
-greedy; score as in \Cref{tab:headboth}. Rows use the groups whose odd stars all
+greedy; score as in \Cref{tab:group}. Rows use the groups whose odd stars all
 differ on the same property ($775$ of $1{,}203$; the last row uses all groups). \emph{Unique}: groups in which
 the odd star is the only member with its odd property. Binarity and open-cluster
-membership are also given to the tool as catalog flags (\Cref{sec:text}). All
+membership are also given to the tool as catalog flags (\Cref{sec:ltu}). All
 differences between the fully fine-tuned narrator and the tool narrator are significant
 (exact McNemar, $p<10^{-3}$) except giants in the unique groups ($p=0.33$, $n=60$).}
 \label{tab:perodd}
@@ -367,7 +669,8 @@ we fit two probes for every property on the same inputs the narrator receives
 galaxy). The first probe is linear (ridge or logistic regression); the second is non-linear with
 one hidden layer of 512 units. Both are trained on the training fold and tested
 on the test fold. For each property we compare them with the narrator on the
-objects where the narrator stated that property (\Cref{fig:probevsnarrator}).
+objects where the narrator stated that property (\Cref{fig:probevsnarrator}). \Cref{tab:single} gives the same comparison in standard metrics for all
+narrators; this section shows the fully fine-tuned narrator with mean errors and the non-linear probe.
 
 \paragraph{Galaxies.} No test galaxy appears in the training text, so this is a
 clean comparison. The narrator says about as much as the non-linear probe can

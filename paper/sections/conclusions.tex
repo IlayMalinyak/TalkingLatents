@@ -1,25 +1,22 @@
 \section{Conclusion}
-We asked whether a language model can reason directly over learned scientific features,
-beyond describing them. On single objects and pairs it can, on both datasets. On questions
-that require reasoning, the main result concerns training rather than architecture. A fully
-fine-tuned narrator fails to find the odd star in a group, and fails more as the group grows.
-A narrator trained with LoRA on a frozen base, on the same text and the same features,
-succeeds in about two thirds of groups and does not lose accuracy with group size, and the
-same comparison also favours LoRA on galaxies. Neither method was tuned, so a better recipe
-for full fine-tuning may exist, but LoRA gives this result without one, and most of the gain
-remains when the two share an optimizer schedule.
+We asked whether a learned scientific representation is a sufficient interface for a language
+model to analyse data, beyond describing it. For description it is: on stars and on galaxies the
+narrator states properties of single objects about as well as a linear probe on the same
+features. For reasoning over a group of stars, the answer depends on adaptation. A fully
+fine-tuned narrator fails to find the odd star, and fails more as the group grows. A narrator
+trained with LoRA on a frozen base, on the same text and features, succeeds in about two thirds
+of groups at every group size, also when the answer never appeared in training, and the same
+comparison favours LoRA on galaxies. A probe shows that the features hold the answer, so the
+failure is in how the fully fine-tuned model reads them. Neither recipe was tuned, so we present
+this as a condition for the approach to work, not as a general ranking of the two methods.
 
-Latent tool use adds to this in a specific place. A small flow-matching model that receives
-catalog labels as auxiliary data, and returns its output as a latent token, improves the
-identification of outliers that never appeared as outliers in training ($0.62 \to 0.75$),
-including when binary stars are excluded ($0.78 \to 0.88$). It adds little where the training
-data offers precedent, and nothing on galaxies, where its output repeats what the narrator
-already reads. Text is a poor substitute: models given the catalog numbers score below the
-LoRA narrator, and frontier models given the raw observations zero-shot score lower still.
-Verified templated text remains preferable to fluent LLM-written text as training data.
+Against the alternatives, the latent narrator is ahead of models that read the catalog values
+as text without training on the task, and of frontier models that read the raw observations
+zero-shot. \TODO{Conclusion on the text-trained LoRA (run A) and on frontier agents with code
+(run C); revise this paragraph if either matches or beats the latent narrator.}
 
-For a language model reading scientific data, these results suggest first adapting it with a
-low-rank adapter, and then adding dedicated models with auxiliary data where the task goes
-beyond what the training data covers. Why the frozen base preserves this ability, and how
-frontier agents with code execution compare, remain open.
-
+Some information lies outside the representation. A small model that receives catalog labels
+and returns its output as a latent token helps on groups whose odd star was never odd in
+training ($0.62 \to 0.75$), also without binary stars ($0.78 \to 0.88$), and adds little
+elsewhere. \TODO{Whether this gain comes from the tool or from its labels (run B).} Why the
+frozen base preserves the ability to reason over a group remains open.

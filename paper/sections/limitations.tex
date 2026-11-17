@@ -11,18 +11,31 @@ training length.
 \paragraph{The tool has catalog labels.} The stellar tool models the aligned features jointly
 with catalog labels and receives those labels at test time, which narrators without the tool
 do not. The comparison with and without the tool is therefore a comparison with and without
-auxiliary data, and we do not separate the part of the gain due to the learned density from
-the part due to the labels. The tool's gain is concentrated on groups whose odd star was
-never odd in training, where binarity is the odd property in more than half of the groups.
+auxiliary data. The labels-token narrator is meant to separate the two, but it was trained for
+$20$ epochs against $50$ for the tool narrator, so a small difference between them may reflect
+training length. The tool's gain is concentrated on groups whose odd star was never odd in
+training, where binarity is the odd property in more than half of the groups.
 
-\paragraph{Frontier models were tested zero-shot.} The frontier models received the raw
-observations without tools and without any training on this data, while the narrators read
-pre-trained features and were trained on descriptions of these stars. The comparison shows
-what a general-purpose model does out of the box. It does not bound what an agent could do
-with code execution over the same observations, which we did not complete.
+\paragraph{Training lengths differ.} The LoRA narrator without the tool, the text-trained
+narrator and the labels-token narrator were trained for $20$ epochs; the tool narrator for
+$50$. The LoRA narrator with the full fine-tuning schedule was stopped before it converged.
+
+\paragraph{Probes and narrators are different readouts.} The narrator writes free text and
+states a property only for some objects, so we compare it with the probe on the objects where it
+states it. On stars, $99.2\%$ of test stars appear in some training description, so part of the
+narrator's single-star precision is recall; galaxies have no such overlap. In the group task the
+probe ranks members by distance from the group median, while the narrator names a label, so the
+probe score is a reference, not a ceiling.
+
+\paragraph{Frontier models.} The zero-shot frontier models received the raw observations
+without tools and without training on this data, while the narrators read pre-trained features
+and were trained on descriptions of these stars. \TODO{Update when run C (agents with code)
+is finished: number of items, cost, and what the agents could not access.}
 
 \paragraph{One seed per narrator.} Each narrator was trained once. Our claims rest on large
-paired differences on the same test items and on the same pattern across two datasets.
+paired differences on the same test items and on the same pattern across two datasets. We do
+not interpret differences of a few points, in particular between the labels-token and tool
+narrators.
 
 % \paragraph{The corpus is not split-aware.} $99.2\%$ of test-fold stars appear in
 % some training description. The contrast is symmetric across narrators so the paired
