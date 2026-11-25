@@ -24,7 +24,7 @@ MLP with one hidden layer of $512$ units. \Cref{tab:single} gives the results.
 Test set, greedy. Each cell gives the model's score on the objects where its text states the
 property and, in parentheses, the score of a linear / non-linear probe on the same objects.
 $R^2$ for numerical properties, balanced accuracy for classes. Bold: the best model in each row; for galaxies, where only one model was run, the higher of the model and the probes. Stars: $19{,}010$ test stars, of which $99.2\%$ appear in some training description
-(\Cref{sec:data}), so part of the narrators' numeric precision is recall
+(\Cref{sec:data}), so the narrators' advantage over the probes is recall
 (\Cref{sec:memorization}). Opus 5.5 reads the raw observations, zero-shot, on a subset of
 $1{,}463$ stars; it rarely states the sample-relative metallicity quartile, so its quartile is
 assigned from its stated [Fe/H] with the catalog thresholds. A few gross errors lower $R^2$ for the fully fine-tuned narrator's
@@ -63,8 +63,9 @@ disturbance & 0.67 (\textbf{0.82}/0.80) & --- & --- & --- \\
 
 \textbf{Stars.} The LoRA narrators match or exceed the linear probe on every property
 (\Cref{tab:single}). The fully fine-tuned narrator does so on all properties except
-temperature and age. Part of this advantage is recall: the narrator often states the exact
-catalog value of a star described in its training text (\Cref{sec:memorization}). Age is weak
+temperature and age. This advantage is recall: the narrator often states the exact catalog
+value of a star described in its training text, and without these values its error is at the
+probe's level (\Cref{sec:memorization}). Age is weak
 for every readout, including the probe ($R^2=0.55$ on all test stars), so the limit lies in the tokens rather
 than in the narrator. Opus 5.5, reading the raw observations zero-shot, is well below the probe
 on every property ($R^2$ between $-0.26$ and $0.57$; balanced accuracy $0.67$ on the
@@ -307,9 +308,9 @@ LoRA $+$ tool          & 0.719 ($p=0.9$) & 0.890 ($p<10^{-9}$) \\
 Because the stellar data are split per description (\Cref{sec:data}), every test star also
 appears in training, and the narrator can memorize the values written about it. It does: it
 gives the exact temperature in $35\%$ of its statements, against $0.5\%$ for a probe on the same
-tokens, and almost every exact value appears in a training description of the same star. Its
-mean error, however, is similar whether or not a training description of the star states the
-value (\Cref{app:memo}). Whether a model memorizes the result of reasoning is a different
+tokens, and almost every exact value appears in a training text about the same star. Without
+these exact values, its mean error is at the probe's level (\Cref{app:memo}), so its advantage
+over the probe on single stars is recall. Whether a model memorizes the result of reasoning is a different
 question, with wider implications: modern LLMs have seen data on many of the objects they are
 asked about. We test it on the never-odd groups (\Cref{sec:population}). There, the narrators
 keep their order on every measure, and LoRA's gain over full fine-tuning is $0.34$, against $0.30$

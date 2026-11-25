@@ -214,7 +214,7 @@ separate test with its own control; numbers are not comparable across rows.}
 what could be copied & data & test & finding \\
 \midrule
 wording & galaxies & data augmentation (\Cref{app:recipe}) & copied when only the input format varies; the paper sentences remove it \\
-values about one object & stars, galaxies & narrator against probes and against the training text (\Cref{app:probevsnarrator}) & exact values copied when the training text gives them; average error barely changes \\
+values about one object & stars, galaxies & narrator against probes and against the training text (\Cref{app:probevsnarrator}) & exact values copied when the training text gives them; without them, error at the probe's level \\
 the answer to a reasoning question & stars & never-odd groups (\Cref{tab:adversarial}) & not recalled; LoRA's gain holds, and the tool's is larger \\
 \bottomrule
 \end{tabular}
@@ -231,13 +231,15 @@ described in training, the narrator states about what a non-linear probe on the
 same tokens can read. On stars it states more: it is more accurate than the same
 probe on most numbers (radius error $0.40$ against $0.82\,R_\odot$), and it
 gives the exact temperature (zero Kelvin error) in $35\%$ of its statements, against $0.5\%$
-for the probe. Almost every such exact value is written in some training
-description of the same star; where none gives it, exact matches fall to the
-probe's level. The mean error is similar whether or not a training description of the star
-states the value (temperature $0.097$ against $0.107$, mass $0.166$ against $0.179$, radius
-$0.053$ against $0.047$, absolute error in units of the catalog standard deviation). Part of the stellar
-narrator's numeric precision is therefore recall, and its single-star numbers
-in \Cref{tab:single} should be read with this in mind.
+for the probe. For $99\%$ of these temperature statements, some training text that mentions
+the star (single, pair or group) states its catalog value. When the exact statements are
+removed, the narrator's mean error is at or above the probe's on the same statements
+(temperature $0.151$ against $0.131$, mass $0.253$ against $0.230$, in units of the catalog
+standard deviation); only on radius does it stay below ($0.070$ against $0.094$). The
+narrator's advantage over the probe on single stars is therefore recall, and its single-star
+numbers in \Cref{tab:single} should be read with this in mind. Exact values also occur when no
+training text states the value ($20$--$30\%$ of mass and radius statements, against $3$--$9\%$
+for the probe); we have not traced their source.
 
 \textbf{The answer to a reasoning question.} \Cref{tab:adversarial} splits the group score of
 \Cref{tab:group} into naming the odd star and naming its property.
@@ -747,8 +749,8 @@ The comparison with the narrators therefore does not depend on the probe. Part o
 narrators' advantage is recall. The narrator states the exact catalog temperature, to the
 kelvin, in $35\%$ of its statements, against $0.5\%$ for the probe. Almost every such value
 appears in a training description of the same star, which exists for $99.2\%$ of test stars
-(\Cref{sec:data}). When the value appears in no training description, exact matches fall to
-the probe's level. The effect on the mean error is small.
+(\Cref{sec:data}). Without these exact values, the narrator's error is at the probe's level
+(\Cref{app:memo}).
 
 \paragraph{Galaxies.} No test galaxy appears in the training text. The non-linear probe
 improves substantially on the linear one for galaxies (on all test galaxies, e.g.\
