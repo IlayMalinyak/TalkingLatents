@@ -1,3 +1,4 @@
+% !TEX root = ../main.tex
 \section{Appendix}\label{sec:appendix}
 
 \subsection{Is the signal in the features? The ranking probe}\label{app:probe}
@@ -188,7 +189,7 @@ separate test with its own control; numbers are not comparable across rows.}
 \toprule
 what could be copied & data & test & finding \\
 \midrule
-wording & galaxies & training recipe (\Cref{app:recipe}) & copied when only the input format varies; the paper sentences remove it \\
+wording & galaxies & data augmentation (\Cref{app:recipe}) & copied when only the input format varies; the paper sentences remove it \\
 values about one object & stars, galaxies & narrator against probes and against the training text (\Cref{app:probevsnarrator}) & exact values copied when the training text gives them; average error barely changes \\
 the answer to a reasoning question & stars & test set split by whether the odd star was ever the odd one in training, and a larger set built that way (\Cref{tab:adversarial}) & not recalled; LoRA's gain holds, and the tool's is larger \\
 \bottomrule
@@ -268,7 +269,6 @@ AstroSage-8B, reads the table                & 0.473 & 0.761 & 0.92$\times$ & 83
 AstroSage-8B, reads the table, reasons first & 0.288 & 0.447 & 1.82$\times$ & 25\% \\
 Qwen3.5-27B, reads the table                 & 0.341 & 0.512 & 3.63$\times$ & 14\% \\
 Qwen3.5-27B, reads the table, reasons first  & 0.324 & 0.570 & 4.07$\times$ & 14\% \\
-AstroSage-8B, LoRA on the table              & \TODO{A} & \TODO{A} & \TODO{A} & \TODO{A} \\
 \midrule
 narrator, full fine-tune                & 0.332 & 0.442 & 3.36$\times$ & 13\% \\
 narrator, LoRA, FT schedule             & 0.510 & 0.672 & 3.39$\times$ & 20\% \\
@@ -279,6 +279,7 @@ narrator $+$ tool                            & \textbf{0.662} & \textbf{0.797} &
 \end{table}
 
 
+\clearpage
 \subsection{Frontier models on the raw observations}\label{app:frontiertab}
 \begin{table}[h]\centering\small
 \caption{\textbf{Frontier models on the raw observations, zero-shot}, paired on the same items.
@@ -300,8 +301,48 @@ pair, relational acc.    & 0.750 & --- & 0.937 & 0.949 & \textbf{0.970} \\
 \bottomrule
 \end{tabular}
 \end{table}
+\FloatBarrier
 
+\subsection{The templater}\label{app:templater}
+Each description samples, independently, which facts to state (a random three to
+six), a style and a framing.
+\begin{itemize}
+\item \textbf{Stars.} Three styles (natural prose, observation log, bullet list)
+  and four framings (plain description, outlier flag, comparison with other
+  stars, comparison with the Sun). With probability one half each, the
+  templater adds a chemistry block (disk population, $\alpha$-abundance) and an
+  activity block (chromospheric activity, variability amplitude). Each fact is
+  then worded by drawing from a bank of alternative phrasings ($917$
+  alternatives at $141$ points in the text). A star is described about five
+  times, each time with different facts and words.
+\item \textbf{Galaxies.} Four styles (technical paper, observation log, teaching
+  text, concise summary), four framings (plain description, comparison with the
+  galaxy population, comparison with the star-forming main sequence, outlier
+  flag) and three lengths. There is one wording per fact and style, so the
+  variety comes from the facts, style, framing and length.
 
+  \emph{Star-formation history.} Each galaxy's SFH is the catalog's $50$-bin
+  star-formation history, normalized to unit total mass. For a window covering
+  the last $X\%$ of the Hubble time ($X = 5, 10, 20, 30, 50$), we compute two
+  statistics: the trend index $i_X$, the difference between the mass formed in
+  the recent and the earlier half of the window, divided by the mass formed in
+  the whole window (positive for a rising SFH); and the recent mass fraction
+  $f_X$, the fraction of the total stellar mass formed within the window. The SFH
+  trend class is the sign of $i_X$ and a catalog-quantile bin of its magnitude.
+  Each description states these quantities for one or two randomly chosen
+  windows and names the window.
+\end{itemize}
+\textbf{Diversity.} Every stellar single and pair description is unique, and
+$99.9\%$ remain unique with all numbers masked. For galaxies, $99.9\%$ of single
+descriptions are unique and $70\%$ remain so with numbers masked.
+
+\textbf{Corpora.} The stellar corpus has $1.93$M records ($1.01$M single,
+$0.69$M pair, $0.23$M population); each population record is a group of $4$ to
+$32$ stars with an odd member on one of six properties. The galaxy corpus has
+$288$k records ($90$k single, $198$k pair). The galaxy agreement task uses a
+separate, deliberately narrow corpus of $45{,}817$ records (three phrasings per
+case, also from training galaxies only) in which galaxies whose morphology and
+star-formation history disagree are oversampled to $33\%$.
 
 \subsection{Templates against LLM-written prose}\label{app:corpus}
 Everything above is trained on prose written by the deterministic templater.
@@ -354,11 +395,6 @@ writer (DeepSeek-V4), verified & 0.258 & 0.178 & 7.16 & 0.000 \\
 \end{table}
 
 
-\subsection{New runs by group size and kind of odd star}\label{app:newruns}
-\TODO{Runs A (text-only LoRA) and B (labels token): scores by group size and by kind of odd
-star, on the test and never-odd groups, with the non-binary subset for B. Run C (frontier agents
-with code): items, tokens, cost and wall time per item.}
-
 \subsection{The galaxy narrators: token or training?}\label{app:2x2}
 The galaxy tool narrator differs from the fully fine-tuned narrator in two ways:
 it reads the tool token, and it is trained with LoRA on a frozen base. To separate
@@ -403,8 +439,8 @@ information it carries is already available from the data tokens. On galaxies,
 the improvement over the fully fine-tuned narrator therefore comes from the
 training, not from the tool token. The stellar equivalent is in \Cref{sec:tokenortraining}.
 
-\subsection{The training recipe}\label{app:recipe}
-\Cref{tab:recipe} tests the two input changes of \Cref{sec:data} on the galaxy
+\subsection{Data augmentation}\label{app:recipe}
+\Cref{tab:recipe} tests the two parts of the data augmentation (\Cref{sec:data}) on the galaxy
 data with Llama-3.1-8B. \emph{Novel phrasing} is the fraction of generated
 descriptions that do not copy a training description (\Cref{app:eval}); low
 values mean the narrator recites the templates.
@@ -426,12 +462,12 @@ is varied. A one-variable test of the paper sentences without varied formats is
 in progress.
 
 \begin{table}[h]\centering\small
-\caption{\textbf{Training recipe}, galaxies, Llama-3.1-8B, greedy, scored by the
+\caption{\textbf{Data augmentation}, galaxies, Llama-3.1-8B, greedy, scored by the
 verifier. \emph{num.}: numeric accuracy; \emph{qual.}/\emph{rel.}: qualitative
 (single) or relational (pair) accuracy; \emph{novel}: novel phrasing. Upper
 block: cosine learning-rate schedule with label smoothing in every row. Lower
 block: the first two rows use a constant learning rate and no label smoothing;
-the last row is the full recipe used throughout the paper. Blocks are not
+the last row is the full augmentation used throughout the paper. Blocks are not
 comparable with each other.}
 \label{tab:recipe}
 \begin{tabular}{lcccccc}
@@ -522,7 +558,6 @@ S\'ersic index          & --- & 0    & ---  & ---   & 61   & 0.16 & 1.40  \\
 formation age           & Gyr & 82   & 0.55 & 0.054 & 324  & 0.58 & 0.17  \\
 SFH mean time           & --- & 1692 & 0.89 & 0.012 & 2248 & 0.87 & 0.013 \\
 SFH trend index         & --- & 1726 & 0.70 & 0.048 & 1890 & 0.66 & 0.051 \\
-recent mass fraction    & --- & 419  & 0.65 & 0.026 & 1058 & 0.64 & 0.023 \\
 \bottomrule
 \end{tabular}
 \end{table}
@@ -663,56 +698,33 @@ all kinds           & 1{,}203 & 0.332 & 0.633 & \textbf{0.662} & 556 & 0.369 & 0
 \end{table}
 
 \subsection{Does the narrator say what the tokens contain?}\label{app:probevsnarrator}
-To see whether the narrator's errors come from the tokens or from the narrator,
-we fit two probes for every property on the same inputs the narrator receives
-(the aligned star tokens; the image and star-formation-history embeddings of a
-galaxy). The first probe is linear (ridge or logistic regression); the second is non-linear with
-one hidden layer of 512 units. Both are trained on the training fold and tested
-on the test fold. For each property we compare them with the narrator on the
-objects where the narrator stated that property (\Cref{fig:probevsnarrator}). \Cref{tab:single} gives the same comparison in standard metrics for all
-narrators; this section shows the fully fine-tuned narrator with mean errors and the non-linear probe.
+\Cref{tab:single} compares the narrators with a linear probe and a non-linear probe: an MLP with
+one hidden layer of $512$ units. Both probes are trained on the same inputs as the narrator (the
+aligned star tokens; the image and star-formation-history embeddings of a galaxy) on the
+training fold and evaluated on the test fold.
 
-\paragraph{Galaxies.} No test galaxy appears in the training text, so this is a
-clean comparison. The narrator says about as much as the non-linear probe can
-read. On classes they are equal for morphology, disturbance and the
-star-formation trend; elsewhere the probe is ahead by $0.03$--$0.07$ (by $0.09$
-for the S\'ersic shape, which the narrator states for $1\%$ of galaxies).
-On numbers the probe is more accurate for the star-formation-history quantities
-and the specific star-formation rate, and the narrator is more accurate for
-redshift and stellar mass. The largest gap is not accuracy but coverage: the
-narrator states the stellar mass, specific star-formation rate, redshift or
-S\'ersic index for only $2$--$18\%$ of galaxies, although the probes read them
-well ($R^2 = 0.85$--$0.99$, except the S\'ersic index, $R^2 = 0.43$).
+\paragraph{Stars.} On all test stars, the non-linear probe improves on the linear probe by at
+most $0.02$ in $R^2$ and not at all on classes, so the star tokens encode these properties almost linearly.
+The comparison with the narrators therefore does not depend on the probe. Part of the
+narrators' advantage is recall. The narrator states the exact catalog temperature, to the
+kelvin, in $35\%$ of its statements, against $0.5\%$ for the probe. Almost every such value
+appears in a training description of the same star, which exists for $99.2\%$ of test stars
+(\Cref{sec:data}). When the value appears in no training description, exact matches fall to
+the probe's level. The effect on the mean error is small.
 
-\paragraph{Stars.} The narrator is more accurate than both probes on most
-numbers, for example radius ($0.40$ against $0.82\,R_\odot$ for the non-linear
-probe). Part of this is recall. The narrator states the exact catalog value far
-more often than a probe can: temperature to the kelvin in $35\%$ of its
-statements, against $0.5\%$ for the non-linear probe. Almost every such value is
-written in some training description of that star, which exists for $99.2\%$ of
-test stars (\Cref{sec:data}); when the value appears in none of them, exact
-matches drop to the probe's level. The effect on the average error is small: it
-is only slightly lower where the training text gave the number. On classes the
-narrator and the probes agree to within $0.02$.
+\paragraph{Galaxies.} No test galaxy appears in the training text. The non-linear probe
+improves substantially on the linear one for galaxies (on all test galaxies, e.g.\
+$\log M_\star$, $0.76 \to 0.85$; formation age, $0.88 \to 0.99$). On numerical properties the narrator is within $0.04$ of it,
+and exceeds it for stellar mass. On classes the narrator matches it for morphology and is
+below it for quenching state, SFH trend and disturbance ($0.03$--$0.13$). The
+main gap is coverage rather than accuracy: the narrator states the stellar mass, specific
+star-formation rate, redshift or S\'ersic index for only $2$--$18\%$ of galaxies, although
+both probes recover them well.
 
-\paragraph{Weak in both.} Some properties are hard for the probes too: star age
-($R^2 = 0.55$), the metallicity rank ($66\%$, against $25\%$ by chance), and the
-galaxy S\'ersic index. For these, the information is mostly missing from the
-tokens, and the narrator's errors (\Cref{fig:perprop}) reflect the tokens rather
-than the narrator.
-
-\begin{figure}[h]\centering
-\includegraphics[width=\textwidth]{figs/probe_vs_narrator.pdf}
-\caption{\textbf{Probes against the narrator, per property}, AstroSage-8B,
-single objects. Probes read the same tokens as the narrator. Left: mean
-absolute error divided by the spread (standard deviation) of the property in
-the test set; right: accuracy of class statements, with the rate of the most
-common class (black tick). All bars are on the objects where the narrator stated
-the property; the percentage next to each name is how often it did. Top:
-galaxies ($3{,}000$, none in the training text); bottom: stars ($19{,}010$,
-$99.2\%$ described in the training text).}
-\label{fig:probevsnarrator}
-\end{figure}
+\paragraph{Weak in both.} Some properties are hard for both probes, measured on all test objects:
+stellar age ($R^2=0.55$), the metallicity quartile ($0.66$, against $0.25$ by chance) and the galaxy S\'ersic index. For
+these properties the information is largely absent from the tokens, and the narrator's errors
+(\Cref{fig:perprop}) reflect the tokens rather than the narrator.
 
 \subsection{Reading the numbers, by group size}\label{app:textsize}
 \Cref{tab:textsize} breaks \Cref{tab:text} down by the number of stars in the

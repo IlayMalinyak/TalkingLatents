@@ -1,3 +1,4 @@
+% !TEX root = ../main.tex
 \section{Conclusion}
 We asked whether a learned scientific representation is a sufficient interface for a language
 model to analyse data, beyond describing it. For description it is: on stars and on galaxies the
@@ -12,11 +13,10 @@ this as a condition for the approach to work, not as a general ranking of the tw
 
 Against the alternatives, the latent narrator is ahead of models that read the catalog values
 as text without training on the task, and of frontier models that read the raw observations
-zero-shot. \TODO{Conclusion on the text-trained LoRA (run A) and on frontier agents with code
-(run C); revise this paragraph if either matches or beats the latent narrator.}
+zero-shot.
 
 Some information lies outside the representation. A small model that receives catalog labels
 and returns its output as a latent token helps on groups whose odd star was never odd in
 training ($0.62 \to 0.75$), also without binary stars ($0.78 \to 0.88$), and adds little
-elsewhere. \TODO{Whether this gain comes from the tool or from its labels (run B).} Why the
+elsewhere. Why the
 frozen base preserves the ability to reason over a group remains open.

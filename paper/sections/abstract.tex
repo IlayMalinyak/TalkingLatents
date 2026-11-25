@@ -1,10 +1,10 @@
+% !TEX root = ../main.tex
 \begin{abstract}
 Large Language Models (LLMs) can describe scientific objects, but can they analyse data
 directly from a learned scientific representation? We connect pre-trained multimodal encoders
 of stars and of galaxies to an 8B language model and ask whether their features are a
-sufficient interface for analysis beyond description. Two reference points bracket the
-results: linear probes on the same features show what the representation contains, and
-frontier models given the raw observations show what is reachable without it. The language
+sufficient interface for analysis beyond description. We compare this model with two baselines:
+linear probes, and frontier models. The language
 model describes single objects about as well as the probes, on both datasets. Finding the odd
 member of a group of stars depends on how the model is adapted. Fully fine-tuned, it fails in
 two thirds of groups, and fails more often as the group grows. Trained with a low-rank adapter

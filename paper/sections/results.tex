@@ -1,108 +1,156 @@
+% !TEX root = ../main.tex
 \section{Results}\label{sec:results}
-We ask whether a learned representation is a sufficient interface for a language model to
-analyse data, beyond describing it. Two reference points bracket every result. Probes trained on
-the same features show what the representation contains. Frontier models given the raw
-observations show what is reachable without it. The progression from single objects to pairs
-to groups is tested on stars; galaxies test description and the effect of the adaptation
-method on a single-object reasoning task. All narrators use AstroSage-8B
-\citep{haan2025_astrosage}; with the same training, Llama-3.1-8B gives the same results to
-within $0.05$ on every single-object and pair metric (\Cref{app:basemodel}).
+% We ask whether a learned representation is a sufficient interface for a language model to
+% analyse data, beyond describing it. Two reference points bracket every result. Probes trained on
+% the same features show what the representation contains. Frontier models given the raw
+% observations show what is reachable without it. The progression from single objects to pairs
+% to groups is tested on stars; galaxies test description and the effect of the adaptation
+% method on a single-object reasoning task. All narrators use AstroSage-8B
+% \citep{haan2025_astrosage}; with the same training, Llama-3.1-8B gives the same results to
+% within $0.05$ on every single-object and pair metric (\Cref{app:basemodel}).
 
 \subsection{Describing single objects}\label{sec:description}
-We compare the narrator with linear probes on the tokens it reads (ridge regression for
-numbers, logistic regression for classes), trained on the training objects and tested on the
-test objects. We use standard metrics: $R^2$ for numbers, balanced accuracy for classes, and
-the fraction of stated values within $10\%$ of the catalog value (\Cref{app:eval}). The
-narrator writes free text and does not state every property for every object, so we score it
-on the objects where it states the property and give the probe's score on the same objects
-next to it. \Cref{tab:single} shows the result.
+The first task is to describe a single object. We compare each narrator with linear probes
+trained on the tokens it reads: ridge regression for numerical properties and logistic
+regression for classes, fit on the training objects and evaluated on the test objects. We
+report $R^2$ for numerical properties and balanced accuracy for classes. A narrator does not
+state every property for every object, so we score it only on the objects for which it states
+the property and evaluate the probe on the same objects. A narrator that matches the probe
+conveys the information that the tokens encode linearly. We also report a non-linear probe, an
+MLP with one hidden layer of $512$ units. \Cref{tab:single} gives the results.
 
 \begin{table*}[t]\centering\small
-\caption{\textbf{Describing single objects: narrators against linear probes on the same
-tokens.} Test set, greedy. \emph{Probe, all}: the linear probe on every test object. Narrator
-and frontier cells give the model's score on the objects where its text states the property,
-and, in parentheses, the linear probe's score on the same objects. $R^2$ and the $10\%$
-tolerance are computed from the stated values; for $\log g$ and $\log M_\star$ the tolerance is
-$10\%$ in the underlying quantity ($0.041$\,dex), and for the signed SFH trend index it is
-$0.05$. Stars: $19{,}010$ test stars, of which $99.2\%$ appear in some training description
+\caption{\textbf{Describing single objects: narrators against probes on the same tokens.}
+Test set, greedy. Each cell gives the model's score on the objects where its text states the
+property and, in parentheses, the score of a linear / non-linear probe on the same objects.
+$R^2$ for numerical properties, balanced accuracy for classes. Bold: the best model in each row; for galaxies, where only one model was run, the higher of the model and the probes. Stars: $19{,}010$ test stars, of which $99.2\%$ appear in some training description
 (\Cref{sec:data}), so part of the narrators' numeric precision is recall
 (\Cref{sec:memorization}). Opus 5.5 reads the raw observations, zero-shot, on a subset of
-$1{,}463$ stars. A few gross errors lower $R^2$ for the fully fine-tuned narrator's
+$1{,}463$ stars; it rarely states the sample-relative metallicity quartile, so its quartile is
+assigned from its stated [Fe/H] with the catalog thresholds. A few gross errors lower $R^2$ for the fully fine-tuned narrator's
 temperatures (e.g.\ $52{,}628$\,K). Galaxies: $3{,}000$ test galaxies, none in the training
 text; only the fully fine-tuned narrator was run on single galaxies. How often each model
-states each property, and a non-linear probe, are in \Cref{app:probevsnarrator}.}
+states each property is in \Cref{app:probevsnarrator}. The SFH trend
+and SFH trend index are defined over five time windows (\Cref{app:templater}); each statement
+is scored against the window it names.}
 \label{tab:single}
-\begin{tabular}{lccccc}
+\begin{tabular}{lcccc}
 \toprule
- & probe, all & full fine-tune & LoRA & LoRA $+$ tool & Opus 5.5, raw \\
+ & full fine-tune & LoRA & LoRA $+$ tool & Opus 5.5, raw \\
 \midrule
-\multicolumn{6}{l}{\textbf{stars}}\\
-\multicolumn{6}{l}{\emph{$R^2$}}\\
-$T_\mathrm{eff}$ & 0.95 & 0.34 (0.94) & 0.92 (0.92) & 0.94 (0.94) & 0.46 (0.96) \\
-$\log g$ & 0.94 & 0.96 (0.95) & 0.97 (0.94) & 0.98 (0.94) & 0.41 (0.94) \\
-mass & 0.84 & 0.88 (0.85) & 0.94 (0.85) & 0.97 (0.84) & 0.16 (0.89) \\
-radius & 0.93 & 0.93 (0.94) & 0.96 (0.96) & 0.98 (0.89) & 0.57 (0.86) \\
-age & 0.55 & 0.31 (0.45) & 0.37 (0.35) & 0.57 (0.31) & $-$0.26 (0.58) \\
-\multicolumn{6}{l}{\emph{within $10\%$}}\\
-$\log g$ & 0.27 & 0.57 (0.27) & 0.62 (0.27) & 0.72 (0.27) & 0.21 (0.25) \\
-mass & 0.79 & 0.84 (0.79) & 0.89 (0.79) & 0.94 (0.80) & 0.51 (0.78) \\
-radius & 0.17 & 0.60 (0.15) & 0.65 (0.17) & 0.76 (0.14) & 0.43 (0.16) \\
-age & 0.19 & 0.33 (0.19) & 0.33 (0.20) & 0.58 (0.18) & 0.10 (0.17) \\
-\multicolumn{6}{l}{\emph{balanced accuracy}}\\
-evolutionary state & 0.83 & 0.85 (0.83) & 0.93 (0.83) & 0.98 (0.83) & 0.67 (0.83) \\
-metallicity quartile & 0.66 & 0.68 (0.66) & 0.73 (0.66) & 0.79 (0.66) & --- \\
+\multicolumn{5}{l}{\textbf{stars}}\\
+$T_\mathrm{eff}$ & 0.34 (0.94/0.94) & 0.92 (0.92/0.93) & \textbf{0.94} (0.94/0.94) & 0.46 (0.96/0.96) \\
+$\log g$ & 0.96 (0.95/0.96) & 0.97 (0.94/0.96) & \textbf{0.98} (0.94/0.96) & 0.41 (0.94/0.96) \\
+mass & 0.88 (0.85/0.86) & 0.94 (0.85/0.85) & \textbf{0.97} (0.84/0.84) & 0.16 (0.89/0.89) \\
+radius & 0.93 (0.94/0.95) & 0.96 (0.96/0.96) & \textbf{0.98} (0.89/0.93) & 0.57 (0.86/0.94) \\
+age & 0.31 (0.45/0.43) & 0.37 (0.35/0.34) & \textbf{0.57} (0.31/0.26) & $-$0.26 (0.58/0.58) \\
+evolutionary state & 0.85 (0.83/0.83) & 0.93 (0.83/0.83) & \textbf{0.98} (0.83/0.83) & 0.67 (0.83/0.83) \\
+metallicity quartile & 0.68 (0.66/0.66) & 0.73 (0.66/0.66) & \textbf{0.79} (0.66/0.66) & 0.28 (0.69/0.67) \\
 \midrule
-\multicolumn{6}{l}{\textbf{galaxies}}\\
-\multicolumn{6}{l}{\emph{$R^2$}}\\
-$\log M_\star$ & 0.76 & 0.86 (0.78) & --- & --- & --- \\
-$\log$ sSFR & 0.95 & 0.98 (0.97) & --- & --- & --- \\
-redshift & 0.96 & 0.99 (0.96) & --- & --- & --- \\
-formation age & 0.88 & 0.94 (0.85) & --- & --- & --- \\
-SFH trend index & 0.92 & 0.97 (0.91) & --- & --- & --- \\
-\multicolumn{6}{l}{\emph{within $10\%$}}\\
-$\log M_\star$ & 0.14 & 0.23 (0.18) & --- & --- & --- \\
-redshift & 0.58 & 0.86 (0.52) & --- & --- & --- \\
-formation age & 0.27 & 0.58 (0.25) & --- & --- & --- \\
-SFH trend index & 0.40 & 0.66 (0.37) & --- & --- & --- \\
-\multicolumn{6}{l}{\emph{balanced accuracy}}\\
-morphology & 0.77 & 0.77 (0.77) & --- & --- & --- \\
-quenching state & 0.84 & 0.86 (0.87) & --- & --- & --- \\
-SFH trend & 0.81 & 0.82 (0.81) & --- & --- & --- \\
-recent activity & 0.92 & 0.88 (0.95) & --- & --- & --- \\
-disturbance & 0.85 & 0.67 (0.82) & --- & --- & --- \\
+\multicolumn{5}{l}{\textbf{galaxies}}\\
+$\log M_\star$ & \textbf{0.86} (0.78/0.83) & --- & --- & --- \\
+$\log$ sSFR & 0.98 (0.97/\textbf{0.99}) & --- & --- & --- \\
+redshift & \textbf{0.99} (0.96/0.99) & --- & --- & --- \\
+formation age & 0.94 (0.85/\textbf{0.98}) & --- & --- & --- \\
+SFH trend index & 0.97 (0.91/\textbf{0.98}) & --- & --- & --- \\
+morphology & \textbf{0.77} (0.77/0.77) & --- & --- & --- \\
+quenching state & 0.86 (0.87/\textbf{0.89}) & --- & --- & --- \\
+SFH trend & 0.82 (0.81/\textbf{0.86}) & --- & --- & --- \\
+disturbance & 0.67 (\textbf{0.82}/0.80) & --- & --- & --- \\
 \bottomrule
 \end{tabular}
 \end{table*}
 
-\textbf{Galaxies.} No test galaxy appears in the training text, so this is the clean
-comparison. Where the narrator states a number, its $R^2$ is at or above that of the linear
-probe on the same galaxies, and about equal to that of a non-linear probe
-(\Cref{app:probevsnarrator}). On classes it equals the probe for morphology, quenching and the
-star-formation trend, and is below it for recent activity and disturbance. The narrator
-states several numbers for only a minority of galaxies (stellar mass for $8\%$, redshift for
-$18\%$), although the probes read them well.
+\textbf{Stars.} The LoRA narrators match or exceed the linear probe on every property
+(\Cref{tab:single}). The fully fine-tuned narrator does so on all properties except
+temperature and age. Part of this advantage is recall: the narrator often states the exact
+catalog value of a star described in its training text (\Cref{sec:memorization}). Age is weak
+for every readout, including the probe ($R^2=0.55$ on all test stars), so the limit lies in the tokens rather
+than in the narrator. Opus 5.5, reading the raw observations zero-shot, is well below the probe
+on every property ($R^2$ between $-0.26$ and $0.57$; balanced accuracy $0.67$ on the
+evolutionary state).
 
-\textbf{Stars.} The narrators are at or above the probe on most numbers and classes, and the
-LoRA narrators are above the fully fine-tuned one. Part of this advantage is recall: the
-narrator often states the exact catalog value of a star it read about in training
-(\Cref{sec:memorization}). Age is weak for every readout, which points to the tokens rather
-than the narrator. Opus 5.5, reading the raw observations zero-shot, is well below the probe
-on every property ($R^2$ between $-0.26$ and $0.57$, and $0.67$ balanced accuracy on the
-evolutionary state). Pairs show the same ordering of the narrators (\Cref{app:regime}).
+\textbf{Galaxies.} No test galaxy appears in the training text, so recall is not possible. On
+all five numerical properties, the narrator's $R^2$ exceeds that of the probe on the same
+galaxies. On classes, it matches the probe for morphology, quenching state and SFH trend, and
+falls below it for disturbance ($0.67$ vs.\ $0.82$).
+Its main limitation is coverage: it states the stellar mass for only $8\%$ of galaxies and the
+redshift for $18\%$, although the probe recovers both well.
 
-The narrator therefore describes single objects about as well as a probe on the same tokens,
-and on galaxies, where recall is not possible, this holds as well. Description is the easy
-case. The question is whether the same interface supports analysis across several objects.
+Single-object description therefore reaches the level of a linear probe on the same tokens,
+including on galaxies, where recall is excluded. The harder question is whether the same
+interface supports reasoning across several objects.
 
-\subsection{Finding the odd star: reasoning over a group depends on adaptation}\label{sec:population}
-In the stellar group task the narrator reads a group of $4$ to $32$ stars and must name the
-member that does not belong and the property in which it differs. A group can be answered only
-by comparing every member with the rest. We score whether the text names the odd star
-\emph{and} its property (judge; \Cref{app:eval}). The galaxy task asks whether a galaxy's
-shape agrees with its star-formation history. It concerns one object, but it requires
-relating two of its modalities. \Cref{tab:group} collects every model we tested on these
-tasks. This subsection discusses the latent narrators; \Cref{sec:interface} discusses the
-other rows, and \Cref{sec:ltu} the last two.
+\subsection{Comparing two objects}\label{sec:pairs}
+The second task is to compare two objects. The narrator reads the tokens of both objects and
+describes how they differ. We score every comparison it states against the catalog and report
+relational accuracy, the fraction of stated comparisons that are correct. For stars a
+comparison is an order (e.g.\ ``A is hotter than B''); a probe compares two stars by predicting
+the property for each and taking the sign of the difference. For galaxies it is a relation
+class (e.g.\ same or different morphology); a probe assigns the class from its predicted labels
+for both galaxies. As for single objects, we evaluate the probes on the comparisons each narrator
+states (\Cref{tab:pair}).
+
+\begin{table*}[t]\centering\small
+\caption{\textbf{Comparing two objects: narrators against probes on the same comparisons.}
+Relational accuracy: the fraction of stated comparisons that match the catalog. For stars a
+comparison is an order (``A is hotter than B''), and a probe compares two stars by the sign of
+the difference between its predictions; for galaxies it is a relation class (e.g.\ same or
+different morphology), and a probe assigns the class from its predicted labels for both
+galaxies. Each cell gives the model's accuracy on the comparisons its text states and, in
+parentheses, the accuracy of a linear / non-linear probe on the same comparisons.
+Stars: $9{,}505$ test pairs; Opus 5.5 reads the raw
+observations, zero-shot, on $1{,}000$ of them. Galaxies: $2{,}000$ test pairs; only the fully
+fine-tuned narrator was run. The
+fully fine-tuned narrator states only $49$ metallicity comparisons. Bold: the best model in each row; for galaxies, where only one model was run, the higher of the model and the probes. Numeric accuracy on pairs is in \Cref{app:regime}.}
+\label{tab:pair}
+\begin{tabular}{lcccc}
+\toprule
+ & full fine-tune & LoRA & LoRA $+$ tool & Opus 5.5, raw \\
+\midrule
+\multicolumn{5}{l}{\textbf{stars}}\\
+$T_\mathrm{eff}$ & 0.97 (0.96/0.96) & 0.97 (0.97/0.97) & \textbf{0.98} (0.97/0.97) & 0.86 (0.94/0.94) \\
+$\log g$ & 0.91 (0.90/0.91) & 0.93 (0.90/0.92) & \textbf{0.96} (0.90/0.91) & 0.75 (0.86/0.87) \\
+mass & 0.96 (0.95/0.95) & 0.96 (0.94/0.94) & \textbf{0.98} (0.95/0.96) & 0.74 (0.90/0.91) \\
+radius & 0.92 (0.81/0.87) & 0.93 (0.73/0.83) & \textbf{0.96} (0.78/0.85) & 0.77 (0.73/0.78) \\
+age & 0.77 (0.79/0.79) & 0.82 (0.81/0.83) & \textbf{0.93} (0.86/0.87) & 0.56 (0.80/0.79) \\
+{[Fe/H]} & 0.94 (0.92/0.98) & 0.98 (0.95/0.96) & \textbf{0.99} (0.97/0.97) & 0.59 (0.85/0.89) \\
+\midrule
+\multicolumn{5}{l}{\textbf{galaxies}}\\
+main sequence & 0.66 (0.75/\textbf{0.82}) & --- & --- & --- \\
+morphology & 0.79 (0.81/\textbf{0.88}) & --- & --- & --- \\
+disturbance & 0.74 (0.81/\textbf{0.82}) & --- & --- & --- \\
+SFH trend direction & 0.86 (0.94/\textbf{0.96}) & --- & --- & --- \\
+redshift bin & 0.88 (\textbf{0.94}/0.94) & --- & --- & --- \\
+\bottomrule
+\end{tabular}
+\end{table*}
+
+The narrators compare stars more accurately than the probes. The LoRA narrator with the tool
+exceeds both probes on every property; the other two narrators fall below the non-linear probe
+only on age, and the fully fine-tuned narrator also on its $49$ metallicity comparisons. The
+ordering of the narrators is the same as for single objects: full fine-tuning $\le$ LoRA $<$
+LoRA with the tool on every property. As
+for single objects, part of this advantage may be recall of the training text
+(\Cref{sec:memorization}). Opus 5.5, reading the raw observations zero-shot, is below both probes
+on every property except radius.
+
+On galaxies the result is reversed. The fully fine-tuned narrator, the only one run on galaxy
+pairs, is below both probes on every relation, by $0.02$ to $0.09$ against the linear probe and
+$0.06$ to $0.16$ against the non-linear probe. Unlike
+the stellar narrators, it cannot draw on training descriptions of the test objects
+(\Cref{sec:data}).
+
+\subsection{Reasoning across objects and modalities}\label{sec:population}
+The third task requires reasoning: the answer is not stated for any single object or
+modality and must be inferred by combining them. We test two forms. In the stellar
+\emph{group task}, the narrator reads a group of $4$ to $32$ stars and must name the member
+that does not belong and the property in which it differs, which requires comparing every
+member with the rest. We score whether the text names the odd star \emph{and} its property
+(judge; \Cref{app:eval}). In the galaxy \emph{agreement task}, the narrator must state whether
+a galaxy's shape agrees with its star-formation history, which requires relating its two
+modalities. \Cref{tab:group} gives the results for every model we tested; models that read the
+catalog as text are discussed in \Cref{sec:interface}, and the tool in \Cref{sec:ltu}.
 
 \begin{table*}[t]\centering\small
 \caption{\textbf{The reasoning tasks, all models.} Stars: fraction of groups in which the text
@@ -126,19 +174,24 @@ raw observations & Opus 5.5, zero-shot     & 0.203$^\dagger$ & --- & --- & --- \
 \midrule
 latent tokens    & full fine-tune          & 0.332 & 0.279 & 0.980 & 0.884 \\
                  & LoRA                    & 0.633 & 0.615 & \textbf{0.988} & 0.974 \\
-                 & LoRA $+$ labels token   & \TODO{B} & \TODO{B} & --- & --- \\
                  & LoRA $+$ tool           & \textbf{0.662} & \textbf{0.748} & 0.986 & \textbf{0.978} \\
 \bottomrule
 \end{tabular}
 \end{table*}
 
-\textbf{Full fine-tuning fails on groups; LoRA does not.} The fully fine-tuned narrator reads
-the data tokens and names the odd star and its property in only a third of the test groups.
-The same model trained with LoRA on a frozen base, on the same text and the same tokens, does
-so in $63\%$ of them, and the gap is as large on the groups whose answer never appeared in
-training ($0.28$ against $0.62$). On galaxies the same comparison favours LoRA on quiescent
-galaxies ($0.97$ against $0.88$; \Cref{app:2x2}), where most errors of the fully fine-tuned
-narrator state that a quiescent galaxy still forms stars. We did not tune either recipe, and
+\textbf{Results.} On the group task, the adaptation method determines the outcome. The fully
+fine-tuned narrator names the odd star and its property in $33\%$ of the test groups; the LoRA
+narrator does so in $63\%$, and $66\%$ with the tool. The ordering is the same on the groups
+whose odd star was never odd in training ($0.28$, $0.62$ and $0.75$), so the scores do not
+depend on recalling training answers. Frontier models reading the raw observations zero-shot
+score $0.20$ on a subset of $177$ groups, on which the latent narrators score $0.33$, $0.63$ and
+$0.64$; Opus 5.5 with a code sandbox scores $0.18$. On the agreement task, all narrators reach
+$0.98$--$0.99$ on star-forming galaxies. On quiescent galaxies the fully fine-tuned narrator
+falls to $0.88$, against $0.97$ for LoRA and $0.98$ with the tool; most of its errors state
+that a quiescent galaxy still forms stars (\Cref{app:2x2}). The rest of this subsection
+examines the failure of full fine-tuning and tests whether the features contain the answer.
+
+\textbf{The failure is not due to the optimizer settings.} We did not tune either recipe, and
 the two used different optimizer settings. A LoRA narrator trained with the optimizer settings
 of the fully fine-tuned one still scores well above it ($0.51$ against $0.33$ on the test
 groups, $0.59$ against $0.28$ on the never-odd groups, $p<10^{-24}$; \Cref{sec:tokenortraining}).
@@ -147,7 +200,7 @@ general; it is consistent with the finding that LoRA preserves more of the base 
 abilities than full fine-tuning \citep{Biderman2024_lora}.
 
 \textbf{The failure grows with the number of stars.} On single objects and pairs the gap between the two
-methods is small (\Cref{app:regime}), so we vary only the number of stars, keeping the question fixed
+methods is small (\Cref{tab:single,tab:pair}), so we vary only the number of stars, keeping the question fixed
 (\Cref{fig:groupsize}). With full fine-tuning, the score falls from $0.45$ with $4$ stars to
 $0.06$ with $32$ (Spearman $\rho=-0.24$, $p=10^{-16}$). The LoRA narrator stays between $0.53$
 and $0.70$ with no significant trend ($\rho=+0.01$, $p=0.7$). With the optimizer settings of
@@ -233,11 +286,7 @@ reaches the LoRA narrator (\Cref{tab:text}; $p<10^{-14}$). AstroSage-8B scores $
 naming most of the group: naming the odd star among them is then no better than chance. Qwen3.5-27B
 is more selective, but often gets the odd star's property wrong, and scores $0.341$, no
 different from the fully fine-tuned narrator. Asking either model to reason first does not
-help (\Cref{app:text}). These models were not trained on the task. To compare the two
-interfaces under the same training, we trained the LoRA narrator on the same text with each
-star's catalog row in place of its data tokens: \TODO{run A (text-only LoRA) results, by group
-size and kind of odd star; if it matches or beats the latent narrator, report it and revise
-the claims of this section}.
+help (\Cref{app:text}). These models were not trained on the task.
 
 \textbf{Frontier models on the raw observations.} We give Claude Opus 5.5 and Claude Fable 5.1
 each star's raw observations, namely plots of its Kepler and TESS light curves and its LAMOST
@@ -249,15 +298,14 @@ single stars Opus is well below the probes (\Cref{tab:single}). Replacing the pl
 of the same observations does not change this. The narrators were trained on this task, on
 descriptions of these stars, so this measures what a general-purpose model does out of the box.
 An agent that can run code on the unbinned observations, with star identifiers hidden and no
-network access, is the stronger baseline: \TODO{run C (frontier agents with code; raw
-observations; about $300$ stellar groups and a balanced set of test
-galaxies; tokens, cost and time per item)}.
+network access, does no better than the zero-shot models ($0.18$ against $0.20$, $p=0.57$;
+\Cref{tab:group}).
 
 \subsection{Memorization controls}\label{sec:memorization}
 A narrator trained on templated text, and on the stars it is later tested on (\Cref{sec:data}),
 could copy instead of read. It could copy the wording of its training descriptions, the values
 written about a particular star, or the answer to a reasoning question. The first two happen to
-a limited extent and are measured in \Cref{app:memo}: the training recipe removes copying of
+a limited extent and are measured in \Cref{app:memo}: the data augmentation removes copying of
 wording, and the stellar narrator states exact catalog values it read about the same star,
 which raises its single-star precision but barely changes its average error. The objection
 that matters most is the third: a narrator might recall which star was called unusual in
@@ -339,14 +387,6 @@ and zeroing costs $0.401$ ($\to 0.347$), both below the narrator trained without
 ($0.615$; \Cref{tab:ablate}).
 On galaxies the tool adds nothing, as expected, since it is computed from the same embeddings
 the narrator reads (\Cref{app:2x2}).
-
-\textbf{Is it the tool or its labels?} Because the tool receives the labels, its gain could come
-from the labels alone. We trained a narrator with the same recipe in which each star's extra
-token is a trained projection of the six labels themselves, with no tool:
-\TODO{run B (labels token) on the test and never-odd groups, and on the non-binary subset}. The
-labels-token and tool narrators are one training run each, and the labels-token narrator was
-trained for $20$ epochs against $50$ for the tool narrator, so we do not interpret a difference
-of a few points between them.
 
 \begin{table}[h]\centering\small
 \caption{\textbf{Breaking the token at test time}, stellar group task, greedy, judge-scored.

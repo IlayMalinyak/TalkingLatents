@@ -1,7 +1,8 @@
+% !TEX root = ../main.tex
 \section{Data and Model}
 \label{sec:data}
 \textbf{Terminology.} We use six names throughout. The \emph{narrator} is
-the 8B language model we train: it reads an object's data tokens and answers questions
+the 8B language model (AstroSage-8B; \cite{haan2025_astrosage}) we train: it reads an object's data tokens and answers questions
 about the object. The \emph{tool} is a small model, not a language model,
 trained separately to compute, for every object in a question, a quantity that
 the question depends on, using auxiliary information (\Cref{sec:ltu}). It is run on every input, and its
@@ -17,32 +18,32 @@ the ground truth.
 We test two different astrophysical datasets, representing different domains and physical properties. The first dataset is a \emph{stellar} multimodal dataset comprising 190,091 stars, observed by $5$ different modalities coming from different telescopes - \emph{Kepler}\citep{kepler:mission}, TESS\citep{tess:mission}, LAMOST\citep{lamost:survey}, APOGEE\citep{apogee:mission}, and Gaia\citep{gaia:mission}. Each modality is processed through a specific encoder, and the modalities are aligned with a model that factorizes the latent space into shared and specific subspaces. The result is one shared feature and $5$ per-modality features, each projected to the token embedding space of the LLM as its own small group of tokens. The second dataset is galaxies from the COSMOS-Web survey \citep{Casey2023_cosmos-web}, including two modalities: images and star-formation history (SFH). Similar to the stellar dataset, we use a pretrained model that aligns the two modalities (here using CLIP \cite{Radford2021_CLIP}) and project the frozen features into the LLM's token embedding. Notably, the two datasets are different in many aspects: number and type of modalities, pretrained models, scientific questions, and what their test sets hold out (below). Using the two datasets in the same pipeline highlights general vs data-specific conclusions.\\  
 \textbf{training prose}. One of the challenges in this pipeline is creating the training dataset. This should include ground-truth prose per object. Contrary to other fields, in astrophysics data is usually stored only in numerical catalogs, so one needs to create the prose from scratch. Our main method is a \emph{template-based} method: a deterministic program that picks a subset of facts from the catalog, chooses a phrasing from a bank of templates, and
 writes prose. Every sentence is checked against the record by the verifier before it enters the corpus. The
-check is per-fact: it guarantees that the facts a description states are true of the object, not
-that the description mentions every unusual object in a group. Both datasets share two types of prose: description of a single object (single), and comparison between pairs (pair). We also test deeper reasoning capabilities with two additional tasks, and this is where the datasets diverge. In the stellar dataset, we use population prose: a group of $N$ objects with a description of the typical members, and a callout
-of the ones that do not belong and on which property. In the galaxy dataset, the task is to judge whether a galaxy's shape agrees with its star-formation history, a relation between its two modalities. 
+check is per-fact: it guarantees that the facts a description states are true of the object.
+Both datasets share two types of prose: description of a single object (single), and comparison between pairs (pair).
+We also test deeper reasoning capabilities with two additional tasks, and this is where the datasets diverge.
+In the stellar dataset, we use population prose: a group of $N$ objects with a description of the typical members, and a callout
+of the ones that do not belong and on which property. In the galaxy dataset, the task is to judge whether a galaxy's shape agrees with
+its star-formation history, a relation between its two modalities. Those additional tasks represents real scientific tasks:
+anomaly detection and unusual cross modal correlation. 
 
 % In~\Cref{sec:results} we compare the template-based method with a second method: an \emph{LLM-based} generation, where the writer produces the population prose from the same catalog facts, and every claim is verified.
 
 \textbf{Objects, facts and descriptions.} The two datasets are split in
-different ways, and the difference decides what each test measures. The galaxy
+different ways. The galaxy
 set has $137{,}696$ galaxies, split $80/10/10$ into training, validation and
-test galaxies, and all galaxy training text is written about training galaxies
-only: the galaxy test holds out the objects themselves. The stellar set has
-$190{,}091$ stars, of which we evaluate on a held-out set of $19{,}010$, but the
-stellar training text was written for all stars and divided into training and
-validation by description, not by star. As a result, $99.2\%$ of the evaluation
-stars appear in \emph{some} training description, and the stellar test holds
-out questions rather than objects. This matches how a stellar catalog is used:
-the stars of the Kepler field are fixed and already catalogued, and the
-questions of interest are new comparisons among them, not descriptions of stars
-never observed. No test group appears in training (the largest overlap between
-a test group and any training group is a third of their combined members), and
-in \Cref{sec:memorization} we also hold out the answer itself. For questions
-about a single star the overlap does matter, because the narrator can reuse
-what training said about the same star. \Cref{sec:memorization} measures how
-much, with the galaxies, where no such overlap exists, as the comparison.
+test galaxies, so the galaxy test set holds out the objects themselves. The stellar set has $190{,}091$ stars and is designed differently:
+for each sample we create many different descriptions, with different physical labels,
+which results in a dataset of $1.93$M unique
+proses. We then split the dataset per-description.
+This matches a common scientific practice of looking for 
+\emph{new information about known samples}. For example, the stars of the \emph{Kepler} field are
+fixed and already catalogued, and the
+questions of interest are new classifications or new comparisons among them, not descriptions of stars
+never observed. However, from a machine learning prespective, this kind of split raises a concern
+that a model would memorize
+the samples themselves. We address those concerns in \Cref{sec:memorization}.
 
-Each star's catalog record holds $13$ numbers ($T_\mathrm{eff}$, $\log g$,
+The stellar catalog record holds $13$ physical labels ($T_\mathrm{eff}$, $\log g$,
 $[\mathrm{Fe/H}]$, mass, radius, age, luminosity, distance, parallax, Gaia's
 astrometric quality index RUWE, apparent and absolute brightness, and rotation
 period) and categorical facts: evolutionary state (dwarf, subgiant, giant); how
@@ -55,31 +56,21 @@ redshift, S\'ersic index (how centrally concentrated its light is), visual
 morphology and disturbance, formation age, and the shape of its star-formation
 history (rising or falling, recent activity, quenching, formation time).
 
-The templater writes each description by sampling, independently, which facts
-to state (a random three to six), a style, and a framing. For stars it also adds,
-each with probability one half, a chemistry block (disk population,
-$\alpha$-abundance) and an activity block (chromospheric activity, variability
-amplitude). Stars have three styles (natural prose, observation log, bullet
-list) and four framings (plain description, outlier flag, comparison with other
-stars, comparison with the Sun). Galaxies have four styles (technical paper,
-observation log, teaching text, concise summary), four framings (plain
-description, comparison with the galaxy population, comparison with the
-star-forming main sequence, outlier flag) and three lengths. On stars, each fact
-is then worded by drawing from a bank of alternative phrasings ($917$
-alternatives at $141$ points in the text); the galaxy templater has one wording
-per fact and style, so its variety comes from the facts, style, framing and
-length. A star is described about five times, each time with different facts
-and words (\Cref{fig:example}). The result is highly diverse: every stellar
-single and pair description is unique, and $99.9\%$ remain unique with all
-numbers masked; for galaxies, $99.9\%$ of single descriptions are unique and
-$70\%$ remain so with numbers masked. In total, the stellar corpus has $1.93$M
-records ($1.01$M single, $0.69$M pair, $0.23$M population); each population
-record is a group of $4$ to $32$ stars with an odd member on one of six
-properties. The galaxy corpus has $288$k records ($90$k single, $198$k pair).
-The galaxy agreement task uses a separate, deliberately narrow corpus of
-$45{,}817$ records (three phrasings per case, also from training galaxies only)
-in which galaxies whose morphology and star-formation history disagree are
-oversampled to $33\%$.
+Stars and galaxies are described by the same kind of templater. For each
+description it independently samples which facts to state (three to six), a
+writing style and a framing (a plain description, an outlier flag, or a
+comparison with a reference population), so every object is described several
+times, each time differently (\Cref{fig:example}). The two domains differ in
+where the remaining variety comes from: stellar descriptions draw each fact's
+wording from a bank of $917$ alternative phrasings and may add chemistry and
+activity blocks, while galaxy descriptions use one wording per fact and style
+and vary in length instead. The resulting text is diverse: with all numbers
+masked, $99.9\%$ of stellar descriptions and $70\%$ of single-galaxy
+descriptions are still unique. The stellar corpus has $1.93$M records ($1.01$M
+single, $0.69$M pair, $0.23$M population, where a population is a group of $4$
+to $32$ stars with one odd member); the galaxy corpus has $288$k ($90$k single,
+$198$k pair), plus a separate $46$k-record corpus for the cross modal correlation task.
+\Cref{app:templater} gives the full details.
 
 \begin{figure*}[t]
   \centering
@@ -94,19 +85,25 @@ oversampled to $33\%$.
   \label{fig:example}
 \end{figure*}
 
-\textbf{Training recipe.} A narrator trained on templated text can learn to
-reproduce the templates instead of reading the data. We counter this with two
-changes to the input. First, we vary its format: an object's data tokens appear
-alone, after a question or a short passage, separated from the description by
-intervening text, or among the tokens of several other objects together with a
-request to describe one of them. Second, part of the intervening text consists of
-real sentences from astrophysics papers, filtered so that none states a relation
-between properties we later test. The two are needed together
-(\Cref{app:recipe}). Varying the format alone improves accuracy but makes the
-narrator copy training descriptions almost verbatim; adding the paper sentences
-removes that copying, and accuracy improves further. Population records are always
-presented as the data tokens alone. The recipe was chosen on the galaxy data and
-reused unchanged for stars.
+\textbf{Training.} The physics encoders are frozen, and we compute their embeddings once.
+An adapter maps each modality's embedding to $4$ tokens in the language model's
+input space; it is a two-layer MLP per modality (\Cref{fig:arch}). The adapter is
+always trained. The language model is trained in one of two ways. Full
+fine-tuning updates all its weights. LoRA freezes them and trains low-rank
+matrices (rank $16$) on the attention query and value projections. The tool is
+trained beforehand and stays frozen. The loss is next-token cross-entropy on the
+final description only.
+\Cref{app:recipes} gives the learning rates and schedules.
+
+\textbf{Data augmentation.} A model trained on templated text can memorize the
+templates rather than learn to read the data. To prevent this, we randomize the
+input format of each training example. The data tokens are placed (i) alone,
+(ii) after a question or a short passage, (iii) separated from the description by
+intervening text, or (iv) among the tokens of other objects, with an instruction
+to describe one of them. Part of the intervening text is drawn from astrophysics
+papers, excluding sentences that state any relation evaluated in this work.
+Population records always use format (i). The augmentation was tuned on the
+galaxy data and applied unchanged to the stellar data (\Cref{app:recipe}).
 
 
 \begin{figure}[h]
