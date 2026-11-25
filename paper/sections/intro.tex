@@ -69,7 +69,8 @@ observations show what is reachable without it.
 \emph{First}, we measure what a language model reading learned features can and cannot do. It
 describes single objects about as well as a linear probe on the same features, on stars and on
 galaxies, and it can find the odd member of a group of stars. Frontier models given the raw
-observations zero-shot do worse on both.
+observations zero-shot do worse on both, and models that read the catalog values as a table,
+without training on the task, do worse on groups.
 
 \emph{Second}, we show that reasoning over a group depends on how the language model is
 adapted. With full fine-tuning, the model describes single objects well but often fails to
@@ -77,13 +78,9 @@ find the odd star, and fails more often as the group grows. With LoRA on a froze
 same model, trained on the same data, finds it in most groups at every group size. A probe
 shows that the features contain the answer, so the fully fine-tuned model fails to read it.
 
-\emph{Third}, we compare the latent interface with its alternatives: the catalog values as
-text, read by models with and without training on the task, and frontier models on the raw
-observations.
-
-As a preliminary extension, we show that information outside the representation, such as
-whether a star is a known binary, can be passed to the language model by a small separate model
-as a latent token, and that this helps on groups unlike those seen in training.
+\emph{Third}, we show that information outside the representation, such as whether a star is a
+known binary, can be passed to the language model by a small separate model as a latent token.
+This helps on groups unlike those seen in training.
 
 \section{Related Work}\label{sec:related_work}
 

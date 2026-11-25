@@ -144,23 +144,24 @@ the stellar narrators, it cannot draw on training descriptions of the test objec
 \subsection{Reasoning across objects and modalities}\label{sec:population}
 The third task requires reasoning: the answer is not stated for any single object or
 modality and must be inferred by combining them. We test two forms. In the stellar
-\emph{group task}, the narrator reads a group of $4$ to $32$ stars and must name the member
+\emph{population task}, the narrator reads a group of $4$ to $32$ stars and must name the member
 that does not belong and the property in which it differs, which requires comparing every
 member with the rest. We score whether the text names the odd star \emph{and} its property
-(judge; \Cref{app:eval}). In the galaxy \emph{agreement task}, the narrator must state whether
+(judge; \Cref{app:eval}). In the galaxy \emph{cross modal task}, the narrator must state whether
 a galaxy's shape agrees with its star-formation history, which requires relating its two
-modalities. \Cref{tab:group} gives the results for every model we tested; models that read the
-catalog as text are discussed in \Cref{sec:interface}, and the tool in \Cref{sec:ltu}.
+modalities. \Cref{tab:group} gives the results for every model we tested.
 
 \begin{table*}[t]\centering\small
 \caption{\textbf{The reasoning tasks, all models.} Stars: fraction of groups in which the text
 names the odd star and its property, judge-scored, greedy. \emph{Test}: the $1{,}203$ test
 groups with an odd member. \emph{Never odd}: $1{,}000$ test-fold groups whose odd star was never
-the odd member of a training group (\Cref{sec:memorization}). Galaxies: fraction of test
+the odd member of a training group. Galaxies: fraction of test
 galaxies with the correct agreement verdict, on $9{,}609$ star-forming and $1{,}068$ quiescent
 galaxies. $^\dagger$Frontier models on a subset of $177$ test groups; on the same subset
 the latent narrators score $0.333$ (full fine-tune), $0.627$ (LoRA) and $0.644$ (LoRA $+$ tool).
-Models that read the catalog values as text are in \Cref{tab:text}. --- : not run.}
+$^\ddagger$On $200$ of the never-odd groups; on the same groups the latent narrators score
+$0.295$, $0.620$ and $0.760$. Models that read the catalog values as text are in
+\Cref{tab:text}. --- : not run.}
 \label{tab:group}
 \begin{tabular}{llcccc}
 \toprule
@@ -168,7 +169,7 @@ Models that read the catalog values as text are in \Cref{tab:text}. --- : not ru
 \cmidrule(lr){3-4}\cmidrule(lr){5-6}
 input & model & test & never odd & star-forming & quiescent \\
 \midrule
-raw observations & Opus 5.5, zero-shot     & 0.203$^\dagger$ & --- & --- & --- \\
+raw observations & Opus 5.5, zero-shot     & 0.203$^\dagger$ & 0.200$^\ddagger$ & --- & --- \\
                  & Fable 5.1, zero-shot    & 0.203$^\dagger$ & --- & --- & --- \\
                  & Opus 5.5, agent with code & 0.181$^\dagger$ & --- & --- & --- \\
 \midrule
@@ -179,20 +180,49 @@ latent tokens    & full fine-tune          & 0.332 & 0.279 & 0.980 & 0.884 \\
 \end{tabular}
 \end{table*}
 
-\textbf{Results.} On the group task, the adaptation method determines the outcome. The fully
+\textbf{Results.} On the population task, the training method determines the outcome. The fully
 fine-tuned narrator names the odd star and its property in $33\%$ of the test groups; the LoRA
-narrator does so in $63\%$, and $66\%$ with the tool. The ordering is the same on the groups
-whose odd star was never odd in training ($0.28$, $0.62$ and $0.75$), so the scores do not
-depend on recalling training answers. Frontier models reading the raw observations zero-shot
-score $0.20$ on a subset of $177$ groups, on which the latent narrators score $0.33$, $0.63$ and
-$0.64$; Opus 5.5 with a code sandbox scores $0.18$. On the agreement task, all narrators reach
+narrator does so in $63\%$, and $66\%$ with the tool. Test stars also appear in training
+(\Cref{sec:data}), so a narrator could recall which star was odd instead of finding it. We
+therefore also built $1{,}000$ \emph{never-odd} groups from the test fold, whose odd star was
+never the odd member of a training group ($2.3\%$ of candidate groups pass this filter). The
+ordering is the same on these groups ($0.28$, $0.62$ and $0.75$). The filter changes the mix of
+odd stars: binarity makes the star odd in $54\%$ of these groups against $26\%$ of the test
+groups, and metallicity in $1\%$. We therefore compare models within each set, not across sets.
+
+The tool adds $0.03$ on the test groups ($0.633 \to 0.662$, $p=0.07$) and $0.13$ on the
+never-odd groups ($0.615 \to 0.748$, $p=5\times10^{-15}$). Part of this gain lies in groups
+whose odd star is a binary ($0.48 \to 0.64$), and binarity is one of the tool's labels. The
+gain remains without them ($0.78 \to 0.88$, $n=458$, $p=6\times10^{-6}$). The tool is not an
+answer on its own: ranking the members by its surprise score puts the odd star first in $29\%$
+of groups, and when its top choice is wrong, the tool narrator follows it no more often than
+the fully fine-tuned narrator does ($7\%$ against $8\%$). The narrator does read the token:
+scrambling it across the group or zeroing it drops the score below that of the narrator trained
+without the tool (\Cref{tab:ablate}).
+
+Frontier models score below every narrator. We give Claude Opus 5.5 and Claude Fable 5.1 each
+star's raw observations: plots of its Kepler and TESS light curves and its LAMOST and APOGEE
+spectra, and its Gaia measurements as text, with no derived stellar parameters
+(\Cref{app:frontier}). Zero-shot, both score $0.20$ on a subset of $177$ test groups, on which
+the latent narrators score $0.33$, $0.63$ and $0.64$ ($p<10^{-13}$ against the LoRA narrators,
+$p=0.005$ against full fine-tuning). Opus scores $0.20$ on the never-odd groups as well. Both
+frontier models make about twice as many contradictions per group as the narrators
+(\Cref{tab:frontier}), and giving the observations as tables instead of plots does not help
+(\Cref{app:frontier}). An agent that can run code on the unbinned observations, with star
+identifiers hidden and no network access, scores $0.18$ ($p=0.57$ against zero-shot). The
+frontier models were not trained on this task; the comparison measures what a general-purpose
+model does without training. Models that read the catalog values as a table, also without
+training on the task, score below the LoRA narrator as well (\Cref{app:text}).
+
+On the agreement task, all narrators reach
 $0.98$--$0.99$ on star-forming galaxies. On quiescent galaxies the fully fine-tuned narrator
 falls to $0.88$, against $0.97$ for LoRA and $0.98$ with the tool; most of its errors state
-that a quiescent galaxy still forms stars (\Cref{app:2x2}). The rest of this subsection
+that a quiescent galaxy still forms stars (\Cref{app:2x2}). The galaxy tool adds nothing, as
+expected, since it is computed from the same embeddings the narrator reads. The rest of this subsection
 examines the failure of full fine-tuning and tests whether the features contain the answer.
 
-\textbf{The failure is not due to the optimizer settings.} We did not tune either recipe, and
-the two used different optimizer settings. A LoRA narrator trained with the optimizer settings
+\textbf{The failure is not due to the optimizer settings.} We note that the fully fine-tuned and LoRA narrators were trained with different optimizers.
+ A LoRA narrator trained with the optimizer settings
 of the fully fine-tuned one still scores well above it ($0.51$ against $0.33$ on the test
 groups, $0.59$ against $0.28$ on the never-odd groups, $p<10^{-24}$; \Cref{sec:tokenortraining}).
 We read this as a condition for the approach to work, not as a claim that LoRA is better in
@@ -200,25 +230,25 @@ general; it is consistent with the finding that LoRA preserves more of the base 
 abilities than full fine-tuning \citep{Biderman2024_lora}.
 
 \textbf{The failure grows with the number of stars.} On single objects and pairs the gap between the two
-methods is small (\Cref{tab:single,tab:pair}), so we vary only the number of stars, keeping the question fixed
-(\Cref{fig:groupsize}). With full fine-tuning, the score falls from $0.45$ with $4$ stars to
-$0.06$ with $32$ (Spearman $\rho=-0.24$, $p=10^{-16}$). The LoRA narrator stays between $0.53$
-and $0.70$ with no significant trend ($\rho=+0.01$, $p=0.7$). With the optimizer settings of
-the fully fine-tuned narrator, the LoRA narrator declines only mildly, from $0.51$ to $0.34$
-($\rho=-0.06$, $p=0.04$). The same pattern holds on the never-odd groups
-(\Cref{fig:groupsize}, right). Since every star adds the same number of tokens, a larger group
+methods exists but is smaller (\Cref{tab:single,tab:pair}). To test if the population size drives the difference,
+we vary only the number of stars, keeping the question fixed
+(\Cref{fig:groupsize}). We show the $1{,}000$ never-odd groups. With full fine-tuning, the score
+falls from $0.38$ with $4$ stars to $0.04$ with $32$ (Spearman $\rho=-0.27$, $p=10^{-18}$). The
+LoRA narrator stays between $0.57$ and $0.69$ and does not decline ($\rho=+0.07$, $p=0.04$). With
+the optimizer settings of the fully fine-tuned narrator, the LoRA narrator declines from $0.62$ to
+$0.34$ ($\rho=-0.10$, $p=10^{-3}$). The same effect is seen on all test groups
+(\Cref{app:groupsize}). Since every star adds the same number of tokens, a larger group
 is also a longer input, and our data cannot separate the two.
 
 \begin{figure}[t]
   \centering
-  \includegraphics[width=0.49\linewidth]{figs/score_vs_group_size_strict.pdf}\hfill
-  \includegraphics[width=0.49\linewidth]{figs/score_vs_group_size_strict_novel.pdf}
+  \includegraphics[width=0.6\linewidth]{figs/score_vs_group_size_strict_novel.pdf}
   \caption{\textbf{Only the fully fine-tuned narrator degrades with the number of stars.}
   Score of \Cref{tab:group} (the narrator names the odd star and its property)
-  as a function of the number of stars in the group. Left: the $1{,}203$ test groups with an
-  odd member. Right: the $1{,}000$ groups whose odd member was never odd in training.
-  Error bars are $95\%$ intervals. Dashed line: the chance of picking the odd star at random
-  ($1/N$); the score also requires the right property, so its chance level is lower still.}
+  as a function of the number of stars in the group, on the $1{,}000$ groups whose odd member
+  was never odd in training. Error bars are $95\%$ intervals. Dashed line: the chance of picking
+  the odd star at random ($1/N$); the score also requires the right property, so its chance
+  level is lower still. All test groups: \Cref{fig:groupsize_test}.}
   \label{fig:groupsize}
 \end{figure}
 
@@ -273,136 +303,15 @@ LoRA $+$ tool          & 0.719 ($p=0.9$) & 0.890 ($p<10^{-9}$) \\
   \label{fig:examples}
 \end{figure*}
 
-\subsection{Is the representation the right interface?}\label{sec:interface}\label{sec:text}
-The failure of full fine-tuning raises the question of whether the latent tokens are needed at
-all. We compare them with two alternatives: the catalog values as text, and the raw
-observations given to a frontier model.
-
-\textbf{The catalog as text.} Each group is shown as a table with one row per star, listing its
-catalog values together with the two catalog flags the tool also receives (binarity and
-open-cluster membership). The model sees two worked examples and is asked to name the star that
-does not belong and its property. Without training on the task, no model that reads the table
-reaches the LoRA narrator (\Cref{tab:text}; $p<10^{-14}$). AstroSage-8B scores $0.473$, but by
-naming most of the group: naming the odd star among them is then no better than chance. Qwen3.5-27B
-is more selective, but often gets the odd star's property wrong, and scores $0.341$, no
-different from the fully fine-tuned narrator. Asking either model to reason first does not
-help (\Cref{app:text}). These models were not trained on the task.
-
-\textbf{Frontier models on the raw observations.} We give Claude Opus 5.5 and Claude Fable 5.1
-each star's raw observations, namely plots of its Kepler and TESS light curves and its LAMOST
-and APOGEE spectra, together with its Gaia measurements as text, with no derived stellar
-parameters (\Cref{app:frontier}). Zero-shot, without tools, both score $0.20$ on groups, below
-every narrator ($p<10^{-13}$ against the LoRA narrators and $p=0.005$ against full
-fine-tuning), and they make about twice as many contradictions (\Cref{app:frontier}). On
-single stars Opus is well below the probes (\Cref{tab:single}). Replacing the plots by tables
-of the same observations does not change this. The narrators were trained on this task, on
-descriptions of these stars, so this measures what a general-purpose model does out of the box.
-An agent that can run code on the unbinned observations, with star identifiers hidden and no
-network access, does no better than the zero-shot models ($0.18$ against $0.20$, $p=0.57$;
-\Cref{tab:group}).
-
 \subsection{Memorization controls}\label{sec:memorization}
-A narrator trained on templated text, and on the stars it is later tested on (\Cref{sec:data}),
-could copy instead of read. It could copy the wording of its training descriptions, the values
-written about a particular star, or the answer to a reasoning question. The first two happen to
-a limited extent and are measured in \Cref{app:memo}: the data augmentation removes copying of
-wording, and the stellar narrator states exact catalog values it read about the same star,
-which raises its single-star precision but barely changes its average error. The objection
-that matters most is the third: a narrator might recall which star was called unusual in
-training rather than work it out.
-
-We test this in two ways (\Cref{tab:adversarial}). First, we split the $1{,}203$ test groups
-by whether the odd star was ever the odd member of a training group. Almost all were
-($1{,}167$), and on the $36$ that were not, the narrators keep their order. Because that set is
-small, we also built $1{,}000$ new groups from the test fold whose odd star was never an odd
-member in training, which keeps $2.3\%$ of candidate groups. On these, LoRA gains $0.34$ over
-full fine-tuning, so that gain is not recall. This set is harder by construction, since stars
-that survive the filter are rarely odd, so only differences within it are comparable. The
-filter also changes which property makes a star odd: in $54\%$ of these groups it is
-binarity, against $26\%$ of the test groups, and almost none turn on metallicity ($1\%$) or
-cluster membership. The set therefore checks recall but does not replace the test groups.
-
-\begin{table}[h]\centering\small
-\caption{\textbf{Is the answer recalled?} Judge-scored. \emph{Top}: the test
-groups of \Cref{tab:group}, split by whether the odd member was ever the odd
-member of a training group; the two rows are disjoint and together reproduce
-\Cref{tab:group}. \emph{Bottom}: a larger set of $1{,}000$ new groups whose
-odd member was never odd in training. $\Delta$ is the tool narrator against the LoRA narrator.
-\emph{score} is the fraction of descriptions that name the true odd member and its property;
-\emph{named} counts naming the odd member regardless of property, and \emph{property} naming
-the right property regardless of member.}
-\label{tab:adversarial}
-\begin{tabular}{llccccc}
-\toprule
- & & groups & full fine-tune & LoRA & LoRA $+$ tool & $\Delta$ \\
-\midrule
-\multirow{3}{*}{\shortstack[l]{test set,\\ odd star was odd in training}}
- & score    & $1{,}167$ & 0.330 & 0.636 & \textbf{0.661} & $+0.025$ \\
- & named    &           & 0.441 & 0.771 & \textbf{0.800} & $+0.029$ \\
- & property &           & 0.388 & 0.661 & \textbf{0.686} & $+0.025$ \\
-\midrule
-\multirow{3}{*}{\shortstack[l]{test set,\\ odd star never odd in training}}
- & score    & $36$      & 0.389 & 0.556 & \textbf{0.694} & $+0.138$ \\
- & named    &           & 0.472 & 0.583 & \textbf{0.694} & $+0.111$ \\
- & property &           & 0.472 & 0.639 & \textbf{0.750} & $+0.111$ \\
-\midrule
-\multirow{3}{*}{\shortstack[l]{new groups,\\ odd star never odd in training}}
- & score    & $1{,}000$ & 0.279 & 0.615 & \textbf{0.748} & $+0.133$ \\
- & named    &           & 0.329 & 0.655 & \textbf{0.782} & $+0.127$ \\
- & property &           & 0.343 & 0.646 & \textbf{0.761} & $+0.115$ \\
-\bottomrule
-\end{tabular}
-\end{table}
-
-The narrator copies surface detail, but not conclusions: whether a star is the odd one in its
-group is worked out from the input, not recalled.
-
-\subsection{Extension: auxiliary information through a latent tool}\label{sec:ltu}
-The probes show that the features contain the continuous properties the group task needs. Some
-information, however, exists outside the representation, for example whether a star is a known
-binary or a member of an open cluster. When auxiliary information exists outside the
-representation, a separate model can pass it to the narrator as a latent token. We test this as
-a preliminary extension.
-
-\textbf{The tool.} In the stellar case the tool is a flow-matching model trained on the joint
-distribution of a star's aligned features and six catalog labels ($T_\mathrm{eff}$, $\log g$,
-$[\mathrm{Fe/H}]$, rotation period, binarity and cluster membership), conditioned on the rest of
-the group. For each star it returns how surprising the star is under that model and the values
-the group would predict for it, eleven numbers in all, which a trained projection maps to that
-star's tool token. The labels are inputs of the tool at test time as well as in training, and
-narrators without the tool do not receive them. In the galaxy case the tool is a cross-modal
-predictor trained to predict one modality from the other. The stellar tool is not an answer on
-its own: ranking the members by its surprise score puts the odd star first in $29\%$ of groups.
-
-\textbf{What it adds.} With the training held fixed, the tool adds $0.03$ on the test groups
-($0.633 \to 0.662$, $p=0.07$) and $0.13$ on the never-odd groups ($0.615 \to 0.748$,
-$p=5\times10^{-15}$; \Cref{tab:group}). Part of this gain lies in groups whose odd star is a
-binary, $54\%$ of the never-odd set ($0.48 \to 0.64$), and binarity is one of the tool's labels.
-The gain remains without them ($0.78 \to 0.88$, $n=458$, $p=6\times10^{-6}$). When the tool's
-own top choice is wrong, the tool narrator follows it no more often than the fully fine-tuned
-narrator does ($7\%$ against $8\%$), so it does not copy a verdict from the token. It does read
-the token: on the test groups, scrambling the token across the group costs $0.056$ and zeroing
-it costs $0.101$ (\Cref{tab:ablate}). On the never-odd groups the costs are larger: scrambling costs $0.197$ ($0.748 \to 0.551$)
-and zeroing costs $0.401$ ($\to 0.347$), both below the narrator trained without the tool
-($0.615$; \Cref{tab:ablate}).
-On galaxies the tool adds nothing, as expected, since it is computed from the same embeddings
-the narrator reads (\Cref{app:2x2}).
-
-\begin{table}[h]\centering\small
-\caption{\textbf{Breaking the token at test time}, stellar group task, greedy, judge-scored.
-\emph{Test}: the $1{,}203$ test groups with an odd member. \emph{Never odd}: the $1{,}000$
-groups of \Cref{tab:group}. The last three rows are one trained model, the tool narrator,
-with its token intact or damaged at generation time.}
-\label{tab:ablate}
-\begin{tabular}{lcc}
-\toprule
- & test & never odd \\
-\midrule
-LoRA, no tool token & 0.633 & 0.615 \\
-\midrule
-LoRA $+$ tool, token zeroed      & 0.561 & 0.347 \\
-LoRA $+$ tool, token scrambled   & 0.606 & 0.551 \\
-LoRA $+$ tool, token intact      & \textbf{0.662} & \textbf{0.748} \\
-\bottomrule
-\end{tabular}
-\end{table}
+Because the stellar data are split per description (\Cref{sec:data}), every test star also
+appears in training, and the narrator can memorize the values written about it. It does: it
+gives the exact temperature in $35\%$ of its statements, against $0.5\%$ for a probe on the same
+tokens, and almost every exact value appears in a training description of the same star. Its
+mean error, however, is similar whether or not a training description of the star states the
+value (\Cref{app:memo}). Whether a model memorizes the result of reasoning is a different
+question, with wider implications: modern LLMs have seen data on many of the objects they are
+asked about. We test it on the never-odd groups (\Cref{sec:population}). There, the narrators
+keep their order on every measure, and LoRA's gain over full fine-tuning is $0.34$, against $0.30$
+on the test groups (\Cref{tab:group}; by named star and property in \Cref{tab:adversarial}). The narrator thus recalls values, but finds the odd
+star from the input.

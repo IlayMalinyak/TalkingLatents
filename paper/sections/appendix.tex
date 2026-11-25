@@ -180,6 +180,30 @@ the schedule and the training length together. Neither recipe was tuned, so a be
 for full fine-tuning may exist; LoRA is better without one.
 
 
+\textbf{Breaking the token.} \Cref{tab:ablate} damages the tool narrator's token at test time.
+On the test groups, scrambling the token across the group costs $0.056$ and zeroing it costs
+$0.101$. On the never-odd groups, scrambling costs $0.197$ and zeroing $0.401$, both below the
+narrator trained without the tool.
+
+\begin{table}[h]\centering\small
+\caption{\textbf{Breaking the token at test time}, stellar group task, greedy, judge-scored.
+\emph{Test}: the $1{,}203$ test groups with an odd member. \emph{Never odd}: the $1{,}000$
+groups of \Cref{tab:group}. The last three rows are one trained model, the tool narrator,
+with its token intact or damaged at generation time.}
+\label{tab:ablate}
+\begin{tabular}{lcc}
+\toprule
+ & test & never odd \\
+\midrule
+LoRA, no tool token & 0.633 & 0.615 \\
+\midrule
+LoRA $+$ tool, token zeroed      & 0.561 & 0.347 \\
+LoRA $+$ tool, token scrambled   & 0.606 & 0.551 \\
+LoRA $+$ tool, token intact      & \textbf{0.662} & \textbf{0.748} \\
+\bottomrule
+\end{tabular}
+\end{table}
+
 \subsection{What the narrator copies}\label{app:memo}
 \begin{table}[h]\centering\small
 \caption{\textbf{What the narrator copies from its training text.} Each row is a
@@ -191,28 +215,10 @@ what could be copied & data & test & finding \\
 \midrule
 wording & galaxies & data augmentation (\Cref{app:recipe}) & copied when only the input format varies; the paper sentences remove it \\
 values about one object & stars, galaxies & narrator against probes and against the training text (\Cref{app:probevsnarrator}) & exact values copied when the training text gives them; average error barely changes \\
-the answer to a reasoning question & stars & test set split by whether the odd star was ever the odd one in training, and a larger set built that way (\Cref{tab:adversarial}) & not recalled; LoRA's gain holds, and the tool's is larger \\
+the answer to a reasoning question & stars & never-odd groups (\Cref{tab:adversarial}) & not recalled; LoRA's gain holds, and the tool's is larger \\
 \bottomrule
 \end{tabular}
 \end{table}
-
-\textbf{Wording.} With a varied input format but no paper sentences, the
-narrator recites its training descriptions: the fraction of novel descriptions
-falls from $0.40$ to $0.18$ on single objects and from $0.42$ to $0.04$ on
-pairs. Adding the paper sentences restores it ($0.39$ and $0.68$). Every
-narrator in this paper uses both.
-
-\textbf{Values about one object.} On galaxies, where no test galaxy is
-described in training, the narrator states about what a non-linear probe on the
-same tokens can read. On stars it states more: it is more accurate than the same
-probe on most numbers (radius error $0.40$ against $0.82\,R_\odot$), and it
-gives the exact temperature (zero Kelvin error) in $35\%$ of its statements, against $0.5\%$
-for the probe. Almost every such exact value is written in some training
-description of the same star; where none gives it, exact matches fall to the
-probe's level. The average error changes little. Part of the stellar
-narrator's numeric precision is therefore recall, and its single-star numbers
-in \Cref{tab:basemodel} should be read with this in mind.
-
 
 \textbf{Wording.} With a varied input format but no paper sentences, the
 narrator recites its training descriptions: the fraction of novel descriptions
@@ -227,11 +233,44 @@ probe on most numbers (radius error $0.40$ against $0.82\,R_\odot$), and it
 gives the exact temperature (zero Kelvin error) in $35\%$ of its statements, against $0.5\%$
 for the probe. Almost every such exact value is written in some training
 description of the same star; where none gives it, exact matches fall to the
-probe's level. The average error changes little. Part of the stellar
+probe's level. The mean error is similar whether or not a training description of the star
+states the value (temperature $0.097$ against $0.107$, mass $0.166$ against $0.179$, radius
+$0.053$ against $0.047$, absolute error in units of the catalog standard deviation). Part of the stellar
 narrator's numeric precision is therefore recall, and its single-star numbers
 in \Cref{tab:single} should be read with this in mind.
 
+\textbf{The answer to a reasoning question.} \Cref{tab:adversarial} splits the group score of
+\Cref{tab:group} into naming the odd star and naming its property.
+
+\begin{table}[h]\centering\small
+\caption{\textbf{Is the answer recalled?} Judge-scored, on the test groups and on the
+never-odd groups (\Cref{sec:population}). \emph{score}: the text names the odd star and its
+property; \emph{named}: it names the odd star, regardless of property; \emph{property}: it
+names the right property, regardless of star. $\Delta$: the tool narrator against the LoRA
+narrator.}
+\label{tab:adversarial}
+\begin{tabular}{llccccc}
+\toprule
+ & & groups & full fine-tune & LoRA & LoRA $+$ tool & $\Delta$ \\
+\midrule
+\multirow{3}{*}{test groups}
+ & score    & $1{,}203$ & 0.332 & 0.633 & \textbf{0.662} & $+0.029$ \\
+ & named    &           & 0.442 & 0.766 & \textbf{0.797} & $+0.031$ \\
+ & property &           & 0.391 & 0.660 & \textbf{0.688} & $+0.028$ \\
+\midrule
+\multirow{3}{*}{never-odd groups}
+ & score    & $1{,}000$ & 0.279 & 0.615 & \textbf{0.748} & $+0.133$ \\
+ & named    &           & 0.329 & 0.655 & \textbf{0.782} & $+0.127$ \\
+ & property &           & 0.343 & 0.646 & \textbf{0.761} & $+0.115$ \\
+\bottomrule
+\end{tabular}
+\end{table}
+
 \subsection{The catalog as text}\label{app:text}
+Each group is shown as a table with one row per star, listing its catalog values together with
+the two catalog flags the tool also receives (binarity and open-cluster membership). The model
+sees two worked examples and is asked to name the star that does not belong and its property.
+None of these models was trained on the task.
 Each text reader is tested twice: answering directly, and reasoning step by step before
 answering. \Cref{tab:text} gives the full comparison.
 No model that reads the numbers reaches the LoRA narrators ($0.633$ without the tool and
@@ -572,9 +611,8 @@ words are exact: every description containing a disagreement word belongs to a
 disagreeing galaxy, and every one containing an agreement word to an agreeing
 galaxy (\Cref{app:eval}). We report the fraction of galaxies with the correct
 verdict, separately for star-forming and quiescent galaxies. The split matters
-because $90\%$ of the test galaxies are star-forming, and the errors concentrate in
-the quiescent minority, where a narrator must notice that a galaxy has stopped
-forming stars. Whenever a narrator's verdict is right, its stated shape and
+because $90\%$ of the test galaxies are star-forming, and the error rate is highest
+in the quiescent minority, where most errors call the galaxy star-forming. Whenever a narrator's verdict is right, its stated shape and
 star-formation state are also right in more than $99.9\%$ of cases.
 
 \textbf{The judge (stellar population records).} The verifier's extractors
@@ -725,6 +763,21 @@ both probes recover them well.
 stellar age ($R^2=0.55$), the metallicity quartile ($0.66$, against $0.25$ by chance) and the galaxy S\'ersic index. For
 these properties the information is largely absent from the tokens, and the narrator's errors
 (\Cref{fig:perprop}) reflect the tokens rather than the narrator.
+
+\subsection{Score by group size on all test groups}\label{app:groupsize}
+\Cref{fig:groupsize_test} repeats \Cref{fig:groupsize} on the $1{,}203$ test groups with an odd
+member. With full fine-tuning, the score falls from $0.45$ with $4$ stars to $0.06$ with $32$
+(Spearman $\rho=-0.24$, $p=10^{-16}$). The LoRA narrator stays between $0.53$ and $0.70$ with no
+significant trend ($\rho=+0.01$, $p=0.7$). With the optimizer settings of the fully fine-tuned
+narrator, the LoRA narrator declines from $0.51$ to $0.34$ ($\rho=-0.06$, $p=0.04$).
+
+\begin{figure}[h]
+  \centering
+  \includegraphics[width=0.6\linewidth]{figs/score_vs_group_size_strict.pdf}
+  \caption{\textbf{Score by number of stars, all test groups.} As \Cref{fig:groupsize}, on the
+  $1{,}203$ test groups with an odd member.}
+  \label{fig:groupsize_test}
+\end{figure}
 
 \subsection{Reading the numbers, by group size}\label{app:textsize}
 \Cref{tab:textsize} breaks \Cref{tab:text} down by the number of stars in the

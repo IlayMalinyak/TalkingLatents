@@ -5,7 +5,7 @@
 the 8B language model (AstroSage-8B; \cite{haan2025_astrosage}) we train: it reads an object's data tokens and answers questions
 about the object. The \emph{tool} is a small model, not a language model,
 trained separately to compute, for every object in a question, a quantity that
-the question depends on, using auxiliary information (\Cref{sec:ltu}). It is run on every input, and its
+the question depends on, using auxiliary information (below). It is run on every input, and its
 output enters the narrator as one extra token per object, the \emph{tool token},
 which the narrator is trained to read; a narrator that reads it is a \emph{tool
 narrator}. The stellar tool also receives catalog labels as inputs, and narrators without a tool do not. The \emph{templater} is the deterministic program that writes
@@ -94,6 +94,18 @@ matrices (rank $16$) on the attention query and value projections. The tool is
 trained beforehand and stays frozen. The loss is next-token cross-entropy on the
 final description only.
 \Cref{app:recipes} gives the learning rates and schedules.
+
+\textbf{The tool.}\label{sec:ltu} Some information lies outside the representation, for
+example whether a star is a known binary or an open-cluster member. A separate model, the tool,
+can pass such information to the narrator as a latent token. We test this as a preliminary
+extension. The stellar tool is a flow-matching model trained on the joint distribution of a
+star's aligned features and six catalog labels ($T_\mathrm{eff}$, $\log g$,
+$[\mathrm{Fe/H}]$, rotation period, binarity and cluster membership), conditioned on the rest of
+the group. For each star it returns how surprising the star is under that model and the values
+the group predicts for it, eleven numbers in all; a trained projection maps them to the star's
+tool token. The labels are inputs of the tool at test time as well as in training, and
+narrators without the tool do not receive them. The galaxy tool predicts one modality from the
+other.
 
 \textbf{Data augmentation.} A model trained on templated text can memorize the
 templates rather than learn to read the data. To prevent this, we randomize the
